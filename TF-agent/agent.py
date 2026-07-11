@@ -1,0 +1,637 @@
+import os
+import re
+import base64
+import io
+import threading
+from typing import Optional
+
+# Workaround for Windows OpenMP runtime duplication from mixed scientific deps.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+import numpy as np
+from dotenv import load_dotenv
+import chromadb
+from chromadb.utils import embedding_functions
+from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
+from langchain_core.messages import SystemMessage
+from langgraph.prebuilt import create_react_agent
+
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(_THIS_DIR, ".env"), override=True)
+load_dotenv(override=False)
+
+
+# ==========================================
+# 1. 定义 Agent 的工具箱 (Tools)
+# ==========================================
+
+# 文献库懒加载：避免「每次打开 Copilot / 任意首轮对话」就拉 Chroma + 下载/加载 BGE（与问题内容无关）
+_kb_collection = None
+_kb_lock = threading.Lock()
+
+
+def _get_knowledge_collection():
+    """仅在首次调用 search_knowledge_base 时初始化本地向量库与嵌入模型。"""
+    global _kb_collection
+    with _kb_lock:
+        if _kb_collection is not None:
+            return _kb_collection
+        print("[CSTF-Agent] 首次触发文献检索，正在连接本地 Chroma 并加载 BGE 嵌入模型…")
+        _db_default = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rs_knowledge_db")
+        db_path = os.environ.get("CHROMA_RS_DB_PATH", _db_default)
+        os.makedirs(db_path, exist_ok=True)
+        chroma_client = chromadb.PersistentClient(path=db_path)
+        bge_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name="BAAI/bge-small-zh-v1.5"
+        )
+        _kb_collection = chroma_client.get_or_create_collection(
+            name="remote_sensing_papers",
+            embedding_function=bge_ef,
+        )
+        return _kb_collection
+
+
+@tool
+def search_knowledge_base(keywords: str) -> str:
+    """
+    【学术与政策检索工具】
+    当用户询问关于遥感文献（如潮滩分割、注意力机制、反演公式）或政策法规（如《国家湿地保护法》、管控红线）时，必须调用此工具！
+    参数 `keywords` 必须是你提炼出的核心检索词，多个词之间用空格隔开。
+    例如："多尺度注意力机制 潮滩边缘" 或 "国家湿地保护法 红树林 管控"
+    """
+    print(f"\n[Agent 后台动作] 🚀 正在调用 ChromaDB 检索文献，关键词：{keywords}")
+
+    collection = _get_knowledge_collection()
+    results = collection.query(
+        query_texts=[keywords],
+        n_results=2
+    )
+
+    docs_batch = results.get("documents") or []
+    if not docs_batch or not docs_batch[0]:
+        return "本地知识库中未检索到相关文献或法规，请告知用户该领域暂无数据支撑。"
+
+    metas_batch = results.get("metadatas") or [[]]
+    retrieved_context = "【系统从本地数据库中检索到的权威资料如下】：\n"
+    for i, (doc, meta) in enumerate(zip(docs_batch[0], metas_batch[0] if metas_batch else [])):
+        retrieved_context += f"文献 {i+1} (来源: {meta['source']}): {doc}\n"
+        
+    retrieved_context += "\n请基于以上检索到的真实资料回答用户的问题，必须在回答中引用文献来源，严禁自行编造公式或法规内容！"
+    
+    return retrieved_context
+
+@tool
+def dispatch_system_command(command_json: str) -> str:
+    """
+    【系统控制主工具 · 凡改侧栏/跑流程/跳地图必用】
+    参数 command_json 为合法 JSON 字符串（不要 markdown 代码块）。
+
+    结构：
+    {
+      "map": {"lat": 30.2, "lon": 121.5, "zoom": 10},          // 可选，仅跳地图
+      "sidebar_states": { ... },                                  // 可选，差量更新侧栏
+      "pending_action": { "type": "run_pipeline"|"run_m4"|"run_autotune", ... }  // 可选，启动后台
+    }
+
+    sidebar_states 全部可用键（未提及则省略，禁止脑补）：
+    workspace_tab, selected_task, run_mode(dl|index), inference_mode(深度学习|指数法),
+    prob_th(0.01~0.50), min_cnt(1~10), adaptive_mode, force_rerun,
+    root_dir, mask_root, final_root, model_path, shp_path, points_shp, task_aoi_shp,
+    m5_enabled, m5_baseline_shp, e1_enabled, e1_data_root, e1_reference, e1_compare_sources[],
+    e1_export_maps, e1_export_heatmap,
+    m4_roi_path, m4_roi_name, m4_start_date, m4_end_date, m4_export_to(drive|local),
+    m4_drive_folder, m4_local_dir, m4_cloud, m4_min_land, m4_max_land, m4_min_pix,
+    m4_bands[], m4_scale, m4_gee_proxy, m4_gee_project
+
+    pending_action：
+    - run_pipeline: 需要 task（可来自 selected_task 或快照）；prob/cnt 可省略则用侧栏
+    - run_m4: m4_params 可含 roi_path/roi_name/start_date/end_date/cloud_limit 等
+    - run_autotune: autotune_params.reference_id + objective(iou|f1|iou_f1)；需 adaptive_mode=true
+
+    口语速查：
+    「跑/推理/合成/开始」→ pending_action.run_pipeline
+    「下载/GEE/下影像」→ workspace_tab=GEE数据下载；「开始下载」→ run_m4
+    「调参/搜最优/AutoTune」→ adaptive_mode=true + run_autotune
+    「5%/百分之五」→ prob_th=0.05；「频次2/两次」→ min_cnt=2
+    「关M5/不要E1」→ m5_enabled/e1_enabled=false
+    """
+    cmd = command_json.strip()
+    if cmd.startswith("```"):
+        cmd = cmd.strip("`").strip()
+        if cmd.lower().startswith("json"):
+            cmd = cmd[4:].strip()
+    return f"[SYSTEM_COMMAND_JSON]\n{cmd}\n[/SYSTEM_COMMAND_JSON]"
+
+
+@tool
+def trigger_spatial_analysis(
+    task_node: str,
+    prob_th: float,
+    min_cnt: int,
+    run_mode: str = "dl",
+    m5_enabled: Optional[bool] = None,
+    e1_enabled: Optional[bool] = None,
+) -> str:
+    """
+    【兼容工具 · 跑潮滩推理】用户明确要求跑模型/推理时调用。
+    run_mode: dl=深度学习, index=指数法。prob/min_cnt 必须来自用户原话，禁止编造。
+    推荐改用 dispatch_system_command 以同时调整 M5/E1。
+    """
+    import json as _json
+
+    payload = {
+        "sidebar_states": {
+            "selected_task": task_node,
+            "prob_th": prob_th,
+            "min_cnt": int(min_cnt),
+            "run_mode": run_mode,
+        },
+        "pending_action": {"type": "run_pipeline", "task": task_node},
+    }
+    if m5_enabled is not None:
+        payload["sidebar_states"]["m5_enabled"] = m5_enabled
+    if e1_enabled is not None:
+        payload["sidebar_states"]["e1_enabled"] = e1_enabled
+    return f"[SYSTEM_COMMAND_JSON]\n{_json.dumps(payload, ensure_ascii=False)}\n[/SYSTEM_COMMAND_JSON]"
+
+
+@tool
+def change_map_view(location_name: str, lat: float, lon: float, zoom: int) -> str:
+    """
+    地图视角跳转。用户表达查看/定位/跳到某地时必须立即调用。
+    可与 dispatch_system_command 合并；单独跳转时用本工具。
+    """
+    import json as _json
+
+    payload = {"map": {"lat": lat, "lon": lon, "zoom": int(zoom)}}
+    return f"[SYSTEM_COMMAND_JSON]\n{_json.dumps(payload, ensure_ascii=False)}\n[/SYSTEM_COMMAND_JSON]"
+
+
+@tool
+def assist_gee_download(
+    region_name: str,
+    year: int,
+    cloud_limit: Optional[int] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    run_now: bool = False,
+) -> str:
+    """
+    GEE Sentinel-2 下载（M4）。用户要下载遥感数据时调用。
+    若用户说「启动下载/开始下」，设 run_now=true 并在 pending_action 中 type=run_m4。
+    """
+    import json as _json
+
+    sd = start_date or f"{int(year)}-01-01"
+    ed = end_date or f"{int(year)}-01-31"
+    payload: dict = {
+        "sidebar_states": {
+            "workspace_tab": "GEE 数据下载",
+            "m4_roi_name": region_name,
+            "m4_start_date": sd,
+            "m4_end_date": ed,
+        },
+    }
+    if cloud_limit is not None:
+        payload["sidebar_states"]["m4_cloud"] = int(cloud_limit)
+    if run_now:
+        payload["pending_action"] = {
+            "type": "run_m4",
+            "task": region_name,
+            "m4_params": {
+                "roi_name": region_name,
+                "start_date": sd,
+                "end_date": ed,
+                "cloud_limit": cloud_limit,
+            },
+        }
+    return f"[SYSTEM_COMMAND_JSON]\n{_json.dumps(payload, ensure_ascii=False)}\n[/SYSTEM_COMMAND_JSON]"
+
+
+# ==========================================
+# 2. 通义千问 API（阿里云百炼 DashScope · OpenAI 兼容模式）
+# ==========================================
+# 在系统环境变量或 .env 中设置（勿把 Key 写进代码仓库）：
+#   DASHSCOPE_API_KEY=sk-你的Key
+# 可选：
+#   QWEN_OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1  （默认即此）
+#   QWEN_CHAT_MODEL=qwen-plus          # 纯文本+工具推荐：qwen-plus / qwen-max / qwen-turbo
+#   QWEN_CHAT_MODEL=qwen-vl-plus       # 需要上传图片解译时改用 VL 系列（qwen-vl-plus / qwen-vl-max）
+#
+# 控制台与计费：https://bailian.console.aliyun.com/  → API-KEY
+_dash_key = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("QWEN_API_KEY")
+_qwen_base = os.environ.get("QWEN_OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+_qwen_model = os.environ.get("QWEN_CHAT_MODEL", "qwen-plus")
+_tiff_mode = os.environ.get("YYNET_TIFF_MODE", "auto").strip().lower()  # auto/native/png
+_attach_geo_meta = os.environ.get("YYNET_ATTACH_GEO_META", "1").strip().lower() not in {"0", "false", "no"}
+_tiff_auto_png_mb = float(os.environ.get("YYNET_TIFF_AUTO_PNG_MB", "12"))
+_vlm_max_side = int(os.environ.get("YYNET_VLM_MAX_SIDE", "2048"))
+
+if not _dash_key:
+    raise RuntimeError(
+        "未检测到 API Key：请设置环境变量 DASHSCOPE_API_KEY（或 QWEN_API_KEY）。"
+        "获取方式：阿里云百炼控制台 → API-KEY。"
+    )
+
+llm = ChatOpenAI(
+    model=_qwen_model,
+    api_key=_dash_key,
+    base_url=_qwen_base,
+    temperature=0.1,
+)
+
+tools = [
+    dispatch_system_command,
+    trigger_spatial_analysis,
+    change_map_view,
+    assist_gee_download,
+    search_knowledge_base,
+]
+
+# ==========================================
+# 3. 组装新一代 LangGraph Agent
+# ==========================================
+system_prompt_base = """你是 CSTF-Copilot，遥感潮滩分析平台的对话控制中枢。
+用户不会按固定句式提问；你必须从碎片化、口语化、多意图混杂的句子中还原真实企图，并调用正确工具。
+
+═══════════════════════════════════════
+第一步 · 意图分类（每轮必做，可多标签）
+═══════════════════════════════════════
+A. 纯问答 / 文献 / 图片解译 → 只回答或 search_knowledge_base，**禁止** dispatch_system_command
+B. 只改侧栏、不立即运行 → dispatch_system_command，**不要** pending_action
+   例：「概率改成 8%」「把 E1 打开」「切到下载页」「云量设 20」
+C. 改侧栏并立即运行 → dispatch_system_command，sidebar_states + pending_action 同轮给出
+   例：「用 5% 跑一下浙江」「下载杭州湾 2020 年 1 月影像并开始」
+D. 只跳地图 → map 字段（可合并进 dispatch_system_command）
+   例：「看看杭州湾」「定位到南流江口」「地图挪到舟山」
+E. 承前省略 / 指代 → 结合【侧栏快照】与对话上文补全 task/参数
+   例：「那就跑吧」「同样参数再跑一遍」「云量改成 20 再下」
+
+═══════════════════════════════════════
+第二步 · 工具选择
+═══════════════════════════════════════
+- **首选** dispatch_system_command：可同时改多个侧栏项 + 跳地图 + 启动流程
+- change_map_view：仅当地图跳转且无任何侧栏/运行需求时用
+- assist_gee_download：用户明确要 GEE 下载时可快捷调用（等价于 dispatch + run_m4）
+- trigger_spatial_analysis：仅简单跑推理且无 M5/E1/Tab 变更时用
+- search_knowledge_base：文献、法规、方法原理类问题
+
+调用后必须在回复**末尾原样附上**工具返回的 [SYSTEM_COMMAND_JSON]...[/SYSTEM_COMMAND_JSON] 块。
+
+═══════════════════════════════════════
+第三步 · 口语 → JSON 映射规范
+═══════════════════════════════════════
+
+【任务名】
+- 必须与「可用任务目录」列表模糊匹配：24浙江/浙江2024 → 24zhejiang1
+- 不在列表中 → 明确告知无法运行，**禁止**编造任务名或强行 pending_action
+
+【推理方式】
+- 深度学习/CDNet/模型/神经网络 → run_mode=dl 或 inference_mode=深度学习
+- 指数法/mNDWI/ACWI/不用模型 → run_mode=index 或 inference_mode=指数法
+
+【阈值】
+- 5%/百分之五/概率0.05 → prob_th=0.05（注意：5% 不是 5.0）
+- 频次2/两次/最少2次/cnt=2 → min_cnt=2
+- 「参数默认/按侧栏/当前设置」→ **省略** prob_th/min_cnt（前端保留快照值）
+
+【M5 / E1】
+- 开/启用/加上/要做 变化检测 → m5_enabled=true；关/不要/跳过 → false
+- E1/一致性/多源对比/和师姐比 → e1_enabled=true
+- 师姐2020/参考2020 → e1_reference=师姐_2020（2022/2024/2025 同理）
+
+【GEE 下载 M4】
+- 下载/下数据/GEE/哨兵/Sentinel → workspace_tab=GEE数据下载
+- 云量20/云小于30 → m4_cloud=20 或 30
+- 2020年1月/2020-01 → m4_start_date/m4_end_date
+- 「开始下载/启动M4/现在就下」→ pending_action.type=run_m4
+
+【AutoTune】
+- 自动调参/搜最优阈值/自适应 → adaptive_mode=true
+- 「跑 AutoTune/开始调参」→ 另加 pending_action.type=run_autotune
+- reference_id 从【数据集资产目录】选取，缺则追问；objective: iou | f1 | iou_f1
+
+【路径】
+- 用户给出盘符路径 → 写入对应 root_dir/mask_root/final_root/model_path 等键
+
+【是否立即运行 · 关键判别】
+含以下动词 → 通常要 pending_action：跑、执行、开始、启动、下载、推理、合成、调参、来一轮
+仅含以下 → 通常**不要** pending_action：改成、设为、打开、关闭、切换、调到、看看（仅地图）
+
+═══════════════════════════════════════
+第四步 · 差量更新铁律
+═══════════════════════════════════════
+- JSON 中**只写用户本轮明确提到或可从指代推断的字段**
+- 未提及的参数：**省略键**或 null，严禁擅自填默认数字
+- 缺关键信息无法安全执行时：**先追问**（task、prob、reference_id、ROI 日期等）
+
+═══════════════════════════════════════
+第五步 · 典型多意图句式（必须一次工具搞定）
+═══════════════════════════════════════
+① 「深度学习跑24zhejiang，5%两次，开M5关E1，开始」
+   → selected_task, run_mode=dl, prob_th=0.05, min_cnt=2, m5_enabled=true, e1_enabled=false, run_pipeline
+② 「指数法跑一下，别的按侧栏」→ run_mode=index, run_pipeline（prob/cnt 省略）
+③ 「切下载，云量15，2020年6月，启动」→ workspace_tab, m4_cloud=15, 日期, run_m4
+④ 「看看钱塘江然后跑当前任务」→ map + run_pipeline（task 取自快照）
+⑤ 「E1打开参考2022，先别跑」→ e1_enabled, e1_reference，**无** pending_action
+
+═══════════════════════════════════════
+禁止事项
+═══════════════════════════════════════
+- 只口头说「已定位/已开始」却不调用工具
+- 向用户解释 JSON/暗号/协议细节
+- 纯地理知识问答时误触发跑图
+- 任务不在硬盘列表时假装能跑"""
+
+
+agent_executor = create_react_agent(llm, tools)
+
+
+def _percentile_stretch_to_uint8(arr: np.ndarray, valid_mask: np.ndarray = None) -> np.ndarray:
+    """Convert an arbitrary numeric array to uint8 using robust percentile stretch."""
+    out = np.zeros(arr.shape, dtype=np.uint8)
+    for c in range(arr.shape[-1]):
+        ch = arr[..., c].astype(np.float32)
+        finite = np.isfinite(ch)
+        if valid_mask is not None:
+            finite = finite & valid_mask
+        if not finite.any():
+            continue
+        lo = np.percentile(ch[finite], 2)
+        hi = np.percentile(ch[finite], 98)
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo = np.min(ch[finite])
+            hi = np.max(ch[finite])
+        if hi <= lo:
+            out[..., c] = 0
+            continue
+        norm = (ch - lo) / (hi - lo)
+        norm = np.clip(norm, 0.0, 1.0)
+        norm = np.where(np.isfinite(norm), norm, 0.0)
+        out[..., c] = (norm * 255.0).astype(np.uint8)
+    return out
+
+
+def _is_tiff_path(image_path: str) -> bool:
+    return os.path.splitext(image_path)[1].lower() in (".tif", ".tiff")
+
+
+def _needs_png_in_auto(image_path: str) -> bool:
+    if not _is_tiff_path(image_path):
+        return False
+    try:
+        size_mb = os.path.getsize(image_path) / (1024 * 1024)
+    except OSError:
+        size_mb = 0.0
+    return size_mb >= _tiff_auto_png_mb
+
+
+def _extract_geotiff_meta_text(image_path: str) -> str:
+    """Return compact geospatial metadata text for model context."""
+    if not _is_tiff_path(image_path):
+        return ""
+    try:
+        import rasterio
+
+        with rasterio.open(image_path) as ds:
+            bounds = ds.bounds
+            compress = ds.profile.get("compress", "none")
+            tiled = bool(ds.profile.get("tiled", False))
+            blockx = ds.profile.get("blockxsize")
+            blocky = ds.profile.get("blockysize")
+            xres, yres = ds.res if ds.res else (None, None)
+            finite_ratio = None
+            try:
+                sample = ds.read(list(range(1, min(ds.count, 3) + 1)))
+                finite_ratio = float(np.isfinite(sample).all(axis=0).mean())
+            except Exception:
+                finite_ratio = None
+            return (
+                "[GeoTIFF metadata]\n"
+                f"- bands: {ds.count}\n"
+                f"- size: {ds.width}x{ds.height}\n"
+                f"- dtype: {ds.dtypes[0] if ds.dtypes else 'unknown'}\n"
+                f"- crs: {ds.crs}\n"
+                f"- resolution: x={xres}, y={yres}\n"
+                f"- nodata: {ds.nodata}\n"
+                f"- bounds: left={bounds.left:.6f}, bottom={bounds.bottom:.6f}, "
+                f"right={bounds.right:.6f}, top={bounds.top:.6f}\n"
+                f"- compression: {compress}\n"
+                f"- tiled: {tiled}\n"
+                + (f"- block_size: {blockx}x{blocky}\n" if blockx and blocky else "")
+                + (f"- finite_pixel_ratio: {finite_ratio:.4f}\n" if finite_ratio is not None else "")
+            )
+    except Exception as exc:
+        return f"[GeoTIFF metadata unavailable: {exc}]"
+
+
+def _estimate_finite_pixel_ratio(image_path: str, sample_max_side: int = 1024) -> float:
+    """Estimate finite pixel ratio (across first up to 3 bands) on a sampled grid."""
+    if not _is_tiff_path(image_path):
+        return 1.0
+    try:
+        import rasterio
+        from rasterio.enums import Resampling
+
+        with rasterio.open(image_path) as ds:
+            bands = list(range(1, min(ds.count, 3) + 1))
+            out_h = min(ds.height, sample_max_side)
+            out_w = min(ds.width, sample_max_side)
+            sample = ds.read(
+                bands,
+                out_shape=(len(bands), out_h, out_w),
+                resampling=Resampling.nearest,
+                masked=False,
+            )
+        return float(np.isfinite(sample).all(axis=0).mean())
+    except Exception:
+        return 1.0
+
+
+def _build_image_data_url(image_path: str, force_png_for_tiff: bool = False) -> str:
+    """Build a data URL for VLM; TIFF can be sent raw or converted to PNG preview."""
+    ext = os.path.splitext(image_path)[1].lower()
+
+    if ext in (".tif", ".tiff") and not force_png_for_tiff:
+        with open(image_path, "rb") as img_file:
+            img_b64 = base64.b64encode(img_file.read()).decode("utf-8")
+        return f"data:image/tiff;base64,{img_b64}"
+
+    if ext in (".tif", ".tiff") and force_png_for_tiff:
+        try:
+            import rasterio
+            from PIL import Image
+
+            with rasterio.open(image_path) as ds:
+                data = ds.read(masked=True)
+            if data.size == 0:
+                raise ValueError("empty raster data")
+
+            if data.shape[0] >= 3:
+                rgb = np.moveaxis(data[:3, :, :], 0, -1)
+            elif data.shape[0] == 2:
+                two = np.moveaxis(data[:2, :, :], 0, -1)
+                rgb = np.concatenate([two, two[..., 1:2]], axis=-1)
+            else:
+                one = data[0]
+                rgb = np.repeat(one[:, :, None], 3, axis=2)
+
+            if np.ma.isMaskedArray(rgb):
+                rgb_plain = np.ma.filled(rgb, np.nan)
+                valid_mask = (~np.ma.getmaskarray(rgb).any(axis=2)) & np.isfinite(rgb_plain).all(axis=2)
+            else:
+                valid_mask = np.isfinite(rgb).all(axis=2)
+                rgb_plain = rgb
+
+            if valid_mask is not None and valid_mask.any():
+                valid_ratio = float(valid_mask.mean())
+                if valid_ratio < 0.70:
+                    ys, xs = np.where(valid_mask)
+                    y0, y1 = ys.min(), ys.max()
+                    x0, x1 = xs.min(), xs.max()
+                    pad = 16
+                    y0 = max(0, y0 - pad)
+                    x0 = max(0, x0 - pad)
+                    y1 = min(rgb_plain.shape[0] - 1, y1 + pad)
+                    x1 = min(rgb_plain.shape[1] - 1, x1 + pad)
+                    rgb_plain = rgb_plain[y0 : y1 + 1, x0 : x1 + 1, :]
+                    valid_mask = valid_mask[y0 : y1 + 1, x0 : x1 + 1]
+
+            rgb_u8 = _percentile_stretch_to_uint8(rgb_plain, valid_mask=valid_mask)
+            img = Image.fromarray(rgb_u8, mode="RGB")
+            if _vlm_max_side > 0:
+                img.thumbnail((_vlm_max_side, _vlm_max_side), Image.Resampling.BILINEAR)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
+        except Exception as conv_err:
+            raise RuntimeError(f"TIFF conversion failed: {conv_err}") from conv_err
+
+    mime = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+    }.get(ext, "image/jpeg")
+    with open(image_path, "rb") as img_file:
+        img_b64 = base64.b64encode(img_file.read()).decode("utf-8")
+    return f"data:{mime};base64,{img_b64}"
+
+
+def chat_with_vlm(
+    user_input: str,
+    chat_history: list,
+    image_path: str = None,
+    available_tasks: list = None,
+    dataset_catalog_text: str = None,
+    sidebar_context: str = None,
+) -> str:
+    """处理对话，完美支持多模态视觉能力与物理感知"""
+
+    task_list_str = ", ".join(available_tasks) if available_tasks else "目前硬盘中没有任何数据"
+    dynamic_prompt = system_prompt_base + f"\n\n【🚨 硬盘可用任务目录（唯一合法 task 名来源）】\n{task_list_str}"
+    if sidebar_context and sidebar_context.strip():
+        dynamic_prompt += "\n\n" + sidebar_context.strip()
+    if dataset_catalog_text and dataset_catalog_text.strip():
+        dynamic_prompt += "\n\n【数据集资产目录 · AutoTune reference_id 从此选取】\n" + dataset_catalog_text.strip()
+
+    messages = [SystemMessage(content=dynamic_prompt)]
+
+    for msg in chat_history[:-1]:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+
+    if image_path and os.path.exists(image_path):
+        if _is_tiff_path(image_path):
+            finite_ratio_est = _estimate_finite_pixel_ratio(image_path)
+            if finite_ratio_est <= 0.0:
+                return (
+                    "该 GeoTIFF 在采样检测中未发现任何有效像素（均为 NaN/Inf），"
+                    "因此无法进行地物解译。请检查数据源、导出流程或尝试提供未损坏的影像。"
+                )
+
+        image_text = user_input
+        if _attach_geo_meta:
+            meta_text = _extract_geotiff_meta_text(image_path)
+            if meta_text:
+                image_text = f"{user_input}\n\n{meta_text}"
+
+        use_force_png = False
+        if _is_tiff_path(image_path):
+            if _tiff_mode == "png":
+                use_force_png = True
+            elif _tiff_mode == "native":
+                use_force_png = False
+            else:
+                use_force_png = _needs_png_in_auto(image_path)
+
+        image_data_url = _build_image_data_url(image_path, force_png_for_tiff=use_force_png)
+        multimodal_content = [
+            {"type": "text", "text": image_text},
+            {"type": "image_url", "image_url": {"url": image_data_url}},
+        ]
+        messages.append({"role": "user", "content": multimodal_content})
+    else:
+        messages.append({"role": "user", "content": user_input})
+
+    try:
+        response = agent_executor.invoke({"messages": messages})
+    except Exception as e:
+        if (
+            image_path
+            and os.path.exists(image_path)
+            and _is_tiff_path(image_path)
+            and _tiff_mode == "auto"
+            and "image format is illegal" in str(e).lower()
+        ):
+            image_text = user_input
+            if _attach_geo_meta:
+                meta_text = _extract_geotiff_meta_text(image_path)
+                if meta_text:
+                    image_text = f"{user_input}\n\n{meta_text}"
+            retry_url = _build_image_data_url(image_path, force_png_for_tiff=True)
+            retry_messages = messages[:-1] + [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": image_text},
+                        {"type": "image_url", "image_url": {"url": retry_url}},
+                    ],
+                }
+            ]
+            response = agent_executor.invoke({"messages": retry_messages})
+        else:
+            raise
+    output_messages = response["messages"]
+    final_reply = output_messages[-1].content
+
+    for msg in output_messages:
+        if msg.type == "tool" and (
+            "[SYSTEM_COMMAND_JSON]" in str(msg.content)
+            or "COMMAND_RUN_PIPELINE" in str(msg.content)
+            or "COMMAND_UPDATE_MAP" in str(msg.content)
+        ):
+            return final_reply + "\n" + str(msg.content)
+
+    if "COMMAND_SEARCH_KNOWLEDGE_BASE" in final_reply:
+        print("\n🚨 [后台监控] 截获到大模型的查库暗号！正在悄悄执行检索...")
+
+        match = re.search(r"COMMAND_SEARCH_KNOWLEDGE_BASE[\|:：\s]*(.*)", final_reply)
+        keywords = match.group(1).strip() if match and match.group(1).strip() else user_input
+        keywords = keywords.strip("。.,!！")
+
+        retrieved_info = search_knowledge_base.invoke(keywords)
+        print(f"✅ [后台监控] 查库完成，正在强迫大模型结合文献重新作答...\n")
+
+        messages.append({"role": "assistant", "content": final_reply})
+        messages.append(
+            {
+                "role": "user",
+                "content": f"系统已自动从后台为您查阅了本地数据库，检索结果如下：\n{retrieved_info}\n请仔细阅读上述文献，直接回答我最初的问题。回答必须专业严谨，且在文末标注'(来源: XXX)'。严禁在本次回答中再输出 COMMAND 暗号。",
+            }
+        )
+
+        response_phase2 = agent_executor.invoke({"messages": messages})
+        return response_phase2["messages"][-1].content
+
+    return final_reply

@@ -1,0 +1,25 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+streamlit.out.log
+streamlit.err.log
+_chat_upload_tmp/
+_analysis_vec_tmp/
+
+.vscode/
+.idea/
+
+start_yynet.ps1
+stop_yynet.ps1
+restart_yynet.ps1
+中转.txt
+
+# GIS / editor lock sidecars (do not commit)
+*.sr.lock
+agent_debug.log
+
+# Local Chroma databases (regenerate on machine)
+**/chroma.sqlite3

@@ -1,0 +1,1009 @@
+{
+  "20shanghai_p0.05_c3": {
+    "task": "20shanghai",
+    "prob_threshold": 0.05,
+    "min_count": 3,
+    "file_path": "E:\\Data\\843output\\20shanghai\\20shanghai_Final_p0.05_c3.tif",
+    "created_at": "2026-03-11 14:17:05",
+    "file_size_mb": 3.21
+  },
+  "20shanghai_p0.05_c4": {
+    "task": "20shanghai",
+    "prob_threshold": 0.05,
+    "min_count": 4,
+    "file_path": "E:\\Data\\843output\\20shanghai\\20shanghai_Final_p0.05_c4.tif",
+    "created_at": "2026-04-17 14:20:30",
+    "file_size_mb": 3.05
+  },
+  "20zhejiang1_p0.04_c2": {
+    "task": "20zhejiang1",
+    "prob_threshold": 0.04,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20zhejiang1\\20zhejiang1_Final_p0.04_c2.tif",
+    "created_at": "2026-03-19 14:04:22",
+    "file_size_mb": 1.87
+  },
+  "20zhejiang1_p0.05_c3": {
+    "task": "20zhejiang1",
+    "prob_threshold": 0.05,
+    "min_count": 3,
+    "file_path": "E:\\Data\\843output\\20zhejiang1\\20zhejiang1_Final_p0.05_c3.tif",
+    "created_at": "2026-03-09 14:07:05",
+    "file_size_mb": 2.16
+  },
+  "20zhejiang1_p0.50_c10": {
+    "task": "20zhejiang1",
+    "prob_threshold": 0.5,
+    "min_count": 10,
+    "file_path": "E:\\Data\\843output\\20zhejiang1\\20zhejiang1_Final_p0.50_c10.tif",
+    "created_at": "2026-03-20 11:34:09",
+    "file_size_mb": 1.9
+  },
+  "20zhejiang1_p0.50_c5": {
+    "task": "20zhejiang1",
+    "prob_threshold": 0.5,
+    "min_count": 5,
+    "file_path": "E:\\Data\\843output\\20zhejiang1\\20zhejiang1_Final_p0.50_c5.tif",
+    "created_at": "2026-03-20 11:50:37",
+    "file_size_mb": 1.94
+  },
+  "20zhejiang2_p0.05_c3": {
+    "task": "20zhejiang2",
+    "prob_threshold": 0.05,
+    "min_count": 3,
+    "file_path": "E:\\Data\\843output\\20zhejiang2\\20zhejiang2_Final_p0.05_c3.tif",
+    "created_at": "2026-03-09 16:08:03",
+    "file_size_mb": 4.49
+  },
+  "20zhejiang3_p0.05_c3": {
+    "task": "20zhejiang3",
+    "prob_threshold": 0.05,
+    "min_count": 3,
+    "file_path": "E:\\Data\\843output\\20zhejiang3\\20zhejiang3_Final_p0.05_c3.tif",
+    "created_at": "2026-03-10 12:11:38",
+    "file_size_mb": 3.44
+  },
+  "20jiangsu1_p0.05_c3": {
+    "task": "20jiangsu1",
+    "prob_threshold": 0.05,
+    "min_count": 3,
+    "file_path": "E:\\Data\\843output\\20jiangsu1\\20jiangsu1_Final_p0.05_c3.tif",
+    "created_at": "2026-03-28 16:40:46",
+    "file_size_mb": 5.09
+  },
+  "20jiangsu2_p0.05_c3": {
+    "task": "20jiangsu2",
+    "prob_threshold": 0.05,
+    "min_count": 3,
+    "file_path": "E:\\Data\\843output\\20jiangsu2\\20jiangsu2_Final_p0.05_c3.tif",
+    "created_at": "2026-03-28 19:43:53",
+    "file_size_mb": 2.79
+  },
+  "20jiangsu2_p0.05_c2": {
+    "task": "20jiangsu2",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20jiangsu2\\20jiangsu2_Final_p0.05_c2.tif",
+    "created_at": "2026-03-28 19:50:54",
+    "file_size_mb": 2.79
+  },
+  "20jiangsu1_p0.05_c2": {
+    "task": "20jiangsu1",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20jiangsu1\\20jiangsu1_Final_p0.05_c2.tif",
+    "created_at": "2026-03-28 20:13:26",
+    "file_size_mb": 4.93
+  },
+  "20jiangsu3_p0.05_c2": {
+    "task": "20jiangsu3",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20jiangsu3\\20jiangsu3_Final_p0.05_c2.tif",
+    "created_at": "2026-03-28 21:26:16",
+    "file_size_mb": 4.85
+  },
+  "20hainan1_p0.05_c2": {
+    "task": "20hainan1",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20hainan1\\20hainan1_Final_p0.05_c2.tif",
+    "created_at": "2026-03-29 17:04:30",
+    "file_size_mb": 5.67
+  },
+  "20hainan1_p0.05_c3": {
+    "task": "20hainan1",
+    "prob_threshold": 0.05,
+    "min_count": 3,
+    "file_path": "E:\\Data\\843output\\20hainan1\\20hainan1_Final_p0.05_c3.tif",
+    "created_at": "2026-03-29 22:49:47",
+    "file_size_mb": 5.63
+  },
+  "20hainan2_p0.05_c3": {
+    "task": "20hainan2",
+    "prob_threshold": 0.05,
+    "min_count": 3,
+    "file_path": "E:\\Data\\843output\\20hainan2\\20hainan2_Final_p0.05_c3.tif",
+    "created_at": "2026-03-30 12:26:06",
+    "file_size_mb": 2.48
+  },
+  "20hainan3_p0.05_c2": {
+    "task": "20hainan3",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20hainan3\\20hainan3_Final_p0.05_c2.tif",
+    "created_at": "2026-03-31 13:55:29",
+    "file_size_mb": 5.52
+  },
+  "20hainan3_p0.05_c3": {
+    "task": "20hainan3",
+    "prob_threshold": 0.05,
+    "min_count": 3,
+    "file_path": "E:\\Data\\843output\\20hainan3\\20hainan3_Final_p0.05_c3.tif",
+    "created_at": "2026-03-31 15:07:55",
+    "file_size_mb": 5.52
+  },
+  "20liaoning1_p0.05_c3": {
+    "task": "20liaoning1",
+    "prob_threshold": 0.05,
+    "min_count": 3,
+    "file_path": "E:\\Data\\843output\\20liaoning1\\20liaoning1_Final_p0.05_c3.tif",
+    "created_at": "2026-04-01 16:51:45",
+    "file_size_mb": 2.21
+  },
+  "20fujian1_p0.05_c3": {
+    "task": "20fujian1",
+    "prob_threshold": 0.05,
+    "min_count": 3,
+    "file_path": "E:\\Data\\843output\\20fujian1\\20fujian1_Final_p0.05_c3.tif",
+    "created_at": "2026-04-01 20:36:18",
+    "file_size_mb": 6.07
+  },
+  "20fujian1_p0.04_c2": {
+    "task": "20fujian1",
+    "prob_threshold": 0.04,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20fujian1\\20fujian1_Final_p0.04_c2.tif",
+    "created_at": "2026-04-10 11:57:11",
+    "file_size_mb": 6.08
+  },
+  "20zhejiang1_p0.32_c2": {
+    "task": "20zhejiang1",
+    "prob_threshold": 0.32,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20zhejiang1\\20zhejiang1_Final_p0.32_c2.tif",
+    "created_at": "2026-04-10 14:10:00",
+    "file_size_mb": 2.02
+  },
+  "20fujian2_p0.05_c2": {
+    "task": "20fujian2",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20fujian2\\20fujian2_Final_p0.05_c2.shp",
+    "created_at": "2026-06-19 23:56:11",
+    "file_size_mb": 2.7
+  },
+  "20fujian2_p0.06_c2": {
+    "task": "20fujian2",
+    "prob_threshold": 0.06,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20fujian2\\20fujian2_Final_p0.06_c2.tif",
+    "created_at": "2026-04-10 13:49:31",
+    "file_size_mb": 5.01
+  },
+  "20guangdong1_p0.05_c2": {
+    "task": "20guangdong1",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20guangdong1\\20guangdong1_Final_p0.05_c2.tif",
+    "created_at": "2026-04-20 19:37:08",
+    "file_size_mb": 5.82
+  },
+  "20guangdong2_p0.05_c2": {
+    "task": "20guangdong2",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20guangdong2\\20guangdong2_Final_p0.05_c2.tif",
+    "created_at": "2026-04-07 12:08:01",
+    "file_size_mb": 5.26
+  },
+  "20guangdong3_p0.05_c2": {
+    "task": "20guangdong3",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20guangdong3\\20guangdong3_Final_p0.05_c2.tif",
+    "created_at": "2026-04-10 16:57:02",
+    "file_size_mb": 3.3
+  },
+  "20guangxi_p0.05_c2": {
+    "task": "20guangxi",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20guangxi\\20guangxi_Final_p0.05_c2.tif",
+    "created_at": "2026-04-07 23:26:16",
+    "file_size_mb": 3.79
+  },
+  "20heibei1_p0.05_c2": {
+    "task": "20heibei1",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20heibei1\\20heibei1_Final_p0.05_c2.tif",
+    "created_at": "2026-04-08 15:08:17",
+    "file_size_mb": 4.49
+  },
+  "20heibei2_p0.11_c3": {
+    "task": "20heibei2",
+    "prob_threshold": 0.11,
+    "min_count": 3,
+    "file_path": "E:\\Data\\843output\\20heibei2\\20heibei2_Final_p0.11_c3.tif",
+    "created_at": "2026-04-08 17:24:03",
+    "file_size_mb": 4.84
+  },
+  "20shandong1_p0.05_c2": {
+    "task": "20shandong1",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20shandong1\\20shandong1_Final_p0.05_c2.tif",
+    "created_at": "2026-04-08 22:53:42",
+    "file_size_mb": 2.2
+  },
+  "20tianjin_p0.05_c2": {
+    "task": "20tianjin",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20tianjin\\20tianjin_Final_p0.05_c2.tif",
+    "created_at": "2026-04-09 19:50:32",
+    "file_size_mb": 2.41
+  },
+  "20taiwan2_p0.05_c2": {
+    "task": "20taiwan2",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20taiwan2\\20taiwan2_Final_p0.05_c2.tif",
+    "created_at": "2026-04-09 22:38:11",
+    "file_size_mb": 3.83
+  },
+  "20guangdong1_p0.50_c1": {
+    "task": "20guangdong1",
+    "prob_threshold": 0.5,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\20guangdong1\\20guangdong1_Final_p0.50_c1.tif",
+    "created_at": "2026-04-10 14:04:14",
+    "file_size_mb": 5.26
+  },
+  "20zhejiang2_p0.09_c1": {
+    "task": "20zhejiang2",
+    "prob_threshold": 0.09,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\20zhejiang2\\20zhejiang2_Final_p0.09_c1.tif",
+    "created_at": "2026-04-10 14:22:57",
+    "file_size_mb": 4.36
+  },
+  "20zhejiang3_p0.06_c1": {
+    "task": "20zhejiang3",
+    "prob_threshold": 0.06,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\20zhejiang3\\20zhejiang3_Final_p0.06_c1.tif",
+    "created_at": "2026-04-10 14:32:40",
+    "file_size_mb": 3.33
+  },
+  "20guangdong1_p0.15_c1": {
+    "task": "20guangdong1",
+    "prob_threshold": 0.15,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\20guangdong1\\20guangdong1_Final_p0.15_c1.tif",
+    "created_at": "2026-04-10 15:18:53",
+    "file_size_mb": 5.46
+  },
+  "20guangdong2_p0.15_c3": {
+    "task": "20guangdong2",
+    "prob_threshold": 0.15,
+    "min_count": 3,
+    "skip_coastline_clip": false,
+    "file_path": "E:\\Data\\843output\\20guangdong2\\20guangdong2_Final_p0.15_c3.tif",
+    "created_at": "2026-04-15 16:04:14",
+    "file_size_mb": 2.24
+  },
+  "20guangdong3_p0.09_c1": {
+    "task": "20guangdong3",
+    "prob_threshold": 0.09,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\20guangdong3\\20guangdong3_Final_p0.09_c1.tif",
+    "created_at": "2026-04-10 16:00:28",
+    "file_size_mb": 3.34
+  },
+  "20jiangsu1_p0.01_c2": {
+    "task": "20jiangsu1",
+    "prob_threshold": 0.01,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20jiangsu1\\20jiangsu1_Final_p0.01_c2.tif",
+    "created_at": "2026-04-10 17:26:09",
+    "file_size_mb": 5.11
+  },
+  "20tianjin_p0.05_c1": {
+    "task": "20tianjin",
+    "prob_threshold": 0.05,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\20tianjin\\20tianjin_Final_p0.05_c1.tif",
+    "created_at": "2026-04-10 17:54:25",
+    "file_size_mb": 2.42
+  },
+  "20fujian1_p0.01_c2": {
+    "task": "20fujian1",
+    "prob_threshold": 0.01,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20fujian1\\20fujian1_Final_p0.01_c2.tif",
+    "created_at": "2026-04-13 19:40:16",
+    "file_size_mb": 6.08
+  },
+  "20fujian1_p0.01_c1": {
+    "task": "20fujian1",
+    "prob_threshold": 0.01,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\20fujian1\\20fujian1_Final_p0.01_c1.tif",
+    "created_at": "2026-04-13 20:29:39",
+    "file_size_mb": 6.11
+  },
+  "20fujian1_p0.01_c1_scene": {
+    "task": "20fujian1",
+    "prob_threshold": 0.01,
+    "min_count": 1,
+    "denominator_mode": "per_mask_scene",
+    "file_path": "E:\\Data\\843output\\20fujian1\\20fujian1_Final_p0.01_c1_scene.tif",
+    "created_at": "2026-04-13 21:10:06",
+    "file_size_mb": 6.11
+  },
+  "20fujian1_p0.05_c1_noclip": {
+    "task": "20fujian1",
+    "prob_threshold": 0.05,
+    "min_count": 1,
+    "denominator_mode": "source_gt_zero",
+    "skip_coastline_clip": true,
+    "file_path": "E:\\Data\\843output\\20fujian1\\20fujian1_Final_p0.05_c1_noclip.tif",
+    "created_at": "2026-04-14 12:14:04",
+    "file_size_mb": 2.48
+  },
+  "20fujian1_p0.05_c2": {
+    "task": "20fujian1",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "denominator_mode": "source_gt_zero",
+    "skip_coastline_clip": false,
+    "file_path": "E:\\Data\\843output\\20fujian1\\20fujian1_Final_p0.05_c2.tif",
+    "created_at": "2026-04-14 12:36:01",
+    "file_size_mb": 2.77
+  },
+  "20fujian1_p0.09_c2": {
+    "task": "20fujian1",
+    "prob_threshold": 0.09,
+    "min_count": 2,
+    "denominator_mode": "source_gt_zero",
+    "skip_coastline_clip": false,
+    "file_path": "E:\\Data\\843output\\20fujian1\\20fujian1_Final_p0.09_c2.tif",
+    "created_at": "2026-04-14 12:41:09",
+    "file_size_mb": 2.75
+  },
+  "20guangdong1_p0.05_c4": {
+    "task": "20guangdong1",
+    "prob_threshold": 0.05,
+    "min_count": 4,
+    "denominator_mode": "source_gt_zero",
+    "skip_coastline_clip": false,
+    "file_path": "E:\\Data\\843output\\20guangdong1\\20guangdong1_Final_p0.05_c4.tif",
+    "created_at": "2026-04-14 14:45:35",
+    "file_size_mb": 5.5
+  },
+  "20guangdong2_p0.05_c2_noclip": {
+    "task": "20guangdong2",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "skip_coastline_clip": true,
+    "file_path": "E:\\Data\\843output\\20guangdong2\\20guangdong2_Final_p0.05_c2_noclip.tif",
+    "created_at": "2026-04-15 13:29:01",
+    "file_size_mb": 2.41
+  },
+  "20guangxi_p0.06_c3": {
+    "task": "20guangxi",
+    "prob_threshold": 0.06,
+    "min_count": 3,
+    "skip_coastline_clip": false,
+    "file_path": "E:\\Data\\843output\\20guangxi\\20guangxi_Final_p0.06_c3.tif",
+    "created_at": "2026-04-15 16:51:49",
+    "file_size_mb": 2.07
+  },
+  "20shandong1_p0.09_c2": {
+    "task": "20shandong1",
+    "prob_threshold": 0.09,
+    "min_count": 2,
+    "skip_coastline_clip": false,
+    "file_path": "E:\\Data\\843output\\20shandong1\\20shandong1_Final_p0.09_c2.tif",
+    "created_at": "2026-04-16 09:58:24",
+    "file_size_mb": 2.18
+  },
+  "20hainan1_p0.06_c1": {
+    "task": "20hainan1",
+    "prob_threshold": 0.06,
+    "min_count": 1,
+    "skip_coastline_clip": false,
+    "file_path": "E:\\Data\\843output\\20hainan1\\20hainan1_Final_p0.06_c1.tif",
+    "created_at": "2026-04-16 11:44:26",
+    "file_size_mb": 2.6
+  },
+  "20hainan2_p0.10_c1": {
+    "task": "20hainan2",
+    "prob_threshold": 0.1,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\20hainan2\\20hainan2_Final_p0.10_c1.tif",
+    "created_at": "2026-04-16 15:54:46",
+    "file_size_mb": 2.5
+  },
+  "20fujian1_p0.09_c1": {
+    "task": "20fujian1",
+    "prob_threshold": 0.09,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\20fujian1\\20fujian1_Final_p0.09_c1.tif",
+    "created_at": "2026-04-16 16:15:20",
+    "file_size_mb": 2.75
+  },
+  "20hainan3_p0.01_c1": {
+    "task": "20hainan3",
+    "prob_threshold": 0.01,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\20hainan3\\20hainan3_Final_p0.01_c1.tif",
+    "created_at": "2026-04-16 19:51:34",
+    "file_size_mb": 5.89
+  },
+  "20heibei1_p0.05_c1": {
+    "task": "20heibei1",
+    "prob_threshold": 0.05,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\20heibei1\\20heibei1_Final_p0.05_c1.tif",
+    "created_at": "2026-04-16 21:09:29",
+    "file_size_mb": 2.04
+  },
+  "20heibei2_p0.08_c1": {
+    "task": "20heibei2",
+    "prob_threshold": 0.08,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\20heibei2\\20heibei2_Final_p0.08_c1.tif",
+    "created_at": "2026-04-16 22:02:14",
+    "file_size_mb": 2.05
+  },
+  "20liaoning1_p0.05_c1": {
+    "task": "20liaoning1",
+    "prob_threshold": 0.05,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\20liaoning1\\20liaoning1_Final_p0.05_c1.tif",
+    "created_at": "2026-04-16 22:40:58",
+    "file_size_mb": 2.22
+  },
+  "20liaoning2_p0.08_c4": {
+    "task": "20liaoning2",
+    "prob_threshold": 0.08,
+    "min_count": 4,
+    "file_path": "E:\\Data\\843output\\20liaoning2\\20liaoning2_Final_p0.08_c4.tif",
+    "created_at": "2026-04-16 23:12:49",
+    "file_size_mb": 1.69
+  },
+  "20liaoning3_p0.10_c4": {
+    "task": "20liaoning3",
+    "prob_threshold": 0.1,
+    "min_count": 4,
+    "file_path": "E:\\Data\\843output\\20liaoning3\\20liaoning3_Final_p0.10_c4.tif",
+    "created_at": "2026-04-17 10:38:34",
+    "file_size_mb": 3.11
+  },
+  "20shandong2_p0.11_c1": {
+    "task": "20shandong2",
+    "prob_threshold": 0.11,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\20shandong2\\20shandong2_Final_p0.11_c1.tif",
+    "created_at": "2026-04-17 11:27:31",
+    "file_size_mb": 2.52
+  },
+  "20shandong3_p0.03_c4": {
+    "task": "20shandong3",
+    "prob_threshold": 0.03,
+    "min_count": 4,
+    "file_path": "E:\\Data\\843output\\20shandong3\\20shandong3_Final_p0.03_c4.tif",
+    "created_at": "2026-04-17 12:15:51",
+    "file_size_mb": 2.53
+  },
+  "20shandong4_p0.06_c7": {
+    "task": "20shandong4",
+    "prob_threshold": 0.06,
+    "min_count": 7,
+    "file_path": "E:\\Data\\843output\\20shandong4\\20shandong4_Final_p0.06_c7.tif",
+    "created_at": "2026-04-17 13:47:37",
+    "file_size_mb": 3.49
+  },
+  "20taiwan1_p0.07_c1": {
+    "task": "20taiwan1",
+    "prob_threshold": 0.07,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\20taiwan1\\20taiwan1_Final_p0.07_c1.tif",
+    "created_at": "2026-04-17 15:29:26",
+    "file_size_mb": 5.04
+  },
+  "20taiwan2_p0.07_c2": {
+    "task": "20taiwan2",
+    "prob_threshold": 0.07,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20taiwan2\\20taiwan2_Final_p0.07_c2.tif",
+    "created_at": "2026-04-17 16:07:46",
+    "file_size_mb": 3.83
+  },
+  "20taiwan3_p0.03_c1": {
+    "task": "20taiwan3",
+    "prob_threshold": 0.03,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\20taiwan3\\20taiwan3_Final_p0.03_c1.tif",
+    "created_at": "2026-04-17 17:39:12",
+    "file_size_mb": 3.7
+  },
+  "24fujian1_p0.05_c2": {
+    "task": "24fujian1",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24fujian1\\24fujian1_Final_p0.05_c2.tif",
+    "created_at": "2026-04-18 21:04:40",
+    "file_size_mb": 2.88
+  },
+  "24fujian2_p0.05_c2": {
+    "task": "24fujian2",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24fujian2\\24fujian2_Final_p0.05_c2.tif",
+    "created_at": "2026-04-19 14:57:52",
+    "file_size_mb": 4.97
+  },
+  "24hainan1_p0.05_c2": {
+    "task": "24hainan1",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24hainan1\\24hainan1_Final_p0.05_c2.tif",
+    "created_at": "2026-04-19 20:25:27",
+    "file_size_mb": 2.54
+  },
+  "24hainan2_p0.05_c2": {
+    "task": "24hainan2",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24hainan2\\24hainan2_Final_p0.05_c2.tif",
+    "created_at": "2026-04-19 21:04:07",
+    "file_size_mb": 2.52
+  },
+  "24hainan3_p0.05_c2": {
+    "task": "24hainan3",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24hainan3\\24hainan3_Final_p0.05_c2.tif",
+    "created_at": "2026-04-20 12:59:01",
+    "file_size_mb": 2.97
+  },
+  "24guangdong1_p0.05_c2": {
+    "task": "24guangdong1",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24guangdong1\\24guangdong1_Final_p0.05_c2.tif",
+    "created_at": "2026-04-21 00:50:50",
+    "file_size_mb": 5.96
+  },
+  "24guangdong3_p0.05_c2": {
+    "task": "24guangdong3",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24guangdong3\\24guangdong3_Final_p0.05_c2.tif",
+    "created_at": "2026-04-21 21:03:54",
+    "file_size_mb": 3.48
+  },
+  "24guangdong4_p0.05_c2": {
+    "task": "24guangdong4",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24guangdong4\\24guangdong4_Final_p0.05_c2.tif",
+    "created_at": "2026-04-21 22:51:49",
+    "file_size_mb": 2.91
+  },
+  "24guangxi_p0.05_c2": {
+    "task": "24guangxi",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24guangxi\\24guangxi_Final_p0.05_c2.tif",
+    "created_at": "2026-04-22 11:50:48",
+    "file_size_mb": 2.13
+  },
+  "24hebei2_p0.05_c2": {
+    "task": "24hebei2",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24hebei2\\24hebei2_Final_p0.05_c2.tif",
+    "created_at": "2026-04-22 18:11:29",
+    "file_size_mb": 2.11
+  },
+  "24jiangsu1_p0.05_c2": {
+    "task": "24jiangsu1",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24jiangsu1\\24jiangsu1_Final_p0.05_c2.tif",
+    "created_at": "2026-04-24 16:48:03",
+    "file_size_mb": 2.23
+  },
+  "24fujian1_p0.09_c3": {
+    "task": "24fujian1",
+    "prob_threshold": 0.09,
+    "min_count": 3,
+    "file_path": "E:\\Data\\843output\\24fujian1\\24fujian1_Final_p0.09_c3.tif",
+    "created_at": "2026-04-23 10:45:03",
+    "file_size_mb": 2.77
+  },
+  "24fujian2_p0.08_c1": {
+    "task": "24fujian2",
+    "prob_threshold": 0.08,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\24fujian2\\24fujian2_Final_p0.08_c1.tif",
+    "created_at": "2026-04-23 12:26:48",
+    "file_size_mb": 4.96
+  },
+  "24guangdong1_p0.18_c3": {
+    "task": "24guangdong1",
+    "prob_threshold": 0.18,
+    "min_count": 3,
+    "file_path": "E:\\Data\\843output\\24guangdong1\\24guangdong1_Final_p0.18_c3.tif",
+    "created_at": "2026-04-23 15:57:04",
+    "file_size_mb": 5.48
+  },
+  "24guangdong3_p0.15_c2": {
+    "task": "24guangdong3",
+    "prob_threshold": 0.15,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24guangdong3\\24guangdong3_Final_p0.15_c2.tif",
+    "created_at": "2026-04-23 19:11:35",
+    "file_size_mb": 3.27
+  },
+  "24guangdong2_p0.13_c2": {
+    "task": "24guangdong2",
+    "prob_threshold": 0.13,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24guangdong2\\24guangdong2_Final_p0.13_c2.tif",
+    "created_at": "2026-04-23 21:05:42",
+    "file_size_mb": 2.24
+  },
+  "24guangdong4_p0.04_c1": {
+    "task": "24guangdong4",
+    "prob_threshold": 0.04,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\24guangdong4\\24guangdong4_Final_p0.04_c1.tif",
+    "created_at": "2026-04-23 22:48:58",
+    "file_size_mb": 2.97
+  },
+  "24hainan1_p0.08_c2": {
+    "task": "24hainan1",
+    "prob_threshold": 0.08,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24hainan1\\24hainan1_Final_p0.08_c2.tif",
+    "created_at": "2026-04-23 23:38:35",
+    "file_size_mb": 2.53
+  },
+  "24hebei1_p0.09_c1": {
+    "task": "24hebei1",
+    "prob_threshold": 0.09,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\24hebei1\\24hebei1_Final_p0.09_c1.tif",
+    "created_at": "2026-04-24 11:13:00",
+    "file_size_mb": 2.03
+  },
+  "24hebei2_p0.09_c4": {
+    "task": "24hebei2",
+    "prob_threshold": 0.09,
+    "min_count": 4,
+    "file_path": "E:\\Data\\843output\\24hebei2\\24hebei2_Final_p0.09_c4.tif",
+    "created_at": "2026-04-24 15:12:42",
+    "file_size_mb": 2.04
+  },
+  "24jiangsu2_p0.01_c1": {
+    "task": "24jiangsu2",
+    "prob_threshold": 0.01,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\24jiangsu2\\24jiangsu2_Final_p0.01_c1.tif",
+    "created_at": "2026-04-24 18:12:06",
+    "file_size_mb": 2.84
+  },
+  "24jiangsu3_p0.07_c3": {
+    "task": "24jiangsu3",
+    "prob_threshold": 0.07,
+    "min_count": 3,
+    "file_path": "E:\\Data\\843output\\24jiangsu3\\24jiangsu3_Final_p0.07_c3.tif",
+    "created_at": "2026-04-24 19:18:11",
+    "file_size_mb": 1.84
+  },
+  "24liaoning1_p0.05_c2": {
+    "task": "24liaoning1",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24liaoning1\\24liaoning1_Final_p0.05_c2.tif",
+    "created_at": "2026-04-24 21:12:13",
+    "file_size_mb": 2.21
+  },
+  "24liaoning1_p0.05_c3": {
+    "task": "24liaoning1",
+    "prob_threshold": 0.05,
+    "min_count": 3,
+    "file_path": "E:\\Data\\843output\\24liaoning1\\24liaoning1_Final_p0.05_c3.tif",
+    "created_at": "2026-04-25 12:29:40",
+    "file_size_mb": 2.19
+  },
+  "24liaoning2_p0.05_c2": {
+    "task": "24liaoning2",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24liaoning2\\24liaoning2_Final_p0.05_c2.tif",
+    "created_at": "2026-04-25 14:26:54",
+    "file_size_mb": 1.77
+  },
+  "24liaoning2_p0.12_c4": {
+    "task": "24liaoning2",
+    "prob_threshold": 0.12,
+    "min_count": 4,
+    "file_path": "E:\\Data\\843output\\24liaoning2\\24liaoning2_Final_p0.12_c4.tif",
+    "created_at": "2026-04-25 19:46:38",
+    "file_size_mb": 1.68
+  },
+  "24liaoning3_p0.11_c2": {
+    "task": "24liaoning3",
+    "prob_threshold": 0.11,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24liaoning3\\24liaoning3_Final_p0.11_c2.tif",
+    "created_at": "2026-04-25 23:37:29",
+    "file_size_mb": 3.11
+  },
+  "24shandong1_p0.05_c2": {
+    "task": "24shandong1",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24shandong1\\24shandong1_Final_p0.05_c2.tif",
+    "created_at": "2026-04-26 13:17:41",
+    "file_size_mb": 2.21
+  },
+  "24shandong1_p0.01_c3": {
+    "task": "24shandong1",
+    "prob_threshold": 0.01,
+    "min_count": 3,
+    "file_path": "E:\\Data\\843output\\24shandong1\\24shandong1_Final_p0.01_c3.tif",
+    "created_at": "2026-04-26 16:31:01",
+    "file_size_mb": 2.18
+  },
+  "24shandong2_p0.05_c2": {
+    "task": "24shandong2",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24shandong2\\24shandong2_Final_p0.05_c2.tif",
+    "created_at": "2026-04-26 19:25:08",
+    "file_size_mb": 2.54
+  },
+  "24shandong2_p0.08_c1": {
+    "task": "24shandong2",
+    "prob_threshold": 0.08,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\24shandong2\\24shandong2_Final_p0.08_c1.tif",
+    "created_at": "2026-04-26 22:07:34",
+    "file_size_mb": 2.52
+  },
+  "24shandong3_p0.05_c2": {
+    "task": "24shandong3",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24shandong3\\24shandong3_Final_p0.05_c2.tif",
+    "created_at": "2026-04-27 01:20:38",
+    "file_size_mb": 2.57
+  },
+  "24shandong3_p0.11_c1": {
+    "task": "24shandong3",
+    "prob_threshold": 0.11,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\24shandong3\\24shandong3_Final_p0.11_c1.tif",
+    "created_at": "2026-04-27 14:17:00",
+    "file_size_mb": 2.54
+  },
+  "24shandong4_p0.05_c2": {
+    "task": "24shandong4",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24shandong4\\24shandong4_Final_p0.05_c2.tif",
+    "created_at": "2026-04-27 19:05:04",
+    "file_size_mb": 3.46
+  },
+  "24shandong4_p0.03_c3": {
+    "task": "24shandong4",
+    "prob_threshold": 0.03,
+    "min_count": 3,
+    "file_path": "E:\\Data\\843output\\24shandong4\\24shandong4_Final_p0.03_c3.tif",
+    "created_at": "2026-04-28 14:32:24",
+    "file_size_mb": 3.46
+  },
+  "24shanghai_p0.05_c2": {
+    "task": "24shanghai",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24shanghai\\24shanghai_Final_p0.05_c2.tif",
+    "created_at": "2026-04-28 17:37:13",
+    "file_size_mb": 3.1
+  },
+  "24shanghai_p0.05_c3": {
+    "task": "24shanghai",
+    "prob_threshold": 0.05,
+    "min_count": 3,
+    "file_path": "E:\\Data\\843output\\24shanghai\\24shanghai_Final_p0.05_c3.tif",
+    "created_at": "2026-04-28 19:29:19",
+    "file_size_mb": 3.08
+  },
+  "24taiwan1_p0.05_c2": {
+    "task": "24taiwan1",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24taiwan1\\24taiwan1_Final_p0.05_c2.tif",
+    "created_at": "2026-04-28 22:49:29",
+    "file_size_mb": 5.14
+  },
+  "24taiwan1_p0.19_c1": {
+    "task": "24taiwan1",
+    "prob_threshold": 0.19,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\24taiwan1\\24taiwan1_Final_p0.19_c1.tif",
+    "created_at": "2026-04-29 10:35:59",
+    "file_size_mb": 5.11
+  },
+  "24taiwan2_p0.05_c2": {
+    "task": "24taiwan2",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24taiwan2\\24taiwan2_Final_p0.05_c2.tif",
+    "created_at": "2026-04-29 12:00:47",
+    "file_size_mb": 3.86
+  },
+  "24taiwan2_p0.01_c4": {
+    "task": "24taiwan2",
+    "prob_threshold": 0.01,
+    "min_count": 4,
+    "file_path": "E:\\Data\\843output\\24taiwan2\\24taiwan2_Final_p0.01_c4.tif",
+    "created_at": "2026-04-29 17:11:47",
+    "file_size_mb": 3.82
+  },
+  "24taiwan3_p0.05_c2": {
+    "task": "24taiwan3",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24taiwan3\\24taiwan3_Final_p0.05_c2.tif",
+    "created_at": "2026-04-29 19:37:10",
+    "file_size_mb": 3.64
+  },
+  "24taiwan3_p0.03_c4": {
+    "task": "24taiwan3",
+    "prob_threshold": 0.03,
+    "min_count": 4,
+    "file_path": "E:\\Data\\843output\\24taiwan3\\24taiwan3_Final_p0.03_c4.tif",
+    "created_at": "2026-04-30 09:42:45",
+    "file_size_mb": 3.62
+  },
+  "24tianjin_p0.05_c2": {
+    "task": "24tianjin",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24tianjin\\24tianjin_Final_p0.05_c2.tif",
+    "created_at": "2026-04-30 11:22:38",
+    "file_size_mb": 2.43
+  },
+  "24tianjin_p0.04_c1": {
+    "task": "24tianjin",
+    "prob_threshold": 0.04,
+    "min_count": 1,
+    "file_path": "E:\\Data\\843output\\24tianjin\\24tianjin_Final_p0.04_c1.tif",
+    "created_at": "2026-04-30 16:55:47",
+    "file_size_mb": 2.53
+  },
+  "24zhejiang1_p0.05_c2": {
+    "task": "24zhejiang1",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24zhejiang1\\24zhejiang1_Final_p0.05_c2.tif",
+    "created_at": "2026-05-02 19:07:25",
+    "file_size_mb": 2.09
+  },
+  "24zhejiang1_p0.13_c2": {
+    "task": "24zhejiang1",
+    "prob_threshold": 0.13,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24zhejiang1\\24zhejiang1_Final_p0.13_c2.tif",
+    "created_at": "2026-05-02 19:13:45",
+    "file_size_mb": 2.07
+  },
+  "24zhejiang2_p0.05_c2": {
+    "task": "24zhejiang2",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24zhejiang2\\24zhejiang2_Final_p0.05_c2.tif",
+    "created_at": "2026-05-02 21:25:59",
+    "file_size_mb": 4.43
+  },
+  "24zhejiang3_p0.05_c2": {
+    "task": "24zhejiang3",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\24zhejiang3\\24zhejiang3_Final_p0.05_c2.tif",
+    "created_at": "2026-05-03 15:12:03",
+    "file_size_mb": 3.35
+  },
+  "24zhejiang3_p0.07_c3": {
+    "task": "24zhejiang3",
+    "prob_threshold": 0.07,
+    "min_count": 3,
+    "file_path": "E:\\Data\\843output\\24zhejiang3\\24zhejiang3_Final_p0.07_c3.tif",
+    "created_at": "2026-05-03 22:50:30",
+    "file_size_mb": 3.32
+  },
+  "25fujian1_p0.05_c2": {
+    "task": "25fujian1",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\25fujian1\\25fujian1_Final_p0.05_c2.tif",
+    "created_at": "2026-05-04 15:36:33",
+    "file_size_mb": 2.85
+  },
+  "25fujian1_p0.09_c4": {
+    "task": "25fujian1",
+    "prob_threshold": 0.09,
+    "min_count": 4,
+    "file_path": "E:\\Data\\843output\\25fujian1\\25fujian1_Final_p0.09_c4.tif",
+    "created_at": "2026-05-05 11:58:05",
+    "file_size_mb": 2.73
+  },
+  "25fujian2_p0.05_c2": {
+    "task": "25fujian2",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\25fujian2\\25fujian2_Final_p0.05_c2.tif",
+    "created_at": "2026-05-05 21:57:16",
+    "file_size_mb": 5.01
+  },
+  "25fujian2_p0.04_c2": {
+    "task": "25fujian2",
+    "prob_threshold": 0.04,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\25fujian2\\25fujian2_Final_p0.04_c2.tif",
+    "created_at": "2026-05-06 16:57:36",
+    "file_size_mb": 5.01
+  },
+  "25guangdong2_p0.05_c2": {
+    "task": "25guangdong2",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\25guangdong2\\25guangdong2_Final_p0.05_c2.tif",
+    "created_at": "2026-05-06 22:02:04",
+    "file_size_mb": 2.44
+  },
+  "25guangdong2_p0.17_c4": {
+    "task": "25guangdong2",
+    "prob_threshold": 0.17,
+    "min_count": 4,
+    "file_path": "E:\\Data\\843output\\25guangdong2\\25guangdong2_Final_p0.17_c4.tif",
+    "created_at": "2026-05-07 09:45:51",
+    "file_size_mb": 2.23
+  },
+  "20_5b_zhejiang1_index": {
+    "task": "20_5b_zhejiang1",
+    "method": "index",
+    "prob_threshold": null,
+    "min_count": null,
+    "file_path": "E:\\Data\\843output\\20_5b_zhejiang1\\20_5b_zhejiang1_Index_Final.tif",
+    "created_at": "2026-05-17 20:14:44",
+    "file_size_mb": 1.79
+  },
+  "20zhejiang1_p0.05_c2": {
+    "task": "20zhejiang1",
+    "prob_threshold": 0.05,
+    "min_count": 2,
+    "file_path": "E:\\Data\\843output\\20zhejiang1\\20zhejiang1_Final_p0.05_c2.shp",
+    "created_at": "2026-06-26 12:50:36",
+    "file_size_mb": 2.03
+  }
+}

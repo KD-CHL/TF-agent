@@ -1,0 +1,63 @@
+# Secrets
+.env
+.env.local
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+.cursor/
+
+# Logs & temp
+*.log
+streamlit.out.log
+streamlit.err.log
+_chat_upload_tmp/
+_analysis_vec_tmp/
+**/chroma.sqlite3
+agent_debug.log
+
+# Large data & models
+_e2e_sandbox/
+DATA/
+*.tif
+*.tiff
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.safetensors
+*.bin
+*.pth
+*.7z
+Qwen*/
+qwen_rs_agent_lora/
+Qwen_Agent_Merged/
+Llama-Factory/
+llamaboard_cache/
+rs_knowledge_db/
+research/jb/e1_workspace/outputs_e1/
+research/jb/e1_workspace/E1_rasters/
+research/jb/point/
+research/jb/边缘验证点/
+research/jb/water-line/
+
+# Third-party / local tooling
+ngrok/
+gee/
+
+# OS
+Thumbs.db
+.DS_Store
+analysis_out.txt
+scan_out.txt

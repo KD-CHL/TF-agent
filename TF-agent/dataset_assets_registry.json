@@ -1,0 +1,146 @@
+{
+  "advisor_china_tidal_flat_2020": {
+    "id": "advisor_china_tidal_flat_2020",
+    "source": "advisor",
+    "role": "reference_truth",
+    "format": "shapefile",
+    "coverage_scale": "national",
+    "geographic_scope": "中国全域（矢量）；与区域 TIF 对比时有效区为预测图范围",
+    "year": 2020,
+    "title": "师姐·全国潮滩矢量 2020",
+    "primary_path": "DATA/sqq_TF_20-25/china_tidal_flat_projected_2020.shp",
+    "license": "internal",
+    "tags": [
+      "tidal_flat",
+      "china",
+      "reference_shp",
+      "year_2020"
+    ],
+    "related_task_hints": [],
+    "pairing_note": "与 combine.evaluate_tif_vs_shp 一致：SHP 重投影到预测 TIF 的 CRS，再按 TIF 网格栅格化后算 IoU/F1 等。",
+    "aliases": [
+      "师姐2020",
+      "china_tidal_flat_2020"
+    ],
+    "description": "",
+    "crs": "",
+    "notes": "",
+    "registered_at": "2026-04-05 15:14:10",
+    "shapefile_sidecars": {
+      "shx": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2020.shx",
+      "dbf": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2020.dbf",
+      "prj": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2020.prj",
+      "cpg": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2020.cpg",
+      "sbn": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2020.sbn",
+      "sbx": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2020.sbx"
+    }
+  },
+  "advisor_china_tidal_flat_2022": {
+    "id": "advisor_china_tidal_flat_2022",
+    "source": "advisor",
+    "role": "reference_truth",
+    "format": "shapefile",
+    "coverage_scale": "national",
+    "geographic_scope": "中国全域（矢量）；与区域 TIF 对比时有效区为预测图范围",
+    "year": 2022,
+    "title": "师姐·全国潮滩矢量 2022",
+    "primary_path": "DATA/sqq_TF_20-25/china_tidal_flat_projected_2022.shp",
+    "license": "internal",
+    "tags": [
+      "tidal_flat",
+      "china",
+      "reference_shp",
+      "year_2022"
+    ],
+    "related_task_hints": [],
+    "pairing_note": "与 combine.evaluate_tif_vs_shp 一致：SHP 重投影到预测 TIF 的 CRS，再按 TIF 网格栅格化后算 IoU/F1 等。",
+    "aliases": [
+      "师姐2022",
+      "china_tidal_flat_2022"
+    ],
+    "description": "",
+    "crs": "",
+    "notes": "",
+    "registered_at": "2026-04-05 15:14:10",
+    "shapefile_sidecars": {
+      "shx": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2022.shx",
+      "dbf": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2022.dbf",
+      "prj": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2022.prj",
+      "cpg": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2022.cpg",
+      "sbn": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2022.sbn",
+      "sbx": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2022.sbx"
+    }
+  },
+  "advisor_china_tidal_flat_2024": {
+    "id": "advisor_china_tidal_flat_2024",
+    "source": "advisor",
+    "role": "reference_truth",
+    "format": "shapefile",
+    "coverage_scale": "national",
+    "geographic_scope": "中国全域（矢量）；与区域 TIF 对比时有效区为预测图范围",
+    "year": 2024,
+    "title": "师姐·全国潮滩矢量 2024",
+    "primary_path": "DATA/sqq_TF_20-25/china_tidal_flat_projected_2024.shp",
+    "license": "internal",
+    "tags": [
+      "tidal_flat",
+      "china",
+      "reference_shp",
+      "year_2024"
+    ],
+    "related_task_hints": [],
+    "pairing_note": "与 combine.evaluate_tif_vs_shp 一致：SHP 重投影到预测 TIF 的 CRS，再按 TIF 网格栅格化后算 IoU/F1 等。",
+    "aliases": [
+      "师姐2024",
+      "china_tidal_flat_2024"
+    ],
+    "description": "",
+    "crs": "",
+    "notes": "",
+    "registered_at": "2026-04-05 15:14:10",
+    "shapefile_sidecars": {
+      "shx": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2024.shx",
+      "dbf": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2024.dbf",
+      "prj": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2024.prj",
+      "cpg": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2024.cpg",
+      "sbn": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2024.sbn",
+      "sbx": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2024.sbx"
+    }
+  },
+  "advisor_china_tidal_flat_2025": {
+    "id": "advisor_china_tidal_flat_2025",
+    "source": "advisor",
+    "role": "reference_truth",
+    "format": "shapefile",
+    "coverage_scale": "national",
+    "geographic_scope": "中国全域（矢量）；与区域 TIF 对比时有效区为预测图范围",
+    "year": 2025,
+    "title": "师姐·全国潮滩矢量 2025",
+    "primary_path": "DATA/sqq_TF_20-25/china_tidal_flat_projected_2025.shp",
+    "license": "internal",
+    "tags": [
+      "tidal_flat",
+      "china",
+      "reference_shp",
+      "year_2025"
+    ],
+    "related_task_hints": [],
+    "pairing_note": "与 combine.evaluate_tif_vs_shp 一致：SHP 重投影到预测 TIF 的 CRS，再按 TIF 网格栅格化后算 IoU/F1 等。",
+    "aliases": [
+      "师姐2025",
+      "china_tidal_flat_2025"
+    ],
+    "description": "",
+    "crs": "",
+    "notes": "",
+    "registered_at": "2026-04-05 15:14:10",
+    "shapefile_sidecars": {
+      "shx": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2025.shx",
+      "dbf": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2025.dbf",
+      "prj": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2025.prj",
+      "cpg": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2025.cpg",
+      "sbn": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2025.sbn",
+      "sbx": "e:\\Code\\GEE\\YYnet\\DATA\\sqq_TF_20-25\\china_tidal_flat_projected_2025.sbx"
+    }
+  }
+}

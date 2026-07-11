@@ -1,0 +1,7 @@
+# 单端口网关模式（推荐）：先启动 cstf_gateway.py，再 ngrok 转发 9080
+#   ngrok start cstf --config "%LOCALAPPDATA%\ngrok\ngrok.yml" --config "E:\Code\GEE\ngrok\cstf-tunnels.yml"
+version: "3"
+tunnels:
+  cstf:
+    addr: 9080
+    proto: http
