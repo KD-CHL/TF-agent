@@ -49,14 +49,43 @@ _BASE_IMAGERY_CANDIDATES = [
 ]
 
 # 默认框选中国大陆（略收紧边界，使视口尽可能铺满中国）
-_CHINA_VIEW_RECT = {"west": 78.0, "south": 21.0, "east": 128.0, "north": 50.0}
+_CHINA_VIEW_RECT = {"west": 73.0, "south": 17.0, "east": 136.0, "north": 54.0}
+
+# 统一相机视觉风格：初始中国总览与 Agent 跳转共用 heading/pitch/roll
+# pitch 需足够俯视（约 -55°），否则 fromDegrees 高度点 + 浅俯角会把地球甩到画面底部/地平线
+DEFAULT_CAMERA = {
+    "heading_deg": 0.0,
+    "pitch_deg": -55.0,
+    "roll_deg": 0.0,
+    "duration": 1.2,
+    # lookAt 距离（米）：对准中国中心，框入完整中国陆域
+    "china_range_m": 4_800_000.0,
+    "china_center": {"lat": 36.0, "lon": 104.0},
+    # 海湾级 / 点位 lookAt 距离
+    "region_range_m": 280_000.0,
+    "point_range_m": 90_000.0,
+}
 
 
 def zoom_to_height_m(zoom: int, lat: float = 30.0) -> float:
+    """将 Web 地图缩放级别映射为 Cesium lookAt 距离（米）。"""
     z = max(1, min(18, int(zoom)))
-    lat_r = math.radians(lat)
-    h = 40_075_016.686 * math.cos(lat_r) / (256 * (2**z)) * 2.5
-    return float(max(800_000, min(h, 12_000_000)))
+    if z <= 4:
+        return float(DEFAULT_CAMERA["china_range_m"])
+    if z <= 7:
+        return 1_000_000.0
+    if z <= 10:
+        return float(DEFAULT_CAMERA["region_range_m"])
+    if z <= 12:
+        return float(DEFAULT_CAMERA["point_range_m"])
+    return 35_000.0
+
+
+def height_from_rectangle_span(west: float, south: float, east: float, north: float) -> float:
+    """由矩形跨度估算观察高度，保持与 DEFAULT_CAMERA 相同的斜视风格。"""
+    span = max(abs(east - west), abs(north - south), 0.02)
+    h = span * 111_000.0 * 2.4
+    return float(max(8_000.0, min(h, 8_000_000.0)))
 
 
 def view_from_vector_path(path: str) -> Optional[Tuple[float, float, int]]:
@@ -241,6 +270,8 @@ def get_raster_tile_overlay(
     path: str,
     tile_clients: Dict[str, Any],
     globe_port: Optional[int] = None,
+    *,
+    force_local: bool = False,
 ) -> Optional[dict]:
     try:
         from localtileserver import TileClient
@@ -277,7 +308,7 @@ def get_raster_tile_overlay(
         import globe_server as gs
 
         token = gs.register_tile_template(key, raw_url)
-        url = gs.overlay_tile_url(globe_port, token)
+        url = gs.overlay_tile_url(globe_port, token, force_local=force_local)
     else:
         url = raw_url
     return {
@@ -314,13 +345,15 @@ def build_globe_payload(
     zoom: int,
     result_path: Optional[str] = None,
     opacity_pct: float = 50.0,
-    pitch_deg: float = -35.0,
+    pitch_deg: float = -55.0,
     e1_report: Optional[dict] = None,
     show_e1_overlay: bool = False,
     tile_clients: Optional[Dict[str, Any]] = None,
     ion_token: Optional[str] = None,
     show_borders: bool = True,
     globe_port: Optional[int] = None,
+    prefer_center: bool = False,
+    force_local: bool = False,
 ) -> dict:
     lat, lon = float(center[0]), float(center[1])
     tile_clients = tile_clients if tile_clients is not None else {}
@@ -328,9 +361,12 @@ def build_globe_payload(
     payload: Dict[str, Any] = {
         "center": {"lat": lat, "lon": lon},
         "height": zoom_to_height_m(zoom, lat),
-        "pitch": float(pitch_deg),
-        "heading": 0.0,
+        "pitch": float(pitch_deg if pitch_deg is not None else DEFAULT_CAMERA["pitch_deg"]),
+        "heading": float(DEFAULT_CAMERA["heading_deg"]),
+        "roll": float(DEFAULT_CAMERA["roll_deg"]),
+        "duration": float(DEFAULT_CAMERA["duration"]),
         "flyRectangle": None,
+        "preferCenter": bool(prefer_center),
         "geojsonLayers": [],
         "imageryLayers": [],
         "opacity": max(0.05, min(1.0, opacity_pct / 100.0)),
@@ -340,6 +376,17 @@ def build_globe_payload(
         "naturalEarthUrl": _CESIUM_NEII_URL,
         "assetName": None,
         "chinaView": dict(_CHINA_VIEW_RECT),
+        "defaultCamera": {
+            "headingDeg": float(DEFAULT_CAMERA["heading_deg"]),
+            "pitchDeg": float(DEFAULT_CAMERA["pitch_deg"]),
+            "rollDeg": float(DEFAULT_CAMERA["roll_deg"]),
+            "duration": float(DEFAULT_CAMERA["duration"]),
+            "chinaRange": float(DEFAULT_CAMERA["china_range_m"]),
+            "regionRange": float(DEFAULT_CAMERA["region_range_m"]),
+            "pointRange": float(DEFAULT_CAMERA["point_range_m"]),
+            "chinaCenter": dict(DEFAULT_CAMERA["china_center"]),
+        },
+        "debugCamera": bool(os.environ.get("CSTF_GLOBE_DEBUG", "").strip() in {"1", "true", "yes"}),
     }
 
     rects: List[Tuple[float, float, float, float]] = []
@@ -358,7 +405,9 @@ def build_globe_payload(
             if b:
                 rects.append(b)
         elif ext in {".tif", ".tiff"}:
-            tile = get_raster_tile_overlay(result_path, tile_clients, globe_port=globe_port)
+            tile = get_raster_tile_overlay(
+                result_path, tile_clients, globe_port=globe_port, force_local=force_local
+            )
             if tile:
                 payload["imageryLayers"].append(
                     {
@@ -386,7 +435,9 @@ def build_globe_payload(
                         {"name": "E1", "data": gj, "color": "#ff6b35", "alpha": 0.65}
                     )
             elif ext in {".tif", ".tiff"}:
-                tile = get_raster_tile_overlay(e1_path, tile_clients, globe_port=globe_port)
+                tile = get_raster_tile_overlay(
+                    e1_path, tile_clients, globe_port=globe_port, force_local=force_local
+                )
                 if tile:
                     payload["imageryLayers"].append(
                         {
@@ -403,7 +454,8 @@ def build_globe_payload(
                     )
                     rects.append((tile["west"], tile["south"], tile["east"], tile["north"]))
 
-    if rects:
+    if rects and not prefer_center:
+        # 有成果图层时默认飞到图层范围；智能体显式跳转时 prefer_center=True，改用 center/height
         west = min(r[0] for r in rects)
         south = min(r[1] for r in rects)
         east = max(r[2] for r in rects)
@@ -416,7 +468,7 @@ def build_globe_payload(
             "east": east + pad_lon,
             "north": north + pad_lat,
         }
-    elif result_path:
+    elif result_path and not prefer_center:
         auto = view_from_asset_path(result_path)
         if auto:
             payload["center"] = {"lat": auto[0], "lon": auto[1]}
@@ -561,6 +613,12 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
     showError("底图加载失败，请检查 CESIUM_ION_TOKEN 或网络。");
   }}
 
+  // Viewer 原则上每个 iframe 生命周期只创建一次；Agent 跳转应走 postMessage，勿重建页面
+  window.__cstfViewerInitCount = (window.__cstfViewerInitCount || 0) + 1;
+  if (CFG.debugCamera) {{
+    console.debug("[CesiumViewer] initialized", window.__cstfViewerInitCount);
+  }}
+
   let viewer;
   try {{
     viewer = new Cesium.Viewer("cesiumContainer", {{
@@ -578,7 +636,9 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
       shouldAnimate: false,
       skyBox: false,
       skyAtmosphere: false,
-      requestRenderMode: false,
+      // 静止时少占 GPU；相机/图层变更后主动 requestRender
+      requestRenderMode: true,
+      maximumRenderTimeChange: Infinity,
       baseLayer: false,
     }});
   }} catch (err) {{
@@ -591,12 +651,25 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
   viewer.scene.backgroundColor = Cesium.Color.fromBytes(2, 4, 12, 255);
   viewer.scene.globe.show = true;
   viewer.scene.globe.depthTestAgainstTerrain = false;
+  viewer.scene.globe.maximumScreenSpaceError = 2;
+  viewer.scene.fxaa = true;
   if (viewer.cesiumWidget && viewer.cesiumWidget.container) {{
     viewer.cesiumWidget.container.style.width = "100%";
     viewer.cesiumWidget.container.style.height = "100%";
   }}
+  // 禁止 Entity 跟踪改相机；Home 按钮走统一导航
+  viewer.trackedEntity = undefined;
+  try {{
+    if (viewer.homeButton && viewer.homeButton.viewModel) {{
+      viewer.homeButton.viewModel.command.beforeExecute.addEventListener(function(e) {{
+        e.cancel = true;
+        navigateToChinaOverview({{ duration: 1.2, source: "homeButton" }});
+      }});
+    }}
+  }} catch (e) {{}}
 
   await setupBaseImagery(viewer);
+  viewer.scene.requestRender();
 
   function hexToCesiumColor(hex, alpha) {{
     const h = hex.replace("#", "");
@@ -638,38 +711,314 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
     return Cesium.Rectangle.fromDegrees(box.west, box.south, box.east, box.north);
   }}
 
-  function flyToRect(rect, duration) {{
-    // 矩形 flyTo 由 Cesium 自动计算距离，使目标区域尽可能铺满视口
-    viewer.camera.flyTo({{ destination: rect, duration: duration || 0 }});
+  const CAM = CFG.defaultCamera || {{}};
+  const DEG2RAD = Cesium.Math.toRadians;
+  let _navSeq = 0;
+  let _lastNavKey = "";
+
+  function cameraSnapshot() {{
+    const c = viewer.camera.positionCartographic;
+    return {{
+      lon: Cesium.Math.toDegrees(c.longitude),
+      lat: Cesium.Math.toDegrees(c.latitude),
+      height: c.height,
+      heading: Cesium.Math.toDegrees(viewer.camera.heading),
+      pitch: Cesium.Math.toDegrees(viewer.camera.pitch),
+      roll: Cesium.Math.toDegrees(viewer.camera.roll),
+    }};
   }}
 
-  function applyCameraView() {{
+  function debugCamera(tag, extra) {{
+    if (!CFG.debugCamera) return;
+    console.debug("[MapCamera]", tag, extra || "", cameraSnapshot());
+  }}
+
+  function defaultPitchDeg() {{
+    const p = (CFG.pitch != null ? CFG.pitch : (CAM.pitchDeg != null ? CAM.pitchDeg : -55));
+    return Number(p);
+  }}
+
+  function defaultHeadingDeg() {{
+    const h = (CFG.heading != null ? CFG.heading : (CAM.headingDeg != null ? CAM.headingDeg : 0));
+    return Number(h);
+  }}
+
+  function heightForRectangle(box) {{
+    const west = Number(box.west), south = Number(box.south);
+    const east = Number(box.east), north = Number(box.north);
+    const span = Math.max(Math.abs(east - west), Math.abs(north - south), 0.02);
+    const h = span * 111000 * 2.8;
+    return Math.max(60000, Math.min(h, 6000000));
+  }}
+
+  // 用 lookAt 对准目标点：避免「相机站在目标正上方 + 浅俯角」导致地球掉到底部/只见地平线
+  function applyLookAtView(lon, lat, range, pitchDeg, headingDeg) {{
+    const target = Cesium.Cartesian3.fromDegrees(lon, lat, 0);
+    const offset = new Cesium.HeadingPitchRange(
+      DEG2RAD(headingDeg),
+      DEG2RAD(pitchDeg),
+      Math.max(1000, range)
+    );
+    viewer.camera.lookAt(target, offset);
+    // 解锁相机，否则用户无法拖拽，后续 flyTo 也会异常
+    viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+  }}
+
+  function navigateToLocation(opts) {{
+    if (!viewer || !opts) return false;
+    const lon = Number(opts.longitude ?? opts.lon);
+    const lat = Number(opts.latitude ?? opts.lat);
+    let range = Number(opts.height ?? opts.heightM ?? opts.range);
+    if (!isFinite(lon) || !isFinite(lat) || lon < -180 || lon > 180 || lat < -90 || lat > 90) {{
+      console.warn("[MapCamera] invalid lon/lat", opts);
+      return false;
+    }}
+    if (!isFinite(range) || range <= 0) {{
+      range = Number(CFG.height) || Number(CAM.regionRange) || 280000;
+    }}
+    const duration = (opts.duration != null && isFinite(Number(opts.duration)))
+      ? Number(opts.duration)
+      : Number(CFG.duration || CAM.duration || 1.2);
+    const pitchDeg = (opts.pitch != null) ? Number(opts.pitch) : defaultPitchDeg();
+    const headingDeg = (opts.heading != null) ? Number(opts.heading) : defaultHeadingDeg();
+    const key = [lat.toFixed(4), lon.toFixed(4), range.toFixed(0), pitchDeg.toFixed(1)].join("|");
+    if (_lastNavKey === key && !opts.force) {{
+      debugCamera("skip duplicate", {{ source: opts.source || "unknown" }});
+      return true;
+    }}
+    _lastNavKey = key;
+    const seq = ++_navSeq;
+    debugCamera("before navigation", {{
+      target: {{ lat, lon, range, pitchDeg, headingDeg }},
+      source: opts.source || "unknown",
+    }});
+
+    try {{ viewer.trackedEntity = undefined; }} catch (e) {{}}
+    try {{
+      if (viewer.camera && viewer.camera.cancelFlight) viewer.camera.cancelFlight();
+    }} catch (e) {{}}
+
+    const target = Cesium.Cartesian3.fromDegrees(lon, lat, 0);
+    const sphere = new Cesium.BoundingSphere(target, Math.max(range * 0.08, 2000));
+    const offset = new Cesium.HeadingPitchRange(
+      DEG2RAD(headingDeg),
+      DEG2RAD(pitchDeg),
+      Math.max(1000, range)
+    );
+    const complete = function() {{
+      if (seq !== _navSeq) return;
+      try {{ viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY); }} catch (e) {{}}
+      debugCamera("after navigation", {{ source: opts.source || "unknown" }});
+      viewer.scene.requestRender();
+    }};
+
+    try {{
+      if (duration <= 0.05) {{
+        applyLookAtView(lon, lat, range, pitchDeg, headingDeg);
+        complete();
+      }} else {{
+        viewer.camera.flyToBoundingSphere(sphere, {{
+          duration: duration,
+          offset: offset,
+          complete: complete,
+        }});
+      }}
+    }} catch (err) {{
+      console.warn("[MapCamera] flyToBoundingSphere failed, fallback lookAt", err);
+      try {{
+        applyLookAtView(lon, lat, range, pitchDeg, headingDeg);
+        complete();
+      }} catch (e2) {{
+        return false;
+      }}
+    }}
+    viewer.scene.requestRender();
+    return true;
+  }}
+
+  function navigateToRectangle(box, opts) {{
+    if (!box) return false;
+    const rect = rectFromCfg(box);
+    const center = Cesium.Rectangle.center(rect);
+    const lon = Cesium.Math.toDegrees(center.longitude);
+    const lat = Cesium.Math.toDegrees(center.latitude);
+    const range = heightForRectangle(box);
+    return navigateToLocation({{
+      longitude: lon,
+      latitude: lat,
+      height: range,
+      duration: (opts && opts.duration != null) ? opts.duration : (CFG.duration || 1.0),
+      source: (opts && opts.source) || "rectangle",
+      force: !!(opts && opts.force),
+    }});
+  }}
+
+  function navigateToChinaOverview(opts) {{
+    const cv = CFG.chinaView || {{ west: 78, south: 21, east: 128, north: 50 }};
+    const rect = rectFromCfg(cv);
+    const cc = CAM.chinaCenter || {{ lat: 36, lon: 104 }};
+    const range = Number(CAM.chinaRange || 4800000);
+    const src = (opts && opts.source) || "chinaOverview";
+    const duration = (opts && opts.duration != null) ? opts.duration : 0.8;
+    const pitchDeg = defaultPitchDeg();
+    const headingDeg = defaultHeadingDeg();
+
+    try {{ viewer.trackedEntity = undefined; }} catch (e) {{}}
+    try {{
+      if (viewer.camera && viewer.camera.cancelFlight) viewer.camera.cancelFlight();
+    }} catch (e) {{}}
+
+    let ok = false;
+    try {{
+      if (duration <= 0.05) {{
+        // 首次加载：矩形铺满视口 = 完整中国地图（最稳妥）
+        viewer.camera.setView({{ destination: rect }});
+        ok = true;
+      }} else {{
+        // 带动画：包围球 + 俯视角，既框入中国又保持三维倾斜
+        const sphere = Cesium.BoundingSphere.fromRectangle3D(rect);
+        const offset = new Cesium.HeadingPitchRange(
+          DEG2RAD(headingDeg),
+          DEG2RAD(pitchDeg),
+          0
+        );
+        viewer.camera.flyToBoundingSphere(sphere, {{
+          duration: duration,
+          offset: offset,
+          complete: function() {{
+            try {{ viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY); }} catch (e) {{}}
+            viewer.scene.requestRender();
+          }},
+        }});
+        ok = true;
+      }}
+    }} catch (err) {{
+      console.warn("[MapCamera] china overview failed, fallback lookAt", err);
+      ok = navigateToLocation({{
+        longitude: cc.lon,
+        latitude: cc.lat,
+        height: range,
+        pitch: pitchDeg,
+        heading: headingDeg,
+        duration: 0,
+        source: src,
+        force: true,
+      }});
+    }}
+
+    try {{
+      console.info("[Cesium Init Camera]", {{
+        longitude: cc.lon,
+        latitude: cc.lat,
+        range: range,
+        heading: headingDeg,
+        pitch: pitchDeg,
+        roll: 0,
+        source: src,
+        mode: duration <= 0.05 ? "setView(rect)" : "flyToBoundingSphere",
+        ok: !!ok,
+      }});
+    }} catch (e) {{}}
+    viewer.scene.requestRender();
+    return ok;
+  }}
+
+  function isDefaultChinaOverview(c) {{
+    if (!c) return true;
+    if (CFG.preferCenter) return false;
+    const cc = CAM.chinaCenter || {{ lat: 36, lon: 104 }};
+    return Math.abs(Number(c.lat) - Number(cc.lat)) < 2.5 &&
+      Math.abs(Number(c.lon) - Number(cc.lon)) < 6.0;
+  }}
+
+  function applyCameraView(source) {{
     viewer.resize();
     if (viewer.cesiumWidget && viewer.cesiumWidget.container) {{
       viewer.cesiumWidget.container.style.width = "100%";
       viewer.cesiumWidget.container.style.height = "100%";
     }}
     const cv = CFG.chinaView || {{ west: 78, south: 21, east: 128, north: 50 }};
-    const chinaRect = rectFromCfg(cv);
-    Cesium.Camera.DEFAULT_VIEW_RECTANGLE = chinaRect;
+    Cesium.Camera.DEFAULT_VIEW_RECTANGLE = rectFromCfg(cv);
+    const base = document.getElementById("cesiumStatus")?.textContent || "底图就绪";
 
-    if (CFG.flyRectangle) {{
-      flyToRect(rectFromCfg(CFG.flyRectangle), 0.8);
-      if (CFG.assetName) {{
-        const base = document.getElementById("cesiumStatus")?.textContent || "底图就绪";
-        setStatus(base + " · 已加载 " + CFG.assetName);
-      }}
+    // 1) 成果图层：用矩形中心+固定高度+固定姿态（不用无 orientation 的 flyToRect）
+    if (CFG.flyRectangle && !CFG.preferCenter) {{
+      navigateToRectangle(CFG.flyRectangle, {{ duration: 0.9, source: source || "assetRect" }});
+      if (CFG.assetName) setStatus(base + " · 已加载 " + CFG.assetName);
       return;
     }}
 
-    flyToRect(chinaRect, 0);
-    const base = document.getElementById("cesiumStatus")?.textContent || "底图就绪";
+    // 2) Copilot / 会话 center+height
+    if (CFG.center && !isDefaultChinaOverview(CFG.center)) {{
+      if (navigateToLocation({{
+        longitude: CFG.center.lon,
+        latitude: CFG.center.lat,
+        height: CFG.height,
+        duration: (source === "init") ? 0 : (CFG.duration || 1.0),
+        source: source || "initialCenter",
+        force: source === "init",
+      }})) {{
+        const lat = Number(CFG.center.lat).toFixed(2);
+        const lon = Number(CFG.center.lon).toFixed(2);
+        setStatus(base + " · 已定位 (" + lat + "°N, " + lon + "°E)");
+        return;
+      }}
+    }}
+
+    // 3) 默认中国视角：首次用 setView（duration=0），避免飞行动画未完成时容器尺寸不对导致地球掉到屏幕下方
+    navigateToChinaOverview({{
+      duration: (source === "init") ? 0 : 0.6,
+      source: source || "chinaDefault",
+      force: source === "init",
+    }});
     setStatus(base + " · 中国视角");
   }}
 
-  requestAnimationFrame(applyCameraView);
-  setTimeout(applyCameraView, 120);
-  setTimeout(applyCameraView, 500);
+  // Streamlit 侧仅改 center/zoom 时通过 postMessage 飞行，避免 iframe 重建
+  window.addEventListener("message", function(ev) {{
+    const data = ev.data;
+    if (!data || data.type !== "CSTF_FLY") return;
+    const ok = navigateToLocation({{
+      longitude: data.lon,
+      latitude: data.lat,
+      height: data.height,
+      pitch: data.pitch != null ? data.pitch : defaultPitchDeg(),
+      heading: data.heading != null ? data.heading : defaultHeadingDeg(),
+      duration: data.duration != null ? data.duration : 1.0,
+      source: data.source || "postMessage",
+      force: true,
+    }});
+    if (ok) {{
+      const label = data.label || (
+        Number(data.lat).toFixed(2) + "°N, " + Number(data.lon).toFixed(2) + "°E"
+      );
+      setStatus("底图就绪 · 已定位 " + label);
+    }}
+  }});
+
+  // 等容器尺寸稳定后再设相机，避免首次渲染高度为 0 导致地球掉到下方
+  function scheduleInitialCamera() {{
+    let tries = 0;
+    const tick = function() {{
+      tries += 1;
+      viewer.resize();
+      const el = document.getElementById("cesiumContainer");
+      const h = el ? el.clientHeight : 0;
+      const w = el ? el.clientWidth : 0;
+      if ((w > 40 && h > 40) || tries > 20) {{
+        applyCameraView("init");
+        viewer.scene.requestRender();
+        return;
+      }}
+      requestAnimationFrame(tick);
+    }};
+    requestAnimationFrame(tick);
+    setTimeout(function() {{
+      viewer.resize();
+      viewer.scene.requestRender();
+    }}, 250);
+  }}
+  scheduleInitialCamera();
 }})();
 </script>
 </body>

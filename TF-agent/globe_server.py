@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
 
-_SERVER_VERSION = 8
+_SERVER_VERSION = 11
 
 _lock = threading.Lock()
 _html_by_key: dict[str, str] = {}
@@ -66,8 +66,15 @@ def _probe_url_ok(url: str, timeout: float = 2.5) -> bool:
     return ok
 
 
-def globe_service_base(port: int, *, validate_public: bool = True) -> str:
+def globe_service_base(
+    port: int,
+    *,
+    validate_public: bool = True,
+    force_local: bool = False,
+) -> str:
     """浏览器加载 iframe/瓦片时使用的地球服务根 URL。"""
+    if force_local:
+        return _local_globe_base(port)
     pub = public_globe_base_url()
     if pub and validate_public:
         if _probe_url_ok(pub):
@@ -81,6 +88,14 @@ def globe_service_base(port: int, *, validate_public: bool = True) -> str:
 
 def _local_globe_base(port: int) -> str:
     return f"http://127.0.0.1:{port}"
+
+
+def is_local_page_host(host: Optional[str]) -> bool:
+    """浏览器 Host 为本机时，iframe 必须用 127.0.0.1，禁止走 ngrok。"""
+    if not host:
+        return False
+    h = str(host).split(",")[0].strip().split(":")[0].lower()
+    return h in {"localhost", "127.0.0.1", "::1", "[::1]"}
 
 
 def globe_public_url_warning(port: int) -> Optional[str]:
@@ -97,8 +112,8 @@ def globe_public_url_warning(port: int) -> Optional[str]:
     )
 
 
-def overlay_tile_url(port: int, token: str) -> str:
-    base = globe_service_base(port)
+def overlay_tile_url(port: int, token: str, *, force_local: bool = False) -> str:
+    base = globe_service_base(port, force_local=force_local)
     return f"{base}/overlay/{token}/{{z}}/{{x}}/{{y}}.png"
 
 
@@ -343,11 +358,26 @@ def publish_html(html: str, key: str) -> None:
     path.write_text(html, encoding="utf-8")
 
 
-def globe_url(port: int, cache_key: str = "", bust: Optional[int] = None) -> str:
+def globe_url(
+    port: int,
+    cache_key: str = "",
+    bust: Optional[int] = None,
+    *,
+    force_local: bool = False,
+) -> str:
     suffix = f"?v={cache_key}" if cache_key else ""
     if bust is not None and cache_key:
         suffix += f"&b={int(bust)}"
-    return f"{globe_service_base(port)}/globe{suffix}"
+    base = globe_service_base(port, force_local=force_local)
+    return f"{base}/globe{suffix}"
+
+
+def same_globe_origin(url: str, port: int, *, force_local: bool = False) -> bool:
+    """判断缓存的 iframe URL 是否仍指向当前可用的地球服务。"""
+    if not url:
+        return False
+    base = globe_service_base(port, force_local=force_local).rstrip("/")
+    return str(url).startswith(base + "/") or str(url).rstrip("/") == base
 
 
 def test_url(port: int) -> str:
