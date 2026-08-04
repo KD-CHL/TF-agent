@@ -91,11 +91,11 @@ def dispatch_system_command(command_json: str) -> str:
     {
       "map": {"lat": 30.2, "lon": 121.5, "zoom": 10},          // 可选，仅跳地图
       "sidebar_states": { ... },                                  // 可选，差量更新侧栏
-      "pending_action": { "type": "run_pipeline"|"run_m4"|"run_autotune", ... }  // 可选，启动后台
+      "pending_action": { "type": "run_pipeline"|"run_m4"|"run_autotune"|"propose_m5"|"run_m5"|"confirm_m5"|"propose_e1"|"run_e1"|"confirm_e1", ... }  // 可选，启动后台
     }
 
     sidebar_states 全部可用键（未提及则省略，禁止脑补）：
-    workspace_tab, selected_task, run_mode(dl|index), inference_mode(深度学习|指数法),
+    workflow_tab(潮滩推理|GEE 数据下载), selected_task, run_mode(dl|index), inference_mode(深度学习|指数法),
     prob_th(0.01~0.50), min_cnt(1~10), adaptive_mode, force_rerun,
     root_dir, mask_root, final_root, model_path, shp_path, points_shp, task_aoi_shp,
     m5_enabled, m5_baseline_shp, e1_enabled, e1_data_root, e1_reference, e1_compare_sources[],
@@ -108,13 +108,23 @@ def dispatch_system_command(command_json: str) -> str:
     - run_pipeline: 需要 task（可来自 selected_task 或快照）；prob/cnt 可省略则用侧栏
     - run_m4: m4_params 可含 roi_path/roi_name/start_date/end_date/cloud_limit 等
     - run_autotune: autotune_params.reference_id + objective(iou|f1|iou_f1)；需 adaptive_mode=true
+    - propose_m5: 仅生成 M5 变化检测计划（读账本/时期），不启动线程；推荐用 prepare_m5_change_detection
+    - run_m5 / confirm_m5: 用户确认后执行独立 M5（confirmed=true）；推荐用 confirm_and_run_m5
+    - propose_e1: 仅生成 E1 多源一致性计划；推荐用 prepare_e1_consistency_check
+    - run_e1 / confirm_e1: 用户确认后执行独立 E1；推荐用 confirm_and_run_e1
+
+    重要（重型工具确认门闩）：run_pipeline / run_m4 / run_autotune 属于重型操作，
+    必须先以 confirmed=true 显式确认（一般只在用户明确说「开始/执行/启动/下载」时给出）；
+    未确认时系统不会启动任务，仅提示用户确认。不可绕过。
 
     口语速查：
-    「跑/推理/合成/开始」→ pending_action.run_pipeline
-    「下载/GEE/下影像」→ workspace_tab=GEE数据下载；「开始下载」→ run_m4
-    「调参/搜最优/AutoTune」→ adaptive_mode=true + run_autotune
+    「跑/推理/合成/开始」→ pending_action.run_pipeline（confirmed=true）
+    「下载/GEE/下影像」→ workflow_tab=GEE数据下载；「开始下载」→ run_m4（confirmed=true）
+    「调参/搜最优/AutoTune」→ adaptive_mode=true + run_autotune（confirmed=true）
     「5%/百分之五」→ prob_th=0.05；「频次2/两次」→ min_cnt=2
     「关M5/不要E1」→ m5_enabled/e1_enabled=false
+    「变化检测/M5/两期对比/萎缩淤积」→ 先 prepare_m5_change_detection，确认后再 confirm_and_run_m5
+    「多源一致性/E1/和师姐比/分歧图」→ 先 prepare_e1_consistency_check，确认后再 confirm_and_run_e1
     """
     cmd = command_json.strip()
     if cmd.startswith("```"):
@@ -122,6 +132,103 @@ def dispatch_system_command(command_json: str) -> str:
         if cmd.lower().startswith("json"):
             cmd = cmd[4:].strip()
     return f"[SYSTEM_COMMAND_JSON]\n{cmd}\n[/SYSTEM_COMMAND_JSON]"
+
+
+@tool
+def prepare_m5_change_detection(
+    task: Optional[str] = None,
+    baseline_task: Optional[str] = None,
+) -> str:
+    """
+    【M5 时空变化检测 · 预检与计划】
+    用户要对「已有潮滩成果」做变化检测 / M5 / 两期对比 / 萎缩淤积告警时，必须先调用本工具。
+    会生成可验证执行计划，等待用户确认；不会立刻跑推理流水线。
+    task 可省略（用侧栏当前任务）；baseline_task 可省略（自动选最近更早同区域时期）。
+    """
+    import json as _json
+
+    action: dict = {"type": "propose_m5"}
+    if task and str(task).strip():
+        action["task"] = str(task).strip()
+    if baseline_task and str(baseline_task).strip():
+        action["baseline_task"] = str(baseline_task).strip()
+    payload = {"pending_action": action, "sidebar_states": {"m5_enabled": True}}
+    if task and str(task).strip():
+        payload["sidebar_states"]["selected_task"] = str(task).strip()
+    return (
+        "[SYSTEM_COMMAND_JSON]\n"
+        + _json.dumps(payload, ensure_ascii=False)
+        + "\n[/SYSTEM_COMMAND_JSON]"
+    )
+
+
+@tool
+def confirm_and_run_m5(task: Optional[str] = None) -> str:
+    """
+    【M5 确认执行】
+    仅在用户已明确确认执行计划后调用（如「确认」「开始执行」）。
+    将真实调用现有 M5 引擎；禁止在未确认时调用。
+    """
+    import json as _json
+
+    action: dict = {"type": "run_m5", "confirmed": True}
+    if task and str(task).strip():
+        action["task"] = str(task).strip()
+    payload = {"pending_action": action}
+    return (
+        "[SYSTEM_COMMAND_JSON]\n"
+        + _json.dumps(payload, ensure_ascii=False)
+        + "\n[/SYSTEM_COMMAND_JSON]"
+    )
+
+
+@tool
+def prepare_e1_consistency_check(
+    task: Optional[str] = None,
+    reference: Optional[str] = None,
+) -> str:
+    """
+    【E1 多源一致性诊断 · 预检与计划】
+    用户要对「已有潮滩成果」做多源一致性 / E1 / 和师姐对比 / 分歧图时，必须先调用本工具。
+    生成可验证计划并等待确认；不跑推理、不下载 GEE。
+    task / reference 可省略（用侧栏当前任务与 ui_e1_reference）。
+    """
+    import json as _json
+
+    action: dict = {"type": "propose_e1"}
+    if task and str(task).strip():
+        action["task"] = str(task).strip()
+    sb: dict = {"e1_enabled": True}
+    if task and str(task).strip():
+        sb["selected_task"] = str(task).strip()
+    if reference and str(reference).strip():
+        sb["e1_reference"] = str(reference).strip()
+        action["reference"] = str(reference).strip()
+    payload = {"pending_action": action, "sidebar_states": sb}
+    return (
+        "[SYSTEM_COMMAND_JSON]\n"
+        + _json.dumps(payload, ensure_ascii=False)
+        + "\n[/SYSTEM_COMMAND_JSON]"
+    )
+
+
+@tool
+def confirm_and_run_e1(task: Optional[str] = None) -> str:
+    """
+    【E1 确认执行】
+    仅在用户已明确确认 E1 计划后调用。真实调用 e1_engine；禁止未确认执行。
+    """
+    import json as _json
+
+    action: dict = {"type": "run_e1", "confirmed": True}
+    if task and str(task).strip():
+        action["task"] = str(task).strip()
+    payload = {"pending_action": action}
+    return (
+        "[SYSTEM_COMMAND_JSON]\n"
+        + _json.dumps(payload, ensure_ascii=False)
+        + "\n[/SYSTEM_COMMAND_JSON]"
+    )
 
 
 @tool
@@ -187,7 +294,7 @@ def assist_gee_download(
     ed = end_date or f"{int(year)}-01-31"
     payload: dict = {
         "sidebar_states": {
-            "workspace_tab": "GEE 数据下载",
+            "workflow_tab": "GEE 数据下载",
             "m4_roi_name": region_name,
             "m4_start_date": sd,
             "m4_end_date": ed,
@@ -198,6 +305,7 @@ def assist_gee_download(
     if run_now:
         payload["pending_action"] = {
             "type": "run_m4",
+            "confirmed": True,  # run_now=true 即用户明确要求启动，满足重型工具确认门闩
             "task": region_name,
             "m4_params": {
                 "roi_name": region_name,
@@ -243,6 +351,10 @@ llm = ChatOpenAI(
 
 tools = [
     dispatch_system_command,
+    prepare_m5_change_detection,
+    confirm_and_run_m5,
+    prepare_e1_consistency_check,
+    confirm_and_run_e1,
     trigger_spatial_analysis,
     change_map_view,
     assist_gee_download,
@@ -267,11 +379,23 @@ D. 只跳地图 → map 字段（可合并进 dispatch_system_command）
    例：「看看杭州湾」「定位到南流江口」「地图挪到舟山」
 E. 承前省略 / 指代 → 结合【侧栏快照】与对话上文补全 task/参数
    例：「那就跑吧」「同样参数再跑一遍」「云量改成 20 再下」
+F. **M5 时空变化检测闭环**
+   - 「做变化检测 / 跑 M5 / 两期对比 / 看萎缩淤积」→ **prepare_m5_change_detection**（propose_m5）
+   - 展示计划后等用户确认；用户说「确认/开始执行」→ **confirm_and_run_m5**
+   - **禁止**用 run_pipeline 冒充独立 M5；**禁止**未确认就 run_m5
+   - 必须结合【M5 变化检测账本】判断当期 SHP / 可用基线时期；条件不足时说明 blockers，不要假装已跑完
+G. **E1 多源一致性闭环**
+   - 「多源一致性 / 跑 E1 / 和师姐比 / 分歧图」→ **prepare_e1_consistency_check**（propose_e1）
+   - 用户确认后 → **confirm_and_run_e1**
+   - **禁止**用 run_pipeline 冒充独立 E1；**禁止**未确认就 run_e1
+   - 结合【E1 账本】检查当期 SHP / data_root / reference；条件不足说明 blockers
 
 ═══════════════════════════════════════
 第二步 · 工具选择
 ═══════════════════════════════════════
 - **首选** dispatch_system_command：可同时改多个侧栏项 + 跳地图 + 启动流程
+- prepare_m5_change_detection / confirm_and_run_m5：独立 M5 变化检测闭环
+- prepare_e1_consistency_check / confirm_and_run_e1：独立 E1 多源一致性闭环
 - change_map_view：仅当地图跳转且无任何侧栏/运行需求时用
 - assist_gee_download：用户明确要 GEE 下载时可快捷调用（等价于 dispatch + run_m4）
 - trigger_spatial_analysis：仅简单跑推理且无 M5/E1/Tab 变更时用
@@ -297,19 +421,21 @@ E. 承前省略 / 指代 → 结合【侧栏快照】与对话上文补全 task/
 - 「参数默认/按侧栏/当前设置」→ **省略** prob_th/min_cnt（前端保留快照值）
 
 【M5 / E1】
-- 开/启用/加上/要做 变化检测 → m5_enabled=true；关/不要/跳过 → false
-- E1/一致性/多源对比/和师姐比 → e1_enabled=true
+- 开/启用/加上/要做 变化检测（作为推理后置）→ m5_enabled=true；关/不要/跳过 → false
+- **独立 M5 闭环**（已有成果、只要变化检测）：prepare_m5_change_detection → 等确认 → confirm_and_run_m5
+- **独立 E1 闭环**（多源一致性/分歧图）：prepare_e1_consistency_check → 等确认 → confirm_and_run_e1
+- 仅改侧栏开 E1（不立刻跑）→ e1_enabled=true
 - 师姐2020/参考2020 → e1_reference=师姐_2020（2022/2024/2025 同理）
 
 【GEE 下载 M4】
-- 下载/下数据/GEE/哨兵/Sentinel → workspace_tab=GEE数据下载
+- 下载/下数据/GEE/哨兵/Sentinel → workflow_tab=GEE数据下载
 - 云量20/云小于30 → m4_cloud=20 或 30
 - 2020年1月/2020-01 → m4_start_date/m4_end_date
-- 「开始下载/启动M4/现在就下」→ pending_action.type=run_m4
+- 「开始下载/启动M4/现在就下」→ pending_action.type=run_m4（confirmed=true）
 
 【AutoTune】
 - 自动调参/搜最优阈值/自适应 → adaptive_mode=true
-- 「跑 AutoTune/开始调参」→ 另加 pending_action.type=run_autotune
+- 「跑 AutoTune/开始调参」→ 另加 pending_action.type=run_autotune（confirmed=true）
 - reference_id 从【数据集资产目录】选取，缺则追问；objective: iou | f1 | iou_f1
 
 【路径】
@@ -330,10 +456,10 @@ E. 承前省略 / 指代 → 结合【侧栏快照】与对话上文补全 task/
 第五步 · 典型多意图句式（必须一次工具搞定）
 ═══════════════════════════════════════
 ① 「深度学习跑24zhejiang，5%两次，开M5关E1，开始」
-   → selected_task, run_mode=dl, prob_th=0.05, min_cnt=2, m5_enabled=true, e1_enabled=false, run_pipeline
-② 「指数法跑一下，别的按侧栏」→ run_mode=index, run_pipeline（prob/cnt 省略）
-③ 「切下载，云量15，2020年6月，启动」→ workspace_tab, m4_cloud=15, 日期, run_m4
-④ 「看看钱塘江然后跑当前任务」→ map + run_pipeline（task 取自快照）
+   → selected_task, run_mode=dl, prob_th=0.05, min_cnt=2, m5_enabled=true, e1_enabled=false, run_pipeline(confirmed=true)
+② 「指数法跑一下，别的按侧栏」→ run_mode=index, run_pipeline(confirmed=true)（prob/cnt 省略）
+③ 「切下载，云量15，2020年6月，启动」→ workflow_tab, m4_cloud=15, 日期, run_m4(confirmed=true)
+④ 「看看钱塘江然后跑当前任务」→ map + run_pipeline(confirmed=true)（task 取自快照）
 ⑤ 「E1打开参考2022，先别跑」→ e1_enabled, e1_reference，**无** pending_action
 
 ═══════════════════════════════════════

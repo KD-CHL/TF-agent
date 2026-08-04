@@ -22,6 +22,12 @@ geemap
 shapely
 localtileserver
 
+# P0 加固补充（缺失依赖，不升级现有版本）
+sentence-transformers   # agent.py 向量检索 embed 后端（chromadb 懒加载）
+Pillow                  # agent.py / app.py 图像解译
+aiohttp                 # cstf_gateway.py 反向代理
+httpx                   # cstf_gateway.py 反向代理
+
 # Train stack
 transformers==4.44.2
 datasets==4.8.4

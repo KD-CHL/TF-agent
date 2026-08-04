@@ -87,6 +87,15 @@ AUTOTUNE_OBJECTIVE_MAP = {
     "均衡": "iou_f1",
 }
 
+# 重型工具确认门闩：未确认时仅记录待确认请求，不写入 pending_task/pending_autotune。
+HEAVY_ACTION_LABELS = {
+    "run_pipeline": "推理任务（深度学习/指数法推理）",
+    "run": "推理任务（深度学习/指数法推理）",
+    "": "推理任务（深度学习/指数法推理）",
+    "run_m4": "GEE 影像下载",
+    "run_autotune": "AutoTune 阈值搜索",
+}
+
 
 @dataclass
 class ApplyResult:
@@ -97,6 +106,10 @@ class ApplyResult:
     action_type: Optional[str] = None
     errors: List[str] = field(default_factory=list)
     clean_reply_hint: str = ""
+    m5_plan: Optional[Dict[str, Any]] = None
+    m5_plan_text: str = ""
+    e1_plan: Optional[Dict[str, Any]] = None
+    e1_plan_text: str = ""
 
 
 PENDING_AGENT_COMMANDS_KEY = "_pending_agent_commands"
@@ -151,7 +164,7 @@ def init_ui_session_defaults(state: Dict[str, Any]) -> None:
 
 
 def parse_system_command(text: str) -> Optional[Dict[str, Any]]:
-    """从 Agent 回复中提取 JSON 指令；兼容 legacy COMMAND 行。"""
+    """从 Agent 回复中提取 JSON 指令；兼容 legacy COMMAND 行与自然语言坐标。"""
     if not text:
         return None
     m = _JSON_BLOCK_RE.search(text)
@@ -171,7 +184,61 @@ def parse_system_command(text: str) -> Optional[Dict[str, Any]]:
         cmd["sidebar_states"]["prob_th"] = float(pp.group(2))
         cmd["sidebar_states"]["min_cnt"] = int(pp.group(3))
         cmd["pending_action"] = {"type": "run_pipeline", "task": pp.group(1).strip()}
+    if "map" not in cmd:
+        nl = _parse_natural_map_command(text)
+        if nl:
+            cmd["map"] = {"lat": nl[0], "lon": nl[1], "zoom": nl[2]}
     return cmd or None
+
+
+_RE_MAP_COORDS_NSEW = re.compile(
+    r"([-\d.]+)\s*[°º]?\s*[Nn北]\s*[,，/]\s*([-\d.]+)\s*[°º]?\s*[Ee东]",
+)
+_RE_MAP_COORDS_PLAIN = re.compile(
+    r"(?:中心点|中心|坐标|定位(?:至|到)?|跳转(?:至|到)?|视角)\s*"
+    r"[（(]?\s*([-\d.]+)\s*[,，]\s*([-\d.]+)\s*[)）]?",
+)
+_RE_MAP_ZOOM = re.compile(
+    r"(?:缩放(?:级别|等级)?|zoom)\s*(?:为|到|=|：|:)?\s*(\d{1,2})",
+    re.IGNORECASE,
+)
+_RE_MAP_INTENT = re.compile(
+    r"(已定位|已跳转|已将地图|地图视角|视角已|飞到|定位到|跳转到|挪到|中心点)",
+)
+
+
+def _parse_natural_map_command(text: str) -> Optional[Tuple[float, float, int]]:
+    """从自然语言回复中提取 lat/lon/zoom（仅定位语境）。"""
+    if not text or not _RE_MAP_INTENT.search(text):
+        return None
+    flat = re.sub(r"[`\*_]+", " ", text)
+    flat = re.sub(r"[\n\r]+", " ", flat)
+    lat = lon = None
+    m = _RE_MAP_COORDS_NSEW.search(flat)
+    if m:
+        try:
+            lat, lon = float(m.group(1)), float(m.group(2))
+        except (ValueError, TypeError):
+            lat = lon = None
+    if lat is None:
+        m = _RE_MAP_COORDS_PLAIN.search(flat)
+        if m:
+            try:
+                lat, lon = float(m.group(1)), float(m.group(2))
+            except (ValueError, TypeError):
+                lat = lon = None
+    if lat is None or lon is None:
+        return None
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return None
+    zoom = 9
+    mz = _RE_MAP_ZOOM.search(flat)
+    if mz:
+        try:
+            zoom = max(1, min(18, int(mz.group(1))))
+        except (ValueError, TypeError):
+            zoom = 9
+    return lat, lon, zoom
 
 
 def _strip_json_block(text: str) -> str:
@@ -240,9 +307,29 @@ def _coerce_date_str(val: Any) -> Optional[str]:
     return None
 
 
+def _pick_float(val: Any, lo: float, hi: float, fallback: float) -> float:
+    """安全解析浮点：非法/空值回退 fallback，越界 clamp（与侧栏 _coerce_float 一致）。"""
+    r = _coerce_float(val, lo, hi)
+    return fallback if r is None else r
+
+
+def _pick_int(val: Any, lo: int, hi: int, fallback: int) -> int:
+    """安全解析整数：非法/空值回退 fallback，越界 clamp（与侧栏 _coerce_int 一致）。"""
+    r = _coerce_int(val, lo, hi)
+    return fallback if r is None else r
+
+
 def _apply_sidebar_delta(state: Dict[str, Any], sidebar: Dict[str, Any], result: ApplyResult) -> None:
     if not sidebar:
         return
+    # 字段统一：规范字段为 workflow_tab；兼容旧 Prompt 输出的 workspace_tab。
+    # 两者同时出现时规范字段优先，旧字段忽略（不允许静默失效）。
+    if "workspace_tab" in sidebar:
+        sidebar = dict(sidebar)
+        if "workflow_tab" not in sidebar:
+            sidebar["workflow_tab"] = sidebar.pop("workspace_tab")
+        else:
+            sidebar.pop("workspace_tab")
     inference_mode_from_run = None
     rm = _coerce_run_mode(sidebar.get("run_mode"))
     if rm == "index":
@@ -324,7 +411,9 @@ def _apply_sidebar_delta(state: Dict[str, Any], sidebar: Dict[str, Any], result:
                 state[ss_key] = [str(x) for x in raw]
                 result.sidebar_keys_updated.append(ss_key)
             continue
-        # 字符串路径类
+        # 字符串路径类：仅文件系统路径做 normpath；
+        # URL/代理地址/公网地址（m4_gee_proxy、m4_gee_project）与名称类绝不做 normpath，
+        # 否则 http://127.0.0.1:7890 会被 Windows normpath 破坏为 http:\\127.0.0.1:7890。
         s = str(raw).strip().strip('"').strip("'")
         if s:
             if json_key.endswith("_dir") or json_key.endswith("_path") or json_key.endswith("_shp") or json_key in (
@@ -336,7 +425,16 @@ def _apply_sidebar_delta(state: Dict[str, Any], sidebar: Dict[str, Any], result:
                 "m4_gee_proxy",
                 "m4_gee_project",
             ):
-                state[ss_key] = os.path.normpath(s) if ("/" in s or "\\" in s or ":" in s) and json_key != "selected_task" and json_key not in ("m4_roi_name", "e1_reference", "m4_gee_project") else s
+                is_url_like = json_key in ("m4_gee_proxy", "m4_gee_project") or s.lower().startswith(
+                    ("http://", "https://")
+                )
+                is_name_like = json_key in ("selected_task", "m4_roi_name", "e1_reference")
+                needs_norm = (
+                    not is_url_like
+                    and not is_name_like
+                    and ("/" in s or "\\" in s or ":" in s)
+                )
+                state[ss_key] = os.path.normpath(s) if needs_norm else s
                 result.sidebar_keys_updated.append(ss_key)
 
 
@@ -374,7 +472,157 @@ def build_agent_sidebar_context(state: Dict[str, Any]) -> str:
         f"- 地图中心: {state.get('map_center', '—')} zoom={state.get('map_zoom', '—')}",
         f"- 任务运行中: {bool(state.get('is_running'))}",
     ]
+    try:
+        import m5_agent_loop
+
+        lines.append(
+            m5_agent_loop.build_m5_context_for_agent(
+                final_root=str(s.get("ui_final_root") or ""),
+                current_task=str(s.get("ui_selected_task") or ""),
+                pending_plan=state.get("_m5_pending_plan")
+                if isinstance(state.get("_m5_pending_plan"), dict)
+                else None,
+            )
+        )
+    except Exception:
+        pass
+    try:
+        import e1_agent_loop
+
+        lines.append(
+            e1_agent_loop.build_e1_context_for_agent(
+                final_root=str(s.get("ui_final_root") or ""),
+                current_task=str(s.get("ui_selected_task") or ""),
+                data_root=str(s.get("ui_e1_data_root") or ""),
+                reference=str(s.get("ui_e1_reference") or "师姐_2020"),
+                pending_plan=state.get("_e1_pending_plan")
+                if isinstance(state.get("_e1_pending_plan"), dict)
+                else None,
+            )
+        )
+    except Exception:
+        pass
     return "\n".join(lines)
+
+
+def propose_e1_plan(state: Dict[str, Any], action: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], List[str]]:
+    """根据磁盘资产与侧栏生成 E1 计划并写入 state['_e1_pending_plan']。"""
+    import e1_agent_loop
+
+    action = action or {}
+    init_ui_session_defaults(state)
+    task = (
+        (action.get("task") or state.get("ui_selected_task") or "")
+        .strip()
+        or None
+    )
+    if task:
+        state["ui_selected_task"] = task
+    prob = action.get("prob_th")
+    if prob is None:
+        prob = state.get("ui_prob_th")
+    cnt = action.get("min_cnt")
+    if cnt is None:
+        cnt = state.get("ui_min_cnt")
+    try:
+        prob_f = float(prob) if prob is not None else None
+    except (TypeError, ValueError):
+        prob_f = None
+    try:
+        cnt_i = int(cnt) if cnt is not None else None
+    except (TypeError, ValueError):
+        cnt_i = None
+
+    reference = (
+        action.get("reference")
+        or action.get("e1_reference")
+        or state.get("ui_e1_reference")
+        or "师姐_2020"
+    )
+    data_root = (
+        action.get("data_root")
+        or action.get("e1_data_root")
+        or state.get("ui_e1_data_root")
+        or ""
+    )
+    compare = action.get("compare_sources") or state.get("ui_e1_compare_sources")
+    if compare is not None and not isinstance(compare, list):
+        compare = None
+
+    plan = e1_agent_loop.build_e1_preflight(
+        final_root=str(state.get("ui_final_root") or ""),
+        current_task=str(task or ""),
+        data_root=str(data_root or ""),
+        reference=str(reference),
+        compare_sources=compare,
+        prob=prob_f,
+        cnt=cnt_i,
+        task_aoi_shp=str(state.get("ui_task_aoi_shp") or "") or None,
+        export_disagreement_maps=bool(
+            action.get("export_disagreement_maps")
+            if action.get("export_disagreement_maps") is not None
+            else state.get("ui_e1_export_maps", True)
+        ),
+        export_multi_product_heatmap=bool(
+            action.get("export_multi_product_heatmap")
+            if action.get("export_multi_product_heatmap") is not None
+            else state.get("ui_e1_export_heatmap", True)
+        ),
+    )
+    state["_e1_pending_plan"] = plan
+    state["_e1_plan_confirmed"] = False
+    errors = list(plan.get("blockers") or []) if not plan.get("ready") else []
+    return plan, errors
+
+
+def propose_m5_plan(state: Dict[str, Any], action: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], List[str]]:
+    """根据磁盘资产账本生成 M5 计划并写入 state['_m5_pending_plan']。"""
+    import m5_agent_loop
+
+    action = action or {}
+    init_ui_session_defaults(state)
+    task = (
+        (action.get("task") or state.get("ui_selected_task") or "")
+        .strip()
+        or None
+    )
+    if task:
+        state["ui_selected_task"] = task
+    prob = action.get("prob_th")
+    if prob is None:
+        prob = state.get("ui_prob_th")
+    cnt = action.get("min_cnt")
+    if cnt is None:
+        cnt = state.get("ui_min_cnt")
+    try:
+        prob_f = float(prob) if prob is not None else None
+    except (TypeError, ValueError):
+        prob_f = None
+    try:
+        cnt_i = int(cnt) if cnt is not None else None
+    except (TypeError, ValueError):
+        cnt_i = None
+
+    baseline_shp = (
+        action.get("baseline_shp")
+        or state.get("ui_m5_baseline_shp")
+        or ""
+    ).strip() or None
+    baseline_task = (action.get("baseline_task") or "").strip() or None
+
+    plan = m5_agent_loop.build_m5_preflight(
+        final_root=str(state.get("ui_final_root") or ""),
+        current_task=str(task or ""),
+        task_options=None,
+        prob=prob_f,
+        cnt=cnt_i,
+        baseline_task=baseline_task,
+        baseline_shp_override=baseline_shp,
+    )
+    state["_m5_pending_plan"] = plan
+    state["_m5_plan_confirmed"] = False
+    errors = list(plan.get("blockers") or []) if not plan.get("ready") else []
+    return plan, errors
 
 def build_pending_task(state: Dict[str, Any], action: Dict[str, Any]) -> Tuple[Optional[Dict], Optional[Dict], List[str]]:
     """
@@ -386,6 +634,10 @@ def build_pending_task(state: Dict[str, Any], action: Dict[str, Any]) -> Tuple[O
     task = (action.get("task") or state.get("ui_selected_task") or "").strip() or None
 
     if atype == "run_autotune":
+        confirmed = bool(action.get("confirmed")) or bool(state.get("_autotune_plan_confirmed"))
+        if not confirmed:
+            errors.append("AutoTune 需用户确认后才能执行（confirmed=true）。")
+            return None, None, errors
         ap = action.get("autotune_params") or {}
         ref = ap.get("reference_id") or action.get("reference_id") or action.get("reference") or state.get("ui_autotune_reference_id")
         obj = ap.get("objective") or action.get("objective") or "iou_f1"
@@ -406,6 +658,10 @@ def build_pending_task(state: Dict[str, Any], action: Dict[str, Any]) -> Tuple[O
         }, errors
 
     if atype == "run_m4":
+        confirmed = bool(action.get("confirmed")) or bool(state.get("_m4_plan_confirmed"))
+        if not confirmed:
+            errors.append("M4/GEE 下载需用户确认后才能执行（confirmed=true）。")
+            return None, None, errors
         m4p = action.get("m4_params") or {}
         roi_path = m4p.get("roi_path") or state.get("ui_m4_roi_path")
         roi_name = m4p.get("roi_name") or state.get("ui_m4_roi_name") or task or "zhejiang1"
@@ -416,6 +672,13 @@ def build_pending_task(state: Dict[str, Any], action: Dict[str, Any]) -> Tuple[O
         root = state.get("ui_root_dir") or r"I:\GEE_data\20"
         local_dir = m4p.get("local_out_dir") or state.get("ui_m4_local_dir") or os.path.join(root, drive_folder)
         bands = m4p.get("bands") or state.get("ui_m4_bands") or ["B8", "B4", "B3", "B2", "B11"]
+        # bands 可能是逗号分隔字符串（模型输出），统一为列表；空列表回退默认。
+        if isinstance(bands, str):
+            bands = [b.strip() for b in bands.split(",") if b.strip()]
+        else:
+            bands = list(bands)
+        if not bands:
+            bands = ["B8", "B4", "B3", "B2", "B11"]
         return {
             "task": task,
             "mode": "m4",
@@ -427,23 +690,101 @@ def build_pending_task(state: Dict[str, Any], action: Dict[str, Any]) -> Tuple[O
                 "export_to": export_to,
                 "local_out_dir": os.path.normpath(str(local_dir).strip()),
                 "drive_folder": str(drive_folder).strip(),
-                "bands": list(bands),
-                "cloud_limit": int(m4p.get("cloud_limit") or state.get("ui_m4_cloud_limit") or 60),
-                "min_land_pct": float(m4p.get("min_land_pct") or state.get("ui_m4_min_land") or 5.0),
-                "max_land_pct": float(m4p.get("max_land_pct") or state.get("ui_m4_max_land") or 95.0),
-                "min_pixel_count": int(m4p.get("min_pixel_count") or state.get("ui_m4_min_pixel_count") or 1000),
-                "scale": int(m4p.get("scale") or state.get("ui_m4_scale") or 10),
+                "bands": bands,
+                "cloud_limit": _pick_int(m4p.get("cloud_limit"), 0, 100, state.get("ui_m4_cloud_limit") or 60),
+                "min_land_pct": _pick_float(m4p.get("min_land_pct"), 0.0, 100.0, state.get("ui_m4_min_land") or 5.0),
+                "max_land_pct": _pick_float(m4p.get("max_land_pct"), 0.0, 100.0, state.get("ui_m4_max_land") or 95.0),
+                "min_pixel_count": _pick_int(m4p.get("min_pixel_count"), 100, 500000, state.get("ui_m4_min_pixel_count") or 1000),
+                "scale": _pick_int(m4p.get("scale"), 10, 30, state.get("ui_m4_scale") or 10),
                 "gee_proxy_url": str(m4p.get("gee_proxy_url") or state.get("ui_m4_gee_proxy") or "").strip(),
                 "gee_project_id": str(m4p.get("gee_project_id") or state.get("ui_m4_gee_project") or "").strip(),
             },
         }, None, errors
 
+    if atype == "run_e1":
+        confirmed = bool(action.get("confirmed")) or bool(state.get("_e1_plan_confirmed"))
+        if not confirmed:
+            errors.append("E1 需用户确认后才能执行（confirmed=true 或侧栏确认）。")
+            return None, None, errors
+        plan = state.get("_e1_pending_plan")
+        if not isinstance(plan, dict) or not plan.get("ready"):
+            plan, plan_errs = propose_e1_plan(state, action)
+            errors.extend(plan_errs)
+        if not isinstance(plan, dict) or not plan.get("ready"):
+            errors.append("E1 执行条件未满足，无法启动。")
+            return None, None, errors
+        if task and task != plan.get("current_task"):
+            action = dict(action)
+            action["task"] = task
+            plan, plan_errs = propose_e1_plan(state, action)
+            errors.extend(plan_errs)
+            if not plan.get("ready"):
+                errors.append("指定任务的 E1 条件未满足。")
+                return None, None, errors
+        state["_e1_plan_confirmed"] = True
+        return {
+            "task": plan["current_task"],
+            "mode": "e1",
+            "prob": plan.get("prob"),
+            "cnt": plan.get("cnt"),
+            "e1": {
+                "target_shp": plan["current_shp"],
+                "data_root": plan["data_root"],
+                "reference": plan.get("reference"),
+                "compare_sources": plan.get("compare_sources"),
+                "workspace_dir": plan.get("workspace_dir"),
+                "task_aoi_shp": plan.get("task_aoi_shp"),
+                "export_disagreement_maps": plan.get("export_disagreement_maps", True),
+                "export_multi_product_heatmap": plan.get("export_multi_product_heatmap", True),
+                "plan": plan,
+            },
+        }, None, errors
+
+    if atype == "run_m5":
+        confirmed = bool(action.get("confirmed")) or bool(state.get("_m5_plan_confirmed"))
+        if not confirmed:
+            errors.append("M5 需用户确认后才能执行（confirmed=true 或侧栏确认）。")
+            return None, None, errors
+        plan = state.get("_m5_pending_plan")
+        if not isinstance(plan, dict) or not plan.get("ready"):
+            plan, plan_errs = propose_m5_plan(state, action)
+            errors.extend(plan_errs)
+        if not isinstance(plan, dict) or not plan.get("ready"):
+            errors.append("M5 执行条件未满足，无法启动。")
+            return None, None, errors
+        if task and task != plan.get("current_task"):
+            # 用户指定了不同任务：重建计划
+            action = dict(action)
+            action["task"] = task
+            plan, plan_errs = propose_m5_plan(state, action)
+            errors.extend(plan_errs)
+            if not plan.get("ready"):
+                errors.append("指定任务的 M5 条件未满足。")
+                return None, None, errors
+        state["_m5_plan_confirmed"] = True
+        return {
+            "task": plan["current_task"],
+            "mode": "m5",
+            "prob": plan.get("prob"),
+            "cnt": plan.get("cnt"),
+            "m5": {
+                "current_shp": plan["current_shp"],
+                "baseline_shp": plan["baseline_shp"],
+                "baseline_task": plan.get("baseline_task"),
+                "plan": plan,
+            },
+        }, None, errors
+
     if atype in ("run_pipeline", "run", ""):
+        confirmed = bool(action.get("confirmed")) or bool(state.get("_pipeline_plan_confirmed"))
+        if not confirmed:
+            errors.append("推理任务需用户确认后才能执行（confirmed=true）。")
+            return None, None, errors
         run_mode = state.get("ui_run_mode") or "dl"
         if state.get("ui_inference_mode") == "指数法":
             run_mode = "index"
-        prob = float(action.get("prob_th") or state.get("ui_prob_th") or 0.05)
-        cnt = int(action.get("min_cnt") or state.get("ui_min_cnt") or 2)
+        prob = _pick_float(action.get("prob_th"), 0.01, 0.50, state.get("ui_prob_th") or 0.05)
+        cnt = _pick_int(action.get("min_cnt"), 1, 10, state.get("ui_min_cnt") or 2)
         if not task:
             errors.append("运行推理需要指定 task（目标任务名）。")
             return None, None, errors
@@ -476,6 +817,15 @@ def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> Appl
                 state["map_center"] = [float(lat), float(lon)]
                 state["map_zoom"] = int(zoom)
                 state["_map_view_synced_for"] = None
+                # 强制按 center 飞；优先 postMessage 到已有 iframe，避免重建 Cesium Viewer
+                state["_map_prefer_center"] = True
+                state["_pending_camera_fly"] = {
+                    "lat": float(lat),
+                    "lon": float(lon),
+                    "zoom": int(zoom),
+                    "source": "agent",
+                }
+                # 不递增 _globe_rev / 不清 iframe 缓存：仅相机变化时复用已加载地球页
                 result.map_updated = True
             except (TypeError, ValueError) as e:
                 result.errors.append(f"map 参数无效: {e}")
@@ -486,14 +836,83 @@ def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> Appl
 
     action = command.get("pending_action")
     if isinstance(action, dict) and action.get("type"):
-        result.action_type = str(action.get("type"))
+        atype = str(action.get("type") or "").strip().lower()
+        result.action_type = atype
+
+        # M5 闭环：先提出计划（不启动线程），确认后再 run_m5
+        if atype in ("propose_m5", "plan_m5"):
+            import m5_agent_loop
+
+            plan, errs = propose_m5_plan(state, action)
+            result.m5_plan = plan
+            result.m5_plan_text = m5_agent_loop.format_m5_plan_for_user(plan)
+            result.errors.extend(errs)
+            return result
+
+        if atype == "confirm_m5":
+            state["_m5_plan_confirmed"] = True
+            action = {
+                "type": "run_m5",
+                "confirmed": True,
+                "task": action.get("task"),
+                "baseline_task": action.get("baseline_task"),
+                "baseline_shp": action.get("baseline_shp"),
+                "prob_th": action.get("prob_th"),
+                "min_cnt": action.get("min_cnt"),
+            }
+            result.action_type = "run_m5"
+
+        # E1 闭环：propose → confirm → run_e1
+        if atype in ("propose_e1", "plan_e1"):
+            import e1_agent_loop
+
+            plan, errs = propose_e1_plan(state, action)
+            result.e1_plan = plan
+            result.e1_plan_text = e1_agent_loop.format_e1_plan_for_user(plan)
+            result.errors.extend(errs)
+            return result
+
+        if atype == "confirm_e1":
+            state["_e1_plan_confirmed"] = True
+            action = {
+                "type": "run_e1",
+                "confirmed": True,
+                "task": action.get("task"),
+                "reference": action.get("reference") or action.get("e1_reference"),
+                "data_root": action.get("data_root") or action.get("e1_data_root"),
+                "compare_sources": action.get("compare_sources"),
+                "prob_th": action.get("prob_th"),
+                "min_cnt": action.get("min_cnt"),
+            }
+            result.action_type = "run_e1"
+
         pt, at, errs = build_pending_task(state, action)
         result.errors.extend(errs)
+        # 重型工具确认门闩：run_pipeline/run_m4/run_autotune 未确认时，
+        # 仅记录待确认请求（供 UI 弹出确认），绝不写入 pending_task/pending_autotune。
+        # 手动侧栏按钮直接写 session_state 的路径不受影响。
+        is_heavy = atype in ("run_pipeline", "run", "", "run_m4", "run_autotune")
+        if is_heavy and not bool(action.get("confirmed")):
+            if errs and any("确认" in e for e in errs):
+                state["_pending_heavy_confirm"] = {
+                    "action_type": atype or "run_pipeline",
+                    "label": HEAVY_ACTION_LABELS.get(atype or "run_pipeline", atype),
+                    "task": action.get("task") or state.get("ui_selected_task"),
+                    "action": action,
+                }
+            else:
+                state.pop("_pending_heavy_confirm", None)
+        elif is_heavy:
+            state.pop("_pending_heavy_confirm", None)
         if pt and not errs:
             state["pending_task"] = pt
             state["is_running"] = True
             state["stop_requested"] = False
             state.pop("pending_autotune", None)
+            if pt.get("mode") == "m5":
+                state.pop("_m5_pending_plan", None)
+            if pt.get("mode") == "e1":
+                state.pop("_e1_pending_plan", None)
         elif at and not errs:
             state["pending_autotune"] = at
             state["is_running"] = True
@@ -533,6 +952,12 @@ def flush_pending_agent_commands(state: Dict[str, Any]) -> ApplyResult:
         merged.errors.extend(one.errors)
         if one.action_type:
             merged.action_type = one.action_type
+        if one.m5_plan is not None:
+            merged.m5_plan = one.m5_plan
+            merged.m5_plan_text = one.m5_plan_text or merged.m5_plan_text
+        if one.e1_plan is not None:
+            merged.e1_plan = one.e1_plan
+            merged.e1_plan_text = one.e1_plan_text or merged.e1_plan_text
     return merged
 
 

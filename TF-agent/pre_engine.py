@@ -325,7 +325,9 @@ def load_model(model_path, device):
     print(f">>> 加载模型: {os.path.basename(model_path)}")
     model = CDNet(backbone='resnet50', output_stride=16, img_size=1024,
                   n_class=1, img_chan=3, chan_num=64, fuzzy_num=16)
-    state = torch.load(model_path, map_location=device)
+    # 安全加载：weights_only=True 拒绝 pickle 任意对象，防止投毒权重 RCE。
+    # 本项目权重为纯 OrderedDict[str, Tensor]（597 键，全部 Tensor），已实测兼容。
+    state = torch.load(model_path, map_location=device, weights_only=True)
     new_state = {k.replace("module.", ""): v for k, v in state.items()}
     model.load_state_dict(new_state, strict=True)
     model.to(device)

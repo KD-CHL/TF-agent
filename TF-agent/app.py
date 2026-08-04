@@ -188,13 +188,28 @@ _RE_CMD_PIPELINE = re.compile(
     r"COMMAND_RUN_PIPELINE\s*\|\s*([^|\n]+?)\s*\|\s*([-\d.]+)\s*\|\s*(\d+)",
     re.IGNORECASE,
 )
+# 模型常只写自然语言坐标而未附 SYSTEM_COMMAND / COMMAND_UPDATE_MAP
+_RE_MAP_COORDS_NSEW = re.compile(
+    r"([-\d.]+)\s*[°º]?\s*[Nn北]\s*[,，/]\s*([-\d.]+)\s*[°º]?\s*[Ee东]",
+)
+_RE_MAP_COORDS_PLAIN = re.compile(
+    r"(?:中心点|中心|坐标|定位(?:至|到)?|跳转(?:至|到)?|视角)\s*"
+    r"[（(]?\s*([-\d.]+)\s*[,，]\s*([-\d.]+)\s*[)）]?",
+)
+_RE_MAP_ZOOM = re.compile(
+    r"(?:缩放(?:级别|等级)?|zoom)\s*(?:为|到|=|：|:)?\s*(\d{1,2})",
+    re.IGNORECASE,
+)
+_RE_MAP_INTENT = re.compile(
+    r"(已定位|已跳转|已将地图|地图视角|视角已|飞到|定位到|跳转到|挪到|中心点)",
+)
 
 
 def _parse_agent_map_command(reply: str):
-    """解析地图跳转：标准 COMMAND_UPDATE_MAP|lat|lon|zoom 或模型乱写的 (lat, lon[, zoom])。"""
-    stripped = re.sub(r"[`\*_]+", " ", reply)
+    """解析地图跳转：标准暗号，或模型自然语言中的坐标+缩放。"""
+    stripped = re.sub(r"[`\*_]+", " ", reply or "")
     flat = re.sub(r"[\n\r]+", " ", stripped)
-    for text in (flat, stripped, reply):
+    for text in (flat, stripped, reply or ""):
         m = _RE_CMD_MAP_PIPE.search(text)
         if m:
             try:
@@ -210,7 +225,39 @@ def _parse_agent_map_command(reply: str):
                 return lat, lon, zoom, m.group(0)
             except (ValueError, TypeError):
                 pass
-    return None
+
+    # 自然语言回退：仅在明确“定位/跳转”语境下提取，避免误伤普通问答
+    if not _RE_MAP_INTENT.search(flat):
+        return None
+    lat = lon = None
+    span = ""
+    m = _RE_MAP_COORDS_NSEW.search(flat)
+    if m:
+        try:
+            lat, lon = float(m.group(1)), float(m.group(2))
+            span = m.group(0)
+        except (ValueError, TypeError):
+            lat = lon = None
+    if lat is None:
+        m = _RE_MAP_COORDS_PLAIN.search(flat)
+        if m:
+            try:
+                lat, lon = float(m.group(1)), float(m.group(2))
+                span = m.group(0)
+            except (ValueError, TypeError):
+                lat = lon = None
+    if lat is None or lon is None:
+        return None
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return None
+    zoom = 9
+    mz = _RE_MAP_ZOOM.search(flat)
+    if mz:
+        try:
+            zoom = max(1, min(18, int(mz.group(1))))
+        except (ValueError, TypeError):
+            zoom = 9
+    return lat, lon, zoom, span or f"{lat},{lon},{zoom}"
 
 
 def _strip_map_command_from_reply(reply: str) -> str:
@@ -312,6 +359,86 @@ def register_index_asset(task, file_path):
         "file_path": file_path,
         "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "file_size_mb": round(os.path.getsize(file_path) / (1024 ** 2), 2) if os.path.exists(file_path) else 0,
+    }
+    save_asset_registry(registry)
+    return asset_key
+
+
+def register_m5_asset(task, report: dict):
+    """将 M5 报告与差异面登记到资产账本。"""
+    import m5_agent_loop
+
+    registry = load_asset_registry()
+    asset_key = f"{task}_m5"
+    map_path = m5_agent_loop.pick_m5_map_path(report)
+    spatial = (report or {}).get("spatial_outputs") or {}
+    loss = spatial.get("loss_shapefile_path")
+    silt = spatial.get("siltation_shapefile_path")
+    if loss and str(loss) == "None":
+        loss = None
+    if silt and str(silt) == "None":
+        silt = None
+    size_mb = 0.0
+    for p in (map_path, loss, silt, (report or {}).get("report_path")):
+        if not p or not os.path.isfile(str(p)):
+            continue
+        try:
+            size_mb += os.path.getsize(str(p)) / (1024 ** 2)
+        except OSError:
+            pass
+    registry[asset_key] = {
+        "task": task,
+        "method": "m5",
+        "file_path": os.path.normpath(map_path) if map_path else "",
+        "report_path": (report or {}).get("report_path"),
+        "loss_shp": loss if loss and os.path.isfile(str(loss)) else None,
+        "siltation_shp": silt if silt and os.path.isfile(str(silt)) else None,
+        "baseline_task": (report or {}).get("baseline_task"),
+        "alert_level": (report or {}).get("alert_level"),
+        "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "file_size_mb": round(size_mb, 2),
+    }
+    save_asset_registry(registry)
+    return asset_key
+
+
+def find_m5_asset(task):
+    registry = load_asset_registry()
+    entry = registry.get(f"{task}_m5")
+    if not entry:
+        return None
+    rp = entry.get("report_path") or entry.get("file_path")
+    if rp and os.path.exists(str(rp)):
+        return entry
+    if entry.get("file_path") and os.path.exists(entry["file_path"]):
+        return entry
+    return None
+
+
+def register_e1_asset(task, report: dict):
+    """将 E1 报告与可选热力/分歧图登记到资产账本。"""
+    import e1_agent_loop
+
+    registry = load_asset_registry()
+    asset_key = f"{task}_e1"
+    map_path = e1_agent_loop.pick_e1_map_path(report)
+    size_mb = 0.0
+    for p in (map_path, (report or {}).get("report_path"), (report or {}).get("report_md_path")):
+        if not p or not os.path.isfile(str(p)):
+            continue
+        try:
+            size_mb += os.path.getsize(str(p)) / (1024 ** 2)
+        except OSError:
+            pass
+    registry[asset_key] = {
+        "task": task,
+        "method": "e1",
+        "file_path": os.path.normpath(map_path) if map_path else "",
+        "report_path": (report or {}).get("report_path"),
+        "report_md_path": (report or {}).get("report_md_path"),
+        "reference": (report or {}).get("reference"),
+        "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "file_size_mb": round(size_mb, 2),
     }
     save_asset_registry(registry)
     return asset_key
@@ -652,6 +779,242 @@ def _run_m5_phase(ctx, shared, current_shp, actual_task, prob, cnt, push_log, ch
     except Exception as e:
         push_log(f"[M5] 检测异常: {e}")
         return None
+
+
+def run_m5_sync(ctx, shared, stop_event):
+    """独立 M5 闭环：仅调用现有 M5 引擎，不跑推理/GEE。"""
+    logs_local = []
+
+    def check_stop():
+        return stop_event.is_set()
+
+    def push_log(msg):
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] root@m5: {msg}"
+        logs_local.append(line)
+        with shared["lock"]:
+            shared["log_lines"] = logs_local[-40:]
+        print(msg)
+
+    def push_progress(pct):
+        with shared["lock"]:
+            shared["progress"] = int(min(100, max(0, pct)))
+
+    def push_status(kind, text):
+        with shared["lock"]:
+            shared["status"] = (kind, text)
+
+    push_progress(5)
+    push_status("info", "M5 变化检测启动…")
+    m5_cfg = ctx.get("m5") or {}
+    task = ctx.get("task") or m5_cfg.get("plan", {}).get("current_task")
+    current_shp = m5_cfg.get("current_shp")
+    baseline_shp = m5_cfg.get("baseline_shp")
+    push_log(f"TASK: {task}")
+    push_log(f"CURRENT: {current_shp}")
+    push_log(f"BASELINE: {baseline_shp} ({m5_cfg.get('baseline_task') or '—'})")
+
+    if check_stop():
+        push_status("warning", "M5 已中断")
+        return False
+    if not current_shp or not os.path.isfile(str(current_shp)):
+        push_status("error", "当期潮滩 SHP 不存在")
+        push_log(f"[ERROR] 当期 SHP 无效: {current_shp}")
+        return False
+    if not baseline_shp or not os.path.isfile(str(baseline_shp)):
+        push_status("error", "基线潮滩 SHP 不存在")
+        push_log(f"[ERROR] 基线 SHP 无效: {baseline_shp}")
+        return False
+
+    push_progress(30)
+    try:
+        import m5_engine
+        import m5_agent_loop
+
+        report = m5_engine.run_m5_after_synthesis(
+            current_shp=current_shp,
+            current_task=task,
+            final_root=ctx["final_root"],
+            task_options=ctx.get("task_options"),
+            prob=ctx.get("prob"),
+            cnt=ctx.get("cnt"),
+            baseline_shp_override=baseline_shp,
+            workspace_dir=ctx["final_root"],
+            logger=push_log,
+        )
+        push_progress(80)
+        if not report:
+            push_status("warning", "M5 未生成报告")
+            return False
+        report["baseline_task"] = report.get("baseline_task") or m5_cfg.get("baseline_task")
+        verification = m5_agent_loop.verify_m5_outputs(report, workspace_dir=ctx["final_root"])
+        map_path = verification.get("map_candidate") or m5_agent_loop.pick_m5_map_path(report)
+        try:
+            register_m5_asset(task, report)
+            push_log(f"[M5] 已登记资产 {task}_m5")
+        except Exception as reg_e:
+            push_log(f"[M5] 资产登记失败（不影响报告）: {reg_e}")
+
+        with shared["lock"]:
+            shared["m5_report"] = report
+            shared["m5_verification"] = verification
+            shared["asset_path"] = map_path
+            shared["job_kind"] = "m5"
+
+        if verification.get("ok"):
+            push_status(
+                "success",
+                f"M5 完成 · 告警 {report.get('alert_level', '—')}",
+            )
+        else:
+            push_status("warning", "M5 已完成但输出校验未完全通过")
+        push_progress(100)
+        push_log(m5_agent_loop.summarize_m5_report_for_chat(report, verification).replace("\n", " | "))
+        return True
+    except Exception as e:
+        push_log(f"[ERROR] {e}")
+        push_status("error", f"M5 异常: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return False
+
+
+def _m5_worker_entry(ctx, shared, stop_event):
+    ok = False
+    try:
+        ok = run_m5_sync(ctx, shared, stop_event)
+    except Exception as e:
+        tb_lines = traceback.format_exc().split("\n")[:25]
+        with shared["lock"]:
+            lines = list(shared.get("log_lines") or [])
+            lines.append(f"[CRASH] {e}")
+            lines.extend(tb_lines)
+            shared["log_lines"] = lines[-40:]
+            shared["status"] = ("error", str(e))
+    finally:
+        with shared["lock"]:
+            shared["success"] = ok
+            shared["done"] = True
+
+
+def run_e1_sync(ctx, shared, stop_event):
+    """独立 E1 闭环：仅调用 e1_engine，不跑推理/GEE。"""
+    logs_local = []
+
+    def check_stop():
+        return stop_event.is_set()
+
+    def push_log(msg):
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] root@e1: {msg}"
+        logs_local.append(line)
+        with shared["lock"]:
+            shared["log_lines"] = logs_local[-40:]
+        print(msg)
+
+    def push_progress(pct):
+        with shared["lock"]:
+            shared["progress"] = int(min(100, max(0, pct)))
+
+    def push_status(kind, text):
+        with shared["lock"]:
+            shared["status"] = (kind, text)
+
+    push_progress(5)
+    push_status("info", "E1 多源一致性诊断启动…")
+    e1_cfg = ctx.get("e1") or {}
+    task = ctx.get("task") or e1_cfg.get("plan", {}).get("current_task")
+    target_shp = e1_cfg.get("target_shp")
+    push_log(f"TASK: {task}")
+    push_log(f"TARGET: {target_shp}")
+    push_log(f"REF: {e1_cfg.get('reference')} | DATA: {e1_cfg.get('data_root')}")
+
+    if check_stop():
+        push_status("warning", "E1 已中断")
+        return False
+    if not target_shp or not os.path.isfile(str(target_shp)):
+        push_status("error", "当期潮滩 SHP 不存在")
+        push_log(f"[ERROR] 目标 SHP 无效: {target_shp}")
+        return False
+
+    push_progress(25)
+    try:
+        import e1_engine
+        import e1_agent_loop
+
+        roi_path = e1_engine.resolve_task_roi_path(
+            e1_cfg.get("task_aoi_shp") or ctx.get("task_aoi_shp"),
+            task,
+            ctx["final_root"],
+            logger=push_log,
+        )
+        workspace = e1_cfg.get("workspace_dir") or e1_engine.workspace_for_task(
+            ctx["final_root"], task
+        )
+        report = e1_engine.run_e1_after_synthesis(
+            target_shp=target_shp,
+            roi_name=task,
+            workspace_dir=workspace,
+            data_root=e1_cfg.get("data_root") or e1_engine.DEFAULT_E1_DATA_ROOT,
+            reference=e1_cfg.get("reference") or "师姐_2020",
+            compare_sources=e1_cfg.get("compare_sources"),
+            roi_path=roi_path,
+            export_disagreement_maps=bool(e1_cfg.get("export_disagreement_maps", True)),
+            export_multi_product_heatmap=bool(e1_cfg.get("export_multi_product_heatmap", True)),
+            logger=push_log,
+        )
+        push_progress(80)
+        if not report:
+            push_status("warning", "E1 未生成报告")
+            return False
+        verification = e1_agent_loop.verify_e1_outputs(report)
+        map_path = verification.get("map_candidate") or e1_agent_loop.pick_e1_map_path(report)
+        try:
+            register_e1_asset(task, report)
+            push_log(f"[E1] 已登记资产 {task}_e1")
+        except Exception as reg_e:
+            push_log(f"[E1] 资产登记失败（不影响报告）: {reg_e}")
+
+        with shared["lock"]:
+            shared["e1_report"] = report
+            shared["e1_verification"] = verification
+            shared["asset_path"] = map_path
+            shared["job_kind"] = "e1"
+
+        n = len(report.get("comparisons") or {})
+        if verification.get("ok"):
+            push_status("success", f"E1 完成 · {n} 组对比")
+        else:
+            push_status("warning", "E1 已完成但输出校验未完全通过")
+        push_progress(100)
+        push_log(e1_agent_loop.summarize_e1_report_for_chat(report, verification).replace("\n", " | "))
+        return True
+    except Exception as e:
+        push_log(f"[ERROR] {e}")
+        push_status("error", f"E1 异常: {e}")
+        import traceback as _tb
+
+        _tb.print_exc()
+        return False
+
+
+def _e1_worker_entry(ctx, shared, stop_event):
+    ok = False
+    try:
+        ok = run_e1_sync(ctx, shared, stop_event)
+    except Exception as e:
+        tb_lines = traceback.format_exc().split("\n")[:25]
+        with shared["lock"]:
+            lines = list(shared.get("log_lines") or [])
+            lines.append(f"[CRASH] {e}")
+            lines.extend(tb_lines)
+            shared["log_lines"] = lines[-40:]
+            shared["status"] = ("error", str(e))
+    finally:
+        with shared["lock"]:
+            shared["success"] = ok
+            shared["done"] = True
 
 
 def _run_e1_phase(ctx, shared, current_shp, actual_task, push_log, check_stop):
@@ -1146,6 +1509,31 @@ _agent_flush = flush_pending_agent_commands(st.session_state)
 if _agent_flush.applied and _agent_flush.errors:
     for _afe in _agent_flush.errors:
         st.warning(_afe)
+if _agent_flush.applied and _agent_flush.m5_plan_text:
+    st.session_state._m5_plan_notice = _agent_flush.m5_plan_text
+    # 将可验证计划写入对话，便于用户确认
+    _msgs = list(st.session_state.get("messages") or [])
+    _last = (_msgs[-1].get("content") if _msgs else "") or ""
+    if "M5 时空变化检测 · 执行计划" not in str(_last):
+        _msgs.append({"role": "assistant", "content": _agent_flush.m5_plan_text})
+        st.session_state.messages = _msgs
+if _agent_flush.applied and _agent_flush.action_type == "run_m5":
+    try:
+        st.toast("M5 变化检测已确认，正在执行…", icon="🛰️")
+    except Exception:
+        pass
+if _agent_flush.applied and _agent_flush.e1_plan_text:
+    st.session_state._e1_plan_notice = _agent_flush.e1_plan_text
+    _msgs_e1 = list(st.session_state.get("messages") or [])
+    _last_e1 = (_msgs_e1[-1].get("content") if _msgs_e1 else "") or ""
+    if "E1 多源一致性诊断 · 执行计划" not in str(_last_e1):
+        _msgs_e1.append({"role": "assistant", "content": _agent_flush.e1_plan_text})
+        st.session_state.messages = _msgs_e1
+if _agent_flush.applied and _agent_flush.action_type == "run_e1":
+    try:
+        st.toast("E1 诊断已确认，正在执行…", icon="📊")
+    except Exception:
+        pass
 
 # =======================================================
 #  🌟 AIE 风格 CSS 深度定制
@@ -1948,7 +2336,121 @@ with st.sidebar:
         except Exception:
             pass
 
+    # 独立 M5 预检入口（不经 LLM，便于验收与无模型时使用）
+    if selected_task and final_root and not st.session_state.is_running:
+        if st.button("预检并生成 M5 计划", key="propose_m5_manual_btn", use_container_width=True):
+            queue_agent_command(
+                st.session_state,
+                {
+                    "sidebar_states": {
+                        "m5_enabled": True,
+                        "selected_task": selected_task,
+                        "final_root": final_root,
+                        "root_dir": root_dir,
+                    },
+                    "pending_action": {"type": "propose_m5", "task": selected_task},
+                },
+            )
+            st.rerun()
+
     _m5_res = st.session_state.get("m5_report")
+    _m5_plan = st.session_state.get("_m5_pending_plan")
+    if isinstance(_m5_plan, dict) and not st.session_state.is_running:
+        sbui.section("M5 执行计划")
+        with st.container(border=True):
+            if _m5_plan.get("ready"):
+                st.success("条件已满足，确认后将调用 M5 引擎")
+            else:
+                st.warning("条件未满足，暂不可执行")
+                for _b in _m5_plan.get("blockers") or []:
+                    st.caption(f"· {_b}")
+            st.caption(
+                f"当前 `{_m5_plan.get('current_task') or '—'}` · "
+                f"基线 `{_m5_plan.get('baseline_task') or '—'}` · "
+                f"可用时期 {len(_m5_plan.get('available_periods') or [])}"
+            )
+            _pc1, _pc2 = st.columns(2)
+            with _pc1:
+                if st.button(
+                    "确认执行 M5",
+                    key="confirm_m5_plan_btn",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not bool(_m5_plan.get("ready")),
+                ):
+                    queue_agent_command(
+                        st.session_state,
+                        {"pending_action": {"type": "run_m5", "confirmed": True}},
+                    )
+                    st.rerun()
+            with _pc2:
+                if st.button("取消计划", key="cancel_m5_plan_btn", use_container_width=True):
+                    st.session_state.pop("_m5_pending_plan", None)
+                    st.session_state.pop("_m5_plan_confirmed", None)
+                    st.session_state.pop("_m5_plan_notice", None)
+                    st.rerun()
+
+    _e1_plan = st.session_state.get("_e1_pending_plan")
+    if isinstance(_e1_plan, dict) and not st.session_state.is_running:
+        sbui.section("E1 执行计划")
+        with st.container(border=True):
+            if _e1_plan.get("ready"):
+                st.success("条件已满足，确认后将调用 E1 引擎")
+            else:
+                st.warning("条件未满足，暂不可执行")
+                for _b in _e1_plan.get("blockers") or []:
+                    st.caption(f"· {_b}")
+            st.caption(
+                f"当前 `{_e1_plan.get('current_task') or '—'}` · "
+                f"参考 `{_e1_plan.get('reference') or '—'}`"
+            )
+            _ec1, _ec2 = st.columns(2)
+            with _ec1:
+                if st.button(
+                    "确认执行 E1",
+                    key="confirm_e1_plan_btn",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not bool(_e1_plan.get("ready")),
+                ):
+                    queue_agent_command(
+                        st.session_state,
+                        {"pending_action": {"type": "run_e1", "confirmed": True}},
+                    )
+                    st.rerun()
+            with _ec2:
+                if st.button("取消 E1 计划", key="cancel_e1_plan_btn", use_container_width=True):
+                    st.session_state.pop("_e1_pending_plan", None)
+                    st.session_state.pop("_e1_plan_confirmed", None)
+                    st.session_state.pop("_e1_plan_notice", None)
+                    st.rerun()
+
+    # 重型工具确认门闩：Agent 请求 run_pipeline/run_m4/run_autotune 未确认时在此待命
+    _pending_heavy = st.session_state.get("_pending_heavy_confirm")
+    if isinstance(_pending_heavy, dict) and not st.session_state.is_running:
+        sbui.section("待确认操作")
+        with st.container(border=True):
+            _h_label = _pending_heavy.get("label") or _pending_heavy.get("action_type") or "推理任务"
+            _h_task = _pending_heavy.get("task") or "—"
+            st.warning(f"Agent 请求执行 **{_h_label}**（任务 `{_h_task}`），需要你确认后才会启动。")
+            _hc1, _hc2 = st.columns(2)
+            with _hc1:
+                if st.button(
+                    "确认执行",
+                    key="confirm_heavy_btn",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    _orig = dict(_pending_heavy.get("action") or {})
+                    _orig["confirmed"] = True
+                    queue_agent_command(st.session_state, {"pending_action": _orig})
+                    st.session_state.pop("_pending_heavy_confirm", None)
+                    st.rerun()
+            with _hc2:
+                if st.button("取消", key="cancel_heavy_btn", use_container_width=True):
+                    st.session_state.pop("_pending_heavy_confirm", None)
+                    st.rerun()
+
     if _m5_res and (not selected_task or _m5_res.get("target_roi") == selected_task):
         sbui.section("M5 告警")
         with st.container(border=True):
@@ -1971,9 +2473,42 @@ with st.sidebar:
             )
             with st.expander("详细指标", expanded=False):
                 st.json(_m5_res)
-            if st.button("清除 M5", key="clear_m5_report"):
-                st.session_state.pop("m5_report", None)
-                st.rerun()
+            _mc1, _mc2, _mc3 = st.columns(3)
+            _spatial = _m5_res.get("spatial_outputs") or {}
+            _loss_p = _spatial.get("loss_shapefile_path")
+            _silt_p = _spatial.get("siltation_shapefile_path")
+            with _mc1:
+                if (
+                    _loss_p
+                    and str(_loss_p) != "None"
+                    and os.path.isfile(str(_loss_p))
+                    and st.button("加载萎缩区", key="load_m5_loss", use_container_width=True)
+                ):
+                    st.session_state.asset_override = _loss_p
+                    st.session_state._asset_pinned = True
+                    st.session_state._map_view_synced_for = None
+                    st.session_state._map_prefer_center = False
+                    st.session_state.asset_just_loaded = True
+                    st.session_state._globe_rev = int(st.session_state.get("_globe_rev", 0)) + 1
+                    st.rerun()
+            with _mc2:
+                if (
+                    _silt_p
+                    and str(_silt_p) != "None"
+                    and os.path.isfile(str(_silt_p))
+                    and st.button("加载淤积区", key="load_m5_silt", use_container_width=True)
+                ):
+                    st.session_state.asset_override = _silt_p
+                    st.session_state._asset_pinned = True
+                    st.session_state._map_view_synced_for = None
+                    st.session_state._map_prefer_center = False
+                    st.session_state.asset_just_loaded = True
+                    st.session_state._globe_rev = int(st.session_state.get("_globe_rev", 0)) + 1
+                    st.rerun()
+            with _mc3:
+                if st.button("清除 M5", key="clear_m5_report", use_container_width=True):
+                    st.session_state.pop("m5_report", None)
+                    st.rerun()
 
     if selected_task and final_root and not st.session_state.is_running:
         try:
@@ -2185,12 +2720,21 @@ with col_map:
     # st_folium 会用 session 的 center/zoom 覆盖 Folium 内部视角；换缓存/换 TIF 时必须先把视角对齐到数据范围
     if map_display_path and os.path.exists(map_display_path):
         if st.session_state.get("_map_view_synced_for") != map_display_path:
-            _rv = _cached_view_for_asset_path(st.session_state, map_display_path)
-            if _rv is not None:
-                _rla, _rlo, _rzm = _rv
-                st.session_state.map_center = [_rla, _rlo]
-                st.session_state.map_zoom = int(_rzm)
+            # Copilot 刚跳转时会把 _map_view_synced_for 置空；此时保留跳转中心，勿拉回成果范围
+            if (
+                st.session_state.get("_map_prefer_center")
+                and st.session_state.get("_map_view_synced_for") is None
+            ):
                 st.session_state._map_view_synced_for = map_display_path
+            else:
+                _rv = _cached_view_for_asset_path(st.session_state, map_display_path)
+                if _rv is not None:
+                    _rla, _rlo, _rzm = _rv
+                    st.session_state.map_center = [_rla, _rlo]
+                    st.session_state.map_zoom = int(_rzm)
+                    st.session_state._map_view_synced_for = map_display_path
+                    # 新加载成果时恢复「飞到图层范围」，覆盖上一轮 Copilot 跳转优先标志
+                    st.session_state._map_prefer_center = False
     else:
         st.session_state._map_view_synced_for = None
 
@@ -2227,17 +2771,30 @@ with col_map:
                 except OSError:
                     _amt = 0.0
 
+            _prefer_center = bool(st.session_state.get("_map_prefer_center", False))
+
+            # 本机打开页面时强制本地地球，避免 iframe 走失效/过载的 ngrok（ERR_NGROK_3004）
+            _page_host = ""
+            try:
+                _hdrs = getattr(getattr(st, "context", None), "headers", None) or {}
+                _page_host = str(_hdrs.get("Host") or _hdrs.get("host") or "")
+            except Exception:
+                _page_host = ""
+            _force_local_globe = _globe_srv.is_local_page_host(_page_host)
+
+            # 缓存签名不含 map_center/zoom：Agent 纯跳转时复用同一 iframe，避免 Viewer 重建
+            # 但包含 force_local，避免本机/远程 URL 混用
             _cache_sig = hashlib.md5(
                 (
                     f"{_ap}|{_amt:.4f}|{_grev}|"
                     f"{st.session_state.get('result_overlay_opacity_pct', 50)}|"
                     f"{st.session_state.get('globe_show_e1', True)}|{_e1_tag}|"
-                    f"{st.session_state.map_center}|{st.session_state.map_zoom}"
+                    f"local={int(_force_local_globe)}|cam=v3"
                 ).encode("utf-8", errors="replace")
             ).hexdigest()
 
             _globe_warn = _globe_srv.globe_public_url_warning(_globe_port)
-            if _globe_warn:
+            if _globe_warn and not _force_local_globe:
                 _warn_tok = hashlib.md5(_globe_warn.encode("utf-8", errors="replace")).hexdigest()[:12]
                 if st.session_state.get("_globe_warn_token") != _warn_tok:
                     st.session_state._globe_warn_token = _warn_tok
@@ -2245,7 +2802,11 @@ with col_map:
 
             _cached_url = st.session_state.get("_globe_iframe_url")
             _globe_cache_hit = (
-                st.session_state.get("_globe_iframe_cache_sig") == _cache_sig and bool(_cached_url)
+                st.session_state.get("_globe_iframe_cache_sig") == _cache_sig
+                and bool(_cached_url)
+                and _globe_srv.same_globe_origin(
+                    _cached_url, _globe_port, force_local=_force_local_globe
+                )
             )
 
             if _globe_cache_hit:
@@ -2270,6 +2831,8 @@ with col_map:
                         ion_token=os.environ.get("CESIUM_ION_TOKEN"),
                         show_borders=False,
                         globe_port=_globe_port,
+                        prefer_center=_prefer_center,
+                        force_local=_force_local_globe,
                     )
 
                 if map_display_path and os.path.exists(map_display_path):
@@ -2290,7 +2853,9 @@ with col_map:
                     _gkey = f"{_gkey}_{_grev}"
 
                 _globe_srv.publish_html(_html, _gkey)
-                _globe_open_url = _globe_srv.globe_url(_globe_port, _gkey, bust=_grev)
+                _globe_open_url = _globe_srv.globe_url(
+                    _globe_port, _gkey, bust=_grev, force_local=_force_local_globe
+                )
                 _html_disk = _globe_srv.html_dir() / f"{_gkey}.html"
 
                 _serve_ok = False
@@ -2333,6 +2898,63 @@ with col_map:
                     height=GLOBE_HEIGHT,
                     scrolling=False,
                 )
+                # Copilot 地图跳转：向已加载的 Cesium iframe 发 CSTF_FLY，避免重建 Viewer
+                _fly = st.session_state.pop("_pending_camera_fly", None)
+                if isinstance(_fly, dict) and _fly.get("lat") is not None and _fly.get("lon") is not None:
+                    try:
+                        _fly_lat = float(_fly["lat"])
+                        _fly_lon = float(_fly["lon"])
+                        _fly_zoom = int(_fly.get("zoom", 9))
+                        _fly_h = float(_globe.zoom_to_height_m(_fly_zoom, _fly_lat))
+                        _fly_payload = {
+                            "type": "CSTF_FLY",
+                            "lat": _fly_lat,
+                            "lon": _fly_lon,
+                            "height": _fly_h,
+                            "pitch": float(_globe.DEFAULT_CAMERA["pitch_deg"]),
+                            "heading": float(_globe.DEFAULT_CAMERA["heading_deg"]),
+                            "duration": 1.0,
+                            "source": str(_fly.get("source") or "agent"),
+                            "label": f"({_fly_lat:.2f}°N, {_fly_lon:.2f}°E)",
+                        }
+                        import json as _json
+
+                        _fly_js = _json.dumps(_fly_payload, ensure_ascii=False)
+                        components.html(
+                            f"""
+<script>
+(() => {{
+  const win = window.parent || window;
+  const doc = win.document;
+  const msg = {_fly_js};
+  const send = () => {{
+    const iframes = doc.querySelectorAll("iframe");
+    let sent = false;
+    iframes.forEach((ifr) => {{
+      const src = ifr.getAttribute("src") || "";
+      if (!src) return;
+      if (src.indexOf("/globe") >= 0 || src.indexOf(":8765") >= 0) {{
+        try {{
+          ifr.contentWindow.postMessage(msg, "*");
+          sent = true;
+        }} catch (e) {{}}
+      }}
+    }});
+    return sent;
+  }};
+  if (!send()) {{
+    let n = 0;
+    const t = setInterval(() => {{
+      if (send() || ++n > 40) clearInterval(t);
+    }}, 120);
+  }}
+}})();
+</script>
+                            """,
+                            height=0,
+                        )
+                    except (TypeError, ValueError):
+                        pass
             else:
                 raster_load_error = raster_load_error or "未能生成三维地球 URL"
         except Exception as _globe_err:
@@ -2614,6 +3236,95 @@ if _user_submitted:
             with st.spinner("🧠 智能体思考中..."):
                 try:
                     import agent
+                    import m5_agent_loop
+                    import e1_agent_loop
+
+                    # 待确认 M5 计划时：用户短句确认 → 直接执行，不绕开条件检查
+                    _pending_m5 = st.session_state.get("_m5_pending_plan")
+                    if (
+                        isinstance(_pending_m5, dict)
+                        and m5_agent_loop.is_m5_confirm_utterance(prompt)
+                        and not st.session_state.is_running
+                    ):
+                        if not _pending_m5.get("ready"):
+                            _block = "；".join(_pending_m5.get("blockers") or ["条件未满足"])
+                            _msg = f"当前 M5 计划尚不可执行：{_block}"
+                            st.warning(_msg)
+                            st.session_state.messages.append(
+                                {"role": "assistant", "content": _msg}
+                            )
+                        else:
+                            queue_agent_command(
+                                st.session_state,
+                                {
+                                    "pending_action": {
+                                        "type": "run_m5",
+                                        "confirmed": True,
+                                        "task": _pending_m5.get("current_task"),
+                                    }
+                                },
+                            )
+                            _msg = (
+                                "已确认 M5 执行计划，正在调用现有 M5 引擎。"
+                                "完成后将根据真实报告与差异面回复。"
+                            )
+                            st.success(_msg)
+                            st.session_state.messages.append(
+                                {"role": "assistant", "content": _msg}
+                            )
+                        st.rerun()
+
+                    # 待确认 E1 计划时：短句确认 → 直接执行
+                    _pending_e1 = st.session_state.get("_e1_pending_plan")
+                    if (
+                        isinstance(_pending_e1, dict)
+                        and e1_agent_loop.is_e1_confirm_utterance(prompt)
+                        and not st.session_state.is_running
+                    ):
+                        # 若同时有 M5 待确认，优先已处理的 M5；此处仅当无 M5 待确认或用户明确提 E1
+                        _pending_m5_chk = st.session_state.get("_m5_pending_plan")
+                        if not isinstance(_pending_m5_chk, dict) or "e1" in (prompt or "").lower() or "一致" in (prompt or ""):
+                            if not _pending_e1.get("ready"):
+                                _block = "；".join(_pending_e1.get("blockers") or ["条件未满足"])
+                                _msg = f"当前 E1 计划尚不可执行：{_block}"
+                                st.warning(_msg)
+                                st.session_state.messages.append(
+                                    {"role": "assistant", "content": _msg}
+                                )
+                            else:
+                                queue_agent_command(
+                                    st.session_state,
+                                    {
+                                        "pending_action": {
+                                            "type": "run_e1",
+                                            "confirmed": True,
+                                            "task": _pending_e1.get("current_task"),
+                                        }
+                                    },
+                                )
+                                _msg = (
+                                    "已确认 E1 执行计划，正在调用现有 E1 引擎。"
+                                    "完成后将根据真实报告回复 IoU 等指标。"
+                                )
+                                st.success(_msg)
+                                st.session_state.messages.append(
+                                    {"role": "assistant", "content": _msg}
+                                )
+                            st.rerun()
+
+                    # 验收/高级：用户消息中直接粘贴 SYSTEM_COMMAND_JSON 时入队（不经 LLM）
+                    if "[SYSTEM_COMMAND_JSON]" in (prompt or ""):
+                        cmd_result, clean_reply = process_agent_reply(st.session_state, prompt)
+                        for _ce in cmd_result.errors:
+                            st.warning(_ce)
+                        _msg = clean_reply or (
+                            f"已接收系统指令：{cmd_result.action_type or 'sidebar/map'}"
+                        )
+                        st.markdown(_msg)
+                        st.session_state.messages.append(
+                            {"role": "assistant", "content": _msg}
+                        )
+                        st.rerun()
 
                     temp_img_path = None
                     if uploaded_img is not None:
@@ -2729,7 +3440,10 @@ def finalize_background_pipeline():
         prog = int(shared.get("progress", 0))
         at_result = shared.get("autotune_result")
         m5_report = shared.get("m5_report")
+        m5_verification = shared.get("m5_verification")
         e1_report = shared.get("e1_report")
+        e1_verification = shared.get("e1_verification")
+        job_kind = shared.get("job_kind")
     st.session_state.pipeline_log_snapshot = lines
     st.session_state.pipeline_progress_value = prog
     st.session_state.is_running = False
@@ -2751,16 +3465,76 @@ def finalize_background_pipeline():
                 )
             except Exception:
                 pass
+        # 独立 M5 闭环：把真实结果写回 Copilot，并加载地图
+        if job_kind == "m5" or (success and m5_verification is not None):
+            try:
+                import m5_agent_loop
+
+                summary = m5_agent_loop.summarize_m5_report_for_chat(
+                    m5_report, m5_verification
+                )
+                st.session_state.messages = list(st.session_state.get("messages") or [])
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": summary}
+                )
+                st.session_state._m5_last_summary = summary
+            except Exception:
+                pass
+            map_path = asset_path
+            if not map_path:
+                try:
+                    import m5_agent_loop
+
+                    map_path = m5_agent_loop.pick_m5_map_path(m5_report)
+                except Exception:
+                    map_path = None
+            if map_path and os.path.isfile(str(map_path)):
+                st.session_state.asset_override = map_path
+                st.session_state._asset_pinned = True
+                st.session_state.asset_just_loaded = True
+                st.session_state._map_view_synced_for = None
+                st.session_state._map_prefer_center = False
+                st.session_state._globe_rev = int(st.session_state.get("_globe_rev", 0)) + 1
     if e1_report:
         st.session_state.e1_report = e1_report
         try:
             st.toast("E1 多源一致性诊断已完成", icon="📊")
         except Exception:
             pass
+        # 独立 E1 闭环：真实指标写回 Copilot，并优先加载分歧热力图
+        if job_kind == "e1" or (success and e1_verification is not None):
+            try:
+                import e1_agent_loop
+
+                summary = e1_agent_loop.summarize_e1_report_for_chat(
+                    e1_report, e1_verification
+                )
+                st.session_state.messages = list(st.session_state.get("messages") or [])
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": summary}
+                )
+                st.session_state._e1_last_summary = summary
+            except Exception:
+                pass
+            map_path = asset_path
+            if not map_path:
+                try:
+                    import e1_agent_loop
+
+                    map_path = e1_agent_loop.pick_e1_map_path(e1_report)
+                except Exception:
+                    map_path = None
+            if map_path and os.path.isfile(str(map_path)):
+                st.session_state.asset_override = map_path
+                st.session_state._asset_pinned = True
+                st.session_state.asset_just_loaded = True
+                st.session_state._map_view_synced_for = None
+                st.session_state._map_prefer_center = False
+                st.session_state._globe_rev = int(st.session_state.get("_globe_rev", 0)) + 1
     m4_result = shared.get("m4_result") if shared else None
     if m4_result:
         st.session_state.m4_last_result = m4_result
-    if success and asset_path:
+    if success and asset_path and job_kind not in ("m5", "e1"):
         st.session_state.asset_override = asset_path
     if success:
         try:
@@ -2931,7 +3705,7 @@ def maybe_start_pipeline_thread():
         threading.Thread(target=_autotune_worker_entry, args=(ctx, shared, stop_ev), daemon=True).start()
         return
 
-    # ---- 常规推理分支 ----
+    # ---- 常规推理 / M4 / 独立 M5 分支 ----
     if not (st.session_state.pending_task and st.session_state.is_running):
         return
     if st.session_state.pipeline_thread_started:
@@ -2949,14 +3723,62 @@ def maybe_start_pipeline_thread():
         "lock": threading.Lock(),
         "log_lines": [],
         "progress": 0,
-        "status": ("info", "正在启动后台推理线程…"),
+        "status": ("info", "正在启动后台线程…"),
         "done": False,
         "success": False,
         "asset_path": None,
         "m5_report": None,
+        "m5_verification": None,
         "e1_report": None,
+        "job_kind": task_info.get("mode"),
     }
     st.session_state.pipeline_shared = shared
+
+    # 独立 M5 闭环（不跑推理）
+    if task_info.get("mode") == "m5":
+        shared["status"] = ("info", "正在启动 M5 变化检测…")
+        ctx = {
+            "root_dir": root_dir,
+            "final_root": final_root,
+            "task_options": list(task_options),
+            "task": task_info.get("task"),
+            "prob": task_info.get("prob"),
+            "cnt": task_info.get("cnt"),
+            "m5": task_info.get("m5") or {},
+            "m5_baseline_shp": m5_baseline_shp,
+        }
+        threading.Thread(
+            target=_m5_worker_entry,
+            args=(ctx, shared, stop_ev),
+            daemon=True,
+        ).start()
+        return
+
+    # 独立 E1 闭环（不跑推理）
+    if task_info.get("mode") == "e1":
+        shared["status"] = ("info", "正在启动 E1 多源一致性诊断…")
+        shared["e1_verification"] = None
+        ctx = {
+            "root_dir": root_dir,
+            "final_root": final_root,
+            "task_options": list(task_options),
+            "task": task_info.get("task"),
+            "prob": task_info.get("prob"),
+            "cnt": task_info.get("cnt"),
+            "task_aoi_shp": task_aoi_shp,
+            "e1": task_info.get("e1") or {},
+            "e1_data_root": e1_data_root,
+            "e1_reference": e1_reference,
+            "e1_compare_sources": list(e1_compare_sources),
+            "e1_export_maps": e1_export_maps,
+            "e1_export_heatmap": e1_export_heatmap,
+        }
+        threading.Thread(
+            target=_e1_worker_entry,
+            args=(ctx, shared, stop_ev),
+            daemon=True,
+        ).start()
+        return
 
     ctx = {
         "root_dir": root_dir,

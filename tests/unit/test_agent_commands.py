@@ -99,7 +99,7 @@ class TestPendingActions(unittest.TestCase):
         state = _base_state()
         cmd = {
             "sidebar_states": {"run_mode": "dl", "prob_th": 0.05, "min_cnt": 2},
-            "pending_action": {"type": "run_pipeline", "task": "24zhejiang1"},
+            "pending_action": {"type": "run_pipeline", "confirmed": True, "task": "24zhejiang1"},
         }
         result = apply_system_command(state, cmd)
         self.assertEqual(result.action_type, "run_pipeline")
@@ -116,6 +116,7 @@ class TestPendingActions(unittest.TestCase):
             "sidebar_states": {"workflow_tab": "GEE 数据下载", "m4_cloud": 20},
             "pending_action": {
                 "type": "run_m4",
+                "confirmed": True,
                 "task": "zhejiang1",
                 "m4_params": {"cloud_limit": 20, "start_date": "2020-06-01"},
             },
@@ -132,6 +133,7 @@ class TestPendingActions(unittest.TestCase):
         cmd = {
             "pending_action": {
                 "type": "run_autotune",
+                "confirmed": True,
                 "task": "24zhejiang1",
                 "autotune_params": {"reference_id": "师姐_2020", "objective": "max_iou"},
             },
@@ -174,7 +176,7 @@ class TestScenarioExamples(unittest.TestCase):
                 "prob_th": 0.05,
                 "min_cnt": 2,
             },
-            "pending_action": {"type": "run_pipeline", "task": "24zhejiang1"},
+            "pending_action": {"type": "run_pipeline", "confirmed": True, "task": "24zhejiang1"},
         }
         reply = f"[SYSTEM_COMMAND_JSON]\n{json.dumps(payload, ensure_ascii=False)}\n[/SYSTEM_COMMAND_JSON]"
         result, clean = process_agent_reply(state, reply)
@@ -198,7 +200,7 @@ class TestStreamlitDeferQueue(unittest.TestCase):
                 "m4_start_date": "2020-01-01",
                 "m4_end_date": "2020-01-31",
             },
-            "pending_action": {"type": "run_m4", "task": "hangzhou_bay"},
+            "pending_action": {"type": "run_m4", "confirmed": True, "task": "hangzhou_bay"},
         }
         reply = f"[SYSTEM_COMMAND_JSON]\n{json.dumps(payload, ensure_ascii=False)}\n[/SYSTEM_COMMAND_JSON]"
         result, _ = process_agent_reply(state, reply)
@@ -235,7 +237,7 @@ class TestStreamlitDeferQueue(unittest.TestCase):
             state,
             {
                 "sidebar_states": {"m5_enabled": True, "run_mode": "index"},
-                "pending_action": {"type": "run_pipeline", "task": "24zhejiang1"},
+                "pending_action": {"type": "run_pipeline", "confirmed": True, "task": "24zhejiang1"},
             },
         )
         self.assertTrue(state["ui_m5_enabled"])
@@ -247,12 +249,39 @@ class TestStreamlitDeferQueue(unittest.TestCase):
             state,
             {
                 "sidebar_states": {"workflow_tab": "GEE数据下载", "m4_cloud": 20},
-                "pending_action": {"type": "run_m4", "task": "zhejiang1"},
+                "pending_action": {"type": "run_m4", "confirmed": True, "task": "zhejiang1"},
             },
         )
         self.assertEqual(state["ui_workflow"], "GEE 数据下载")
         self.assertEqual(state["ui_m4_cloud_limit"], 20)
         self.assertEqual(state["pending_task"]["mode"], "m4")
+
+    def test_natural_language_map_jump(self):
+        """模型只回自然语言坐标时也应解析出 map 指令（杭州湾场景）。"""
+        from agent_command_bridge import parse_system_command
+
+        reply = (
+            "已定位到杭州湾，地图视角已调整至中心点 **(30.5°N, 120.8°E)**，"
+            "缩放级别为 **9**。如需在此区域执行潮滩推理请继续说明。"
+        )
+        cmd = parse_system_command(reply)
+        self.assertIsNotNone(cmd)
+        self.assertEqual(cmd["map"]["lat"], 30.5)
+        self.assertEqual(cmd["map"]["lon"], 120.8)
+        self.assertEqual(cmd["map"]["zoom"], 9)
+
+        state = _base_state()
+        result = apply_system_command(state, cmd)
+        self.assertTrue(result.map_updated)
+        self.assertEqual(state["map_center"], [30.5, 120.8])
+        self.assertEqual(state["map_zoom"], 9)
+        self.assertTrue(state.get("_map_prefer_center"))
+
+    def test_natural_language_coords_ignored_without_intent(self):
+        from agent_command_bridge import parse_system_command
+
+        reply = "杭州湾大致位于 30.5°N, 120.8°E，属于浙江沿岸。"
+        self.assertIsNone(parse_system_command(reply))
 
 
 if __name__ == "__main__":
