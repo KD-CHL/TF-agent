@@ -1,0 +1,177 @@
+{
+  "started_at": "2026-07-19T13:18:36",
+  "finished_at": "2026-07-19T13:18:39",
+  "git": {},
+  "results": [
+    {
+      "name": "inventory_data",
+      "ok": true,
+      "detail": {
+        "prod_final_exists": true,
+        "sandbox_final_exists": true,
+        "prod_tasks_with_final": [
+          "20fujian2",
+          "20zhejiang1",
+          "20_5b_zhejiang1"
+        ],
+        "prod_multi_year_pairs": 0,
+        "sandbox_pair": {
+          "current": "E:\\Code\\GEE\\_e2e_sandbox\\output\\24zhejiang1\\24zhejiang1_Final_p0.05_c2.shp",
+          "baseline": "E:\\Code\\GEE\\_e2e_sandbox\\output\\20zhejiang1\\20zhejiang1_Final_p0.05_c2.shp"
+        },
+        "passed": true,
+        "note": "生产 843output 当前无跨年 Final 成对；完整引擎 happy-path 使用 e2e sandbox。"
+      },
+      "error": ""
+    },
+    {
+      "name": "prod_24_missing_final_blocked",
+      "ok": true,
+      "detail": {
+        "passed": true,
+        "ready": false,
+        "blockers": [
+          "当期潮滩成果 SHP 不存在：E:\\Data\\843output\\24zhejiang1"
+        ],
+        "reason": null
+      },
+      "error": ""
+    },
+    {
+      "name": "prod_20_no_baseline_blocked",
+      "ok": true,
+      "detail": {
+        "passed": true,
+        "ready": false,
+        "current_shp": "E:\\Data\\843output\\20zhejiang1\\20zhejiang1_Final_p0.05_c2.shp",
+        "blockers": [
+          "未找到区域 [zhejiang1] 在 20 年之前的可用基线时期（需 final_root 下有更早同区域 Final SHP）。"
+        ],
+        "reason": null
+      },
+      "error": ""
+    },
+    {
+      "name": "sandbox_preflight_ready",
+      "ok": true,
+      "detail": {
+        "passed": true,
+        "plan_summary": {
+          "ready": true,
+          "baseline_task": "20zhejiang1",
+          "periods": [
+            "20zhejiang1"
+          ]
+        },
+        "reason": null
+      },
+      "error": ""
+    },
+    {
+      "name": "gate_unconfirmed_rejected",
+      "ok": true,
+      "detail": {
+        "passed": true,
+        "errors": [
+          "M5 需用户确认后才能执行（confirmed=true 或侧栏确认）。"
+        ],
+        "pending_task": null,
+        "reason": null
+      },
+      "error": ""
+    },
+    {
+      "name": "gate_confirmed_builds_pending",
+      "ok": true,
+      "detail": {
+        "passed": true,
+        "action_type": "run_m5",
+        "mode": "m5",
+        "m5_paths": {
+          "current": "E:\\Code\\GEE\\_e2e_sandbox\\output\\24zhejiang1\\24zhejiang1_Final_p0.05_c2.shp",
+          "baseline": "E:\\Code\\GEE\\_e2e_sandbox\\output\\20zhejiang1\\20zhejiang1_Final_p0.05_c2.shp"
+        },
+        "reason": null
+      },
+      "error": ""
+    },
+    {
+      "name": "confirm_utterance_helpers",
+      "ok": true,
+      "detail": {
+        "passed": true
+      },
+      "error": ""
+    },
+    {
+      "name": "full_engine_verify_summary",
+      "ok": true,
+      "detail": {
+        "passed": true,
+        "alert_level": "RED",
+        "metrics": {
+          "baseline_area_km2": 25.614,
+          "current_area_km2": 18.675,
+          "change_rate_percentage": -27.09
+        },
+        "verification_ok": true,
+        "map_candidate": "C:\\Users\\admin\\AppData\\Local\\Temp\\tmpeq7oqoym\\outputs_m5_advanced\\24zhejiang1_loss_zones.shp",
+        "report_path": "C:\\Users\\admin\\AppData\\Local\\Temp\\tmpeq7oqoym\\outputs_m5_advanced\\ADVANCED_ALERT_REPORT_24zhejiang1.json",
+        "summary_excerpt": "## M5 变化检测结果（已验证）\n\n- 任务：`24zhejiang1`\n- 基线：`20zhejiang1`\n- 告警级别：**RED**\n- 诊断：潮滩绝对面积剧烈萎缩(-27.09%)\n- 面积：25.614 → 18.675 km² （-27.09%）\n- 重心漂移：1110.77 m\n- 萎缩区：`24zhejiang1_loss_zones.shp`（已登记，可在地图查看）\n- 淤积区：`24zhejiang1_siltation_zones.shp`\n- 报告",
+        "asset_key_shape": "24zhejiang1_m5",
+        "reason": null
+      },
+      "error": ""
+    },
+    {
+      "name": "worker_shared_contract",
+      "ok": true,
+      "detail": {
+        "passed": true,
+        "status": [
+          "success",
+          "M5 RED"
+        ],
+        "log_tail": [
+          "[M5] 地理坐标系 → UTM EPSG:32651（面积/距离单位：米）",
+          "[M5] 面积 25.61→18.68 km² (-27.09%) | 重心漂移 1110.8 m",
+          "[M5] 空间差集：定位萎缩/淤积区…",
+          "[M5] 告警级别 [RED] → 潮滩绝对面积剧烈萎缩(-27.09%)",
+          "[M5] 告警报告已保存: E:\\Code\\GEE\\_e2e_sandbox\\output\\outputs_m5_advanced\\ADVANCED_ALERT_REPORT_24zhejiang1.json"
+        ],
+        "has_asset_path": true,
+        "reason": null
+      },
+      "error": ""
+    }
+  ],
+  "passed": 9,
+  "failed": 0,
+  "total": 9,
+  "all_ok": true,
+  "browser": {
+    "url": "http://127.0.0.1:8501",
+    "checked_at": "2026-07-19T13:27:30",
+    "ui_smoke": "PASS — workbench + China view globe + Copilot + 预检并生成 M5 计划",
+    "exception_plan_ui": "PASS — 预检 20fujian1 显示 M5 执行计划/条件未满足/确认按钮 disabled + blockers",
+    "happy_path_ui": "PARTIAL — Streamlit widget automation could not reliably commit root_dir/task select; full happy-path covered by script case_full_engine_verify_summary + worker_shared_contract",
+    "china_camera": "PASS — default globe shows full China view (prior camera bug not regressing)"
+  },
+  "framework_extraction": {
+    "module": "TF-agent/agent_task_framework.py",
+    "m5_behavior_unchanged": true,
+    "reusable": [
+      "TaskPlan",
+      "require_confirm",
+      "VerifyResult",
+      "grounded_summary",
+      "state key conventions"
+    ],
+    "not_abstracted": [
+      "engine params",
+      "streamlit threads",
+      "registry field details"
+    ]
+  },
+  "script_acceptance": "9/9 PASS"
+}

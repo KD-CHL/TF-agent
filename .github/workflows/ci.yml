@@ -1,0 +1,47 @@
+# 最小 CI：仅跑单元测试（不跑 E2E/压力/训练）。
+# 依赖面：agent_command_bridge / e1_agent_loop / m5_agent_loop / pre_engine 及其 GIS 链。
+# 说明：torch 用 CPU wheel 避免 CUDA 体积；geopandas/rasterio 有官方 wheels。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: TF-agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: TF-agent/requirements.txt
+
+      - name: Install test deps (CPU torch + GIS wheels)
+        run: |
+          pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy rasterio geopandas scipy scikit-image shapely streamlit \
+            python-dotenv chromadb langchain-openai langchain-core langgraph pytest
+
+      - name: Run unit tests
+        run: |
+          python -m pytest ../tests/unit -q --tb=short -p no:cacheprovider
+
+      - name: Upload pytest report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-report
+          path: |
+            TF-agent/.pytest_cache
+            tests/unit/__pycache__
