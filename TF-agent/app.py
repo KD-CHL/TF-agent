@@ -1506,6 +1506,123 @@ from agent_command_bridge import (
 
 import map_protocol as _map_proto
 
+
+# ---- Phase D: 地图 AOI 双向交互（Cesium 绘制 → server → 校验回声 → Copilot 上下文）----
+def _send_globe_message(payload):
+    """向已加载的 Cesium iframe 发送任意 CSTF_MAP_V1 消息（同 FLY 的 targetOrigin 收紧逻辑）。"""
+    import json as _json
+
+    _msg_js = _json.dumps(payload, ensure_ascii=False)
+    try:
+        components.html(
+            f"""
+<script>
+(() => {{
+  const win = window.parent || window;
+  const doc = win.document;
+  const msg = {_msg_js};
+  let origin = "*";
+  try {{
+    const iframes = doc.querySelectorAll("iframe");
+    iframes.forEach((ifr) => {{
+      const src = ifr.getAttribute("src") || "";
+      if (src.indexOf("/globe") >= 0 || src.indexOf(":8765") >= 0) {{
+        try {{ origin = new URL(src, win.location.href).origin; }} catch (e) {{}}
+      }}
+    }});
+  }} catch (e) {{}}
+  const send = () => {{
+    const iframes = doc.querySelectorAll("iframe");
+    let sent = false;
+    iframes.forEach((ifr) => {{
+      const src = ifr.getAttribute("src") || "";
+      if (!src) return;
+      if (src.indexOf("/globe") >= 0 || src.indexOf(":8765") >= 0) {{
+        try {{
+          ifr.contentWindow.postMessage(msg, origin);
+          sent = true;
+        }} catch (e) {{}}
+      }}
+    }});
+    return sent;
+  }};
+  if (!send()) {{
+    let n = 0;
+    const t = setInterval(() => {{
+      if (send() || ++n > 40) clearInterval(t);
+    }}, 120);
+  }}
+}})();
+</script>
+            """,
+            height=0,
+        )
+    except Exception:
+        pass
+
+
+def _poll_aoi_messages():
+    """消费 Cesium iframe 的 AOI 消息：校验 → 回声图层 → 注入 Copilot 上下文。"""
+    try:
+        import aoi_context as _aoi_ctx
+        import aoi_map_bridge as _aoi_bridge
+    except Exception:
+        return
+    try:
+        import globe_server as _gsrv
+
+        _since = int(st.session_state.get("_aoi_poll_seq") or 0)
+        _res = _gsrv.take_aoi_pending(_since)
+    except Exception:
+        return
+    if _res.get("last_seq") is not None:
+        st.session_state["_aoi_poll_seq"] = int(_res.get("last_seq") or _since)
+    for _m in _res.get("messages") or []:
+        _kind = _m.get("kind") or "selected"
+        try:
+            if _kind == "cleared":
+                _r = _aoi_bridge.process_aoi_cleared(st.session_state)
+            else:
+                _r = _aoi_bridge.process_aoi_selected(
+                    st.session_state,
+                    geometry=_m.get("geometry"),
+                    source=_m.get("source") or "map_polygon",
+                    label=_m.get("label"),
+                )
+        except Exception as _ae:
+            _r = {"ok": False, "errors": [str(_ae)], "echo": None}
+        _echo = _r.get("echo")
+        if isinstance(_echo, list):
+            for _e in _echo:
+                if isinstance(_e, dict):
+                    _send_globe_message(_e)
+        elif isinstance(_echo, dict):
+            _send_globe_message(_echo)
+        if not _r.get("ok"):
+            st.warning("AOI 无效：" + "; ".join(_r.get("errors") or []))
+
+
+def _aoi_sidebar_context():
+    """AOI 摘要（供 Agent System Prompt）：仅包含紧凑摘要 + 推荐，不含 GeoJSON。"""
+    try:
+        import aoi_context as _aoi_ctx
+        import aoi_map_bridge as _aoi_bridge
+    except Exception:
+        return ""
+    _aoi = st.session_state.get("_active_aoi")
+    if not _aoi:
+        return ""
+    try:
+        _cap = st.session_state.get("_capability_reg")
+        _caps = {}
+        if _cap is not None:
+            _snap = _cap.snapshot_for_agent()
+            _caps = {cid: v.get("status") for cid, v in _snap.items()}
+        return _aoi_bridge.aoi_recommendation_text(_aoi, _caps)
+    except Exception:
+        return ""
+
+
 # ---- Phase C: 统一任务执行时间线（惰性单例 + 原子账本）----
 def _get_task_timeline():
     tl = st.session_state.get("_task_timeline")
@@ -3008,6 +3125,8 @@ with col_map:
                     height=GLOBE_HEIGHT,
                     scrolling=False,
                 )
+                # Phase D: 消费 Cesium AOI 消息（绘制 → 校验 → 回声图层）
+                _poll_aoi_messages()
                 # Copilot 地图跳转：向已加载的 Cesium iframe 发 CSTF_FLY，避免重建 Viewer
                 _fly = st.session_state.pop("_pending_camera_fly", None)
                 if isinstance(_fly, dict) and _fly.get("lat") is not None and _fly.get("lon") is not None:
@@ -3491,6 +3610,10 @@ if _user_submitted:
                         _ds_cat = ""
 
                     _sidebar_ctx = build_agent_sidebar_context(st.session_state)
+                    # Phase D: AOI 空间上下文（紧凑摘要 + 能力推荐；AOI 选定 ≠ 确认）
+                    _aoi_ctx_text = _aoi_sidebar_context()
+                    if _aoi_ctx_text:
+                        _sidebar_ctx = (_sidebar_ctx + "\n\n" + _aoi_ctx_text) if _sidebar_ctx else _aoi_ctx_text
                     # 能力状态快照（白名单，无路径/密钥）：仅首条消息或刷新后注入一次
                     _cap_snap_text = None
                     try:

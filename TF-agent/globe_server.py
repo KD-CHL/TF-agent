@@ -32,18 +32,29 @@ _MAP_STATE: dict = {
     "ready_count": 0,
     "ack": None,
     "ack_ts": None,
+    "aoi_seq": 0,          # 已处理的 AOI 消息最大序号
+    "aoi_pending": [],     # 待消费 AOI 消息 [{seq, kind, geometry, source, label, ts}]
 }
 
 
 def map_protocol_state() -> dict:
-    """读取地图协议状态（READY 时间 / 最近一次 FLY_ACK）。"""
+    """读取地图协议状态（READY 时间 / 最近一次 FLY_ACK / AOI 序号）。"""
     with _lock:
         return dict(_MAP_STATE)
 
 
 def reset_map_protocol_state() -> None:
     with _lock:
-        _MAP_STATE.update({"ready_ts": None, "ready_count": 0, "ack": None, "ack_ts": None})
+        _MAP_STATE.update(
+            {
+                "ready_ts": None,
+                "ready_count": 0,
+                "ack": None,
+                "ack_ts": None,
+                "aoi_seq": 0,
+                "aoi_pending": [],
+            }
+        )
 
 
 def wait_map_ack(command_id: str, timeout: float = 1.5) -> Optional[dict]:
@@ -56,6 +67,26 @@ def wait_map_ack(command_id: str, timeout: float = 1.5) -> Optional[dict]:
                 return dict(ack)
         time.sleep(0.1)
     return None
+
+
+def push_aoi_message(msg: dict) -> int:
+    """Cesium iframe → Python：追加 AOI 消息，返回新序号。"""
+    with _lock:
+        _MAP_STATE["aoi_seq"] = int(_MAP_STATE.get("aoi_seq") or 0) + 1
+        seq = _MAP_STATE["aoi_seq"]
+        pending = list(_MAP_STATE.get("aoi_pending") or [])
+        pending.append(dict(msg, seq=seq, ts=time.time()))
+        _MAP_STATE["aoi_pending"] = pending[-50:]  # 上限 50 条
+        return seq
+
+
+def take_aoi_pending(since_seq: int = 0) -> dict:
+    """消费序号 > since_seq 的 AOI 消息。返回 {messages, last_seq}。"""
+    with _lock:
+        pending = list(_MAP_STATE.get("aoi_pending") or [])
+    fresh = [m for m in pending if int(m.get("seq") or 0) > int(since_seq)]
+    last_seq = max((int(m.get("seq") or 0) for m in pending), default=int(since_seq))
+    return {"messages": fresh, "last_seq": last_seq}
 
 
 def html_dir() -> Path:
@@ -342,6 +373,40 @@ class _GlobeHandler(BaseHTTPRequestHandler):
                 }
                 _MAP_STATE["ack_ts"] = time.time()
             self._send(200, b"ok", "text/plain; charset=utf-8")
+            return
+        self._send(404, b"not found", "text/plain; charset=utf-8")
+
+    def do_POST(self) -> None:
+        path = (self.path or "/").split("?", 1)[0]
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            length = 0
+        raw_body = self.rfile.read(length) if length > 0 else b""
+        if path == "/api/map/aoi":
+            import json as _json
+
+            try:
+                msg = _json.loads(raw_body.decode("utf-8") or "{}")
+            except Exception:
+                self._send(400, b"invalid json", "text/plain; charset=utf-8")
+                return
+            if not isinstance(msg, dict):
+                self._send(400, b"invalid message", "text/plain; charset=utf-8")
+                return
+            kind = str(msg.get("kind") or "selected")
+            geometry = msg.get("geometry")
+            source = str(msg.get("source") or "map_polygon")
+            label = msg.get("label")
+            push_aoi_message(
+                {
+                    "kind": kind,
+                    "geometry": geometry,
+                    "source": source,
+                    "label": label if isinstance(label, str) else None,
+                }
+            )
+            self._send(200, b'{"ok":true}', "application/json; charset=utf-8")
             return
         self._send(404, b"not found", "text/plain; charset=utf-8")
 

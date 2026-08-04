@@ -525,6 +525,20 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
       font: 12px/1.35 sans-serif; border-radius: 6px; border: 1px solid #2a3a55;
       pointer-events: none;
     }}
+    #aoiToolbar {{
+      position: fixed; top: 10px; right: 10px; z-index: 99998;
+      display: flex; gap: 6px; padding: 6px 8px;
+      background: rgba(8, 14, 28, 0.85); border: 1px solid #2a3a55;
+      border-radius: 8px; font: 12px/1.3 sans-serif;
+    }}
+    #aoiToolbar button {{
+      border: 1px solid #3a4a6a; background: #111c30; color: #cfe0ff;
+      border-radius: 5px; padding: 4px 9px; cursor: pointer; white-space: nowrap;
+    }}
+    #aoiToolbar button:hover {{ background: #1c2c48; }}
+    #aoiToolbar button.active {{
+      background: #2e6ac0; border-color: #7fb2ff; color: #fff;
+    }}
     .cesium-viewer-bottom {{ display: none !important; }}
     .cesium-viewer .cesium-widget-credits {{ font-size: 10px; opacity: 0.55; }}
   </style>
@@ -532,6 +546,13 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
 <body>
 <div id="cesiumError"></div>
 <div id="cesiumStatus">地球初始化中…</div>
+<div id="aoiToolbar">
+  <button id="aoiBtnClick" title="点选（以点击点为中心的小方框）">点选</button>
+  <button id="aoiBtnRect" title="拖拽绘制矩形">矩形</button>
+  <button id="aoiBtnPoly" title="左键加点，右键闭合（至少 3 点）">多边形</button>
+  <button id="aoiBtnView" title="使用当前视野范围">当前视图</button>
+  <button id="aoiBtnClear" title="清除当前 AOI（不影响业务图层）">清除</button>
+</div>
 <div id="cesiumContainer"></div>
 <script>
 (async function() {{
@@ -1141,6 +1162,183 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
     }}, 250);
   }}
   scheduleInitialCamera();
+
+  // ---- AOI 绘制工具：点选 / 矩形 / 多边形 / 当前视图 / 清除 ----
+  // 绘制结果 → server（POST /api/map/aoi，Streamlit 轮询消费） + postToParent(CSTF_AOI_*)
+  const aoi = {{
+    mode: "",          // "" | "click" | "rect" | "poly"
+    handler: null,
+    rectStart: null,
+    polyPts: [],
+    polyEntity: null,
+  }};
+
+  function aoiSetMode(mode) {{
+    aoi.mode = mode;
+    document.querySelectorAll("#aoiToolbar button").forEach(function(b) {{
+      b.classList.remove("active");
+    }});
+    const btn = document.getElementById("aoiBtn" + (mode ? mode[0].toUpperCase() + mode.slice(1) : "X"));
+    if (btn) btn.classList.add("active");
+    if (aoi.handler) {{
+      aoi.handler.destroy();
+      aoi.handler = null;
+    }}
+    if (aoi.polyEntity) {{
+      viewer.entities.remove(aoi.polyEntity);
+      aoi.polyEntity = null;
+    }}
+    aoi.polyPts = [];
+    aoi.rectStart = null;
+    if (!mode) return;
+    aoi.handler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
+    const pickPos = function(position) {{
+      const cart = viewer.camera.pickEllipsoid(position, viewer.scene.globe.ellipsoid);
+      if (!cart) return null;
+      const c = Cesium.Cartographic.fromCartesian(cart);
+      return {{
+        lon: Cesium.Math.toDegrees(c.longitude),
+        lat: Cesium.Math.toDegrees(c.latitude),
+      }};
+    }};
+    const toRing = function(pts) {{
+      const ring = pts.map(function(p) {{ return [p.lon, p.lat]; }});
+      if (ring.length > 0) {{
+        const first = ring[0];
+        const last = ring[ring.length - 1];
+        if (first[0] !== last[0] || first[1] !== last[1]) ring.push([first[0], first[1]]);
+      }}
+      return ring;
+    }};
+    if (mode === "click") {{
+      aoi.handler.setInputAction(function(movement) {{
+        const p = pickPos(movement.position);
+        if (!p) return;
+        aoiSetMode("");
+        sendAoi("selected", {{
+          type: "Polygon",
+          coordinates: [[
+            [p.lon - 0.002, p.lat - 0.002],
+            [p.lon + 0.002, p.lat - 0.002],
+            [p.lon + 0.002, p.lat + 0.002],
+            [p.lon - 0.002, p.lat + 0.002],
+            [p.lon - 0.002, p.lat - 0.002],
+          ]],
+        }}, "map_click");
+      }}, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+    }}
+    if (mode === "rect") {{
+      aoi.handler.setInputAction(function(movement) {{
+        aoi.rectStart = pickPos(movement.position);
+      }}, Cesium.ScreenSpaceEventType.LEFT_DOWN);
+      aoi.handler.setInputAction(function(movement) {{
+        if (!aoi.rectStart) return;
+        const p = pickPos(movement.position);
+        if (!p) return;
+        const w = aoi.rectStart.lon, s = aoi.rectStart.lat;
+        aoiSetMode("");
+        sendAoi("selected", {{
+          type: "Polygon",
+          coordinates: [[
+            [w, s], [p.lon, s], [p.lon, p.lat], [w, p.lat], [w, s],
+          ]],
+        }}, "map_rectangle");
+      }}, Cesium.ScreenSpaceEventType.LEFT_UP);
+    }}
+    if (mode === "poly") {{
+      aoi.handler.setInputAction(function(movement) {{
+        const p = pickPos(movement.position);
+        if (!p) return;
+        aoi.polyPts.push(p);
+        if (aoi.polyEntity) viewer.entities.remove(aoi.polyEntity);
+        aoi.polyEntity = viewer.entities.add({{
+          polyline: {{
+            positions: aoi.polyPts.map(function(q) {{
+              return Cesium.Cartesian3.fromDegrees(q.lon, q.lat);
+            }}),
+            width: 2,
+            material: Cesium.Color.YELLOW.withAlpha(0.9),
+            clampToGround: true,
+          }},
+        }});
+        setStatus("多边形绘制中（" + aoi.polyPts.length + " 点，右键闭合）");
+      }}, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+      aoi.handler.setInputAction(function() {{
+        if (aoi.polyPts.length < 3) {{
+          setStatus("多边形至少需要 3 个点");
+          aoiSetMode("");
+          return;
+        }}
+        const ring = toRing(aoi.polyPts);
+        aoiSetMode("");
+        sendAoi("selected", {{ type: "Polygon", coordinates: [ring] }}, "map_polygon");
+      }}, Cesium.ScreenSpaceEventType.RIGHT_CLICK);
+    }}
+  }}
+
+  function sendAoi(kind, geometry, source, label) {{
+    const msg = {{ kind: kind, geometry: geometry, source: source || "", label: label || null }};
+    try {{
+      fetch("./api/map/aoi", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify(msg),
+        cache: "no-store",
+      }}).catch(function(e) {{
+        console.warn("[AOI] server push failed", e);
+      }});
+    }} catch (e) {{
+      console.warn("[AOI] server push failed", e);
+    }}
+    postToParent({{
+      type: kind === "cleared" ? "CSTF_AOI_CLEARED" : "CSTF_AOI_SELECTED",
+      version: 1,
+      geometry: geometry,
+      source: source || "",
+      label: label || null,
+      ts: Date.now(),
+    }});
+    if (kind === "cleared") setStatus("AOI 已清除");
+    else setStatus("AOI 已发送，等待确认…");
+  }}
+
+  function aoiCurrentView() {{
+    try {{
+      const rect = viewer.camera.computeViewRectangle();
+      if (!rect) {{ setStatus("当前视野不可用（2D/无矩形）"); return; }}
+      sendAoi("selected", {{
+        type: "Polygon",
+        coordinates: [[
+          [Cesium.Math.toDegrees(rect.west), Cesium.Math.toDegrees(rect.south)],
+          [Cesium.Math.toDegrees(rect.east), Cesium.Math.toDegrees(rect.south)],
+          [Cesium.Math.toDegrees(rect.east), Cesium.Math.toDegrees(rect.north)],
+          [Cesium.Math.toDegrees(rect.west), Cesium.Math.toDegrees(rect.north)],
+          [Cesium.Math.toDegrees(rect.west), Cesium.Math.toDegrees(rect.south)],
+        ]],
+      }}, "current_view");
+    }} catch (e) {{
+      console.warn("[AOI] current view failed", e);
+      setStatus("当前视野不可用");
+    }}
+  }}
+
+  document.getElementById("aoiBtnClick").addEventListener("click", function() {{
+    aoiSetMode(aoi.mode === "click" ? "" : "click");
+  }});
+  document.getElementById("aoiBtnRect").addEventListener("click", function() {{
+    aoiSetMode(aoi.mode === "rect" ? "" : "rect");
+  }});
+  document.getElementById("aoiBtnPoly").addEventListener("click", function() {{
+    aoiSetMode(aoi.mode === "poly" ? "" : "poly");
+  }});
+  document.getElementById("aoiBtnView").addEventListener("click", function() {{
+    aoiSetMode("");
+    aoiCurrentView();
+  }});
+  document.getElementById("aoiBtnClear").addEventListener("click", function() {{
+    aoiSetMode("");
+    sendAoi("cleared", null, "ui_clear");
+  }});
 }})();
 </script>
 </body>
