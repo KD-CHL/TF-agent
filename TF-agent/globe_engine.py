@@ -974,25 +974,146 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
     setStatus(base + " · 中国视角");
   }}
 
+  // ---- CSTF_MAP_V1 协议：READY / FLY_ACK / LAYER_*（targetOrigin 收紧到父窗口 origin） ----
+  let _parentOrigin = "";
+  const _cstfLayers = {{}};
+
+  function postToParent(msg) {{
+    if (!window.parent) return;
+    const origin = _parentOrigin || "*";
+    try {{
+      window.parent.postMessage(msg, origin);
+    }} catch (e) {{
+      console.warn("[MapProtocol] postMessage failed", e);
+    }}
+  }}
+
+  function notifyReadyToServer() {{
+    try {{
+      fetch("./api/map/ready", {{ method: "GET", cache: "no-store" }}).catch(function() {{}});
+    }} catch (e) {{}}
+  }}
+
+  function notifyAckToServer(commandId, ok) {{
+    try {{
+      fetch(
+        "./api/map/ack?command_id=" + encodeURIComponent(commandId || "") + "&ok=" + (ok ? "1" : "0"),
+        {{ method: "GET", cache: "no-store" }}
+      ).catch(function() {{}});
+    }} catch (e) {{}}
+  }}
+
+  function sendReady() {{
+    postToParent({{
+      type: "CSTF_MAP_READY",
+      version: 1,
+      command_id: "ready-" + Date.now(),
+      status: "ready",
+      viewer_init_count: window.__cstfViewerInitCount || 1,
+      ts: Date.now(),
+    }});
+    notifyReadyToServer();
+  }}
+
+  function sendFlyAck(commandId, ok, extra) {{
+    const msg = {{
+      type: "CSTF_FLY_ACK",
+      version: 1,
+      command_id: commandId || "",
+      ok: !!ok,
+      ts: Date.now(),
+    }};
+    if (extra) Object.assign(msg, extra);
+    postToParent(msg);
+    notifyAckToServer(commandId, ok);
+  }}
+
+  function sendLayerAck(commandId, layerId, ok, error) {{
+    postToParent({{
+      type: "CSTF_LAYER_ACK",
+      version: 1,
+      command_id: commandId || "",
+      layer_id: layerId || "",
+      ok: !!ok,
+      error: error || "",
+      ts: Date.now(),
+    }});
+  }}
+
+  function addCstfLayer(payload) {{
+    const layerId = payload.layer_id || ("layer-" + Date.now());
+    if (!payload.data) {{
+      sendLayerAck(payload.command_id, layerId, false, "缺少 GeoJSON data");
+      return;
+    }}
+    return Cesium.GeoJsonDataSource.load(payload.data, {{
+      clampToGround: true,
+      stroke: hexToCesiumColor(payload.color || "#e41a1c", 0.95),
+      fill: hexToCesiumColor(payload.color || "#e41a1c", payload.alpha != null ? payload.alpha : 0.5),
+      strokeWidth: 2,
+    }}).then(function(ds) {{
+      ds.name = payload.name || layerId;
+      if (_cstfLayers[layerId]) {{
+        viewer.dataSources.remove(_cstfLayers[layerId]);
+      }}
+      viewer.dataSources.add(ds);
+      _cstfLayers[layerId] = ds;
+      sendLayerAck(payload.command_id, layerId, true);
+      viewer.scene.requestRender();
+    }}).catch(function(err) {{
+      console.warn("[MapProtocol] layer add failed", err);
+      sendLayerAck(payload.command_id, layerId, false, String((err && err.message) || err));
+    }});
+  }}
+
+  function removeCstfLayer(payload) {{
+    const layerId = payload.layer_id || "";
+    const ds = _cstfLayers[layerId];
+    if (ds) {{
+      viewer.dataSources.remove(ds);
+      delete _cstfLayers[layerId];
+      sendLayerAck(payload.command_id, layerId, true);
+      viewer.scene.requestRender();
+      return;
+    }}
+    sendLayerAck(payload.command_id, layerId, false, "图层不存在: " + layerId);
+  }}
+
   // Streamlit 侧仅改 center/zoom 时通过 postMessage 飞行，避免 iframe 重建
   window.addEventListener("message", function(ev) {{
+    if (!ev.origin) return;
+    _parentOrigin = ev.origin;  // 记录父窗口精确 origin，回发收紧 targetOrigin
     const data = ev.data;
-    if (!data || data.type !== "CSTF_FLY") return;
-    const ok = navigateToLocation({{
-      longitude: data.lon,
-      latitude: data.lat,
-      height: data.height,
-      pitch: data.pitch != null ? data.pitch : defaultPitchDeg(),
-      heading: data.heading != null ? data.heading : defaultHeadingDeg(),
-      duration: data.duration != null ? data.duration : 1.0,
-      source: data.source || "postMessage",
-      force: true,
-    }});
-    if (ok) {{
+    if (!data || typeof data !== "object") return;
+    const type = data.type;
+
+    if (type === "CSTF_FLY") {{
+      const ok = navigateToLocation({{
+        longitude: data.lon,
+        latitude: data.lat,
+        height: data.height,
+        pitch: data.pitch != null ? data.pitch : defaultPitchDeg(),
+        heading: data.heading != null ? data.heading : defaultHeadingDeg(),
+        duration: data.duration != null ? data.duration : 1.0,
+        source: data.source || "postMessage",
+        force: true,
+      }});
       const label = data.label || (
         Number(data.lat).toFixed(2) + "°N, " + Number(data.lon).toFixed(2) + "°E"
       );
-      setStatus("底图就绪 · 已定位 " + label);
+      if (ok) setStatus("底图就绪 · 已定位 " + label);
+      sendFlyAck(data.command_id, ok, {{ label: label, source: data.source || "postMessage" }});
+      return;
+    }}
+
+    if (type === "CSTF_LAYER_ADD") {{
+      addCstfLayer(data);
+      return;
+    }}
+
+    if (type === "CSTF_LAYER_REMOVE") {{
+      removeCstfLayer(data);
+      return;
     }}
   }});
 
@@ -1008,6 +1129,7 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
       if ((w > 40 && h > 40) || tries > 20) {{
         applyCameraView("init");
         viewer.scene.requestRender();
+        sendReady();
         return;
       }}
       requestAnimationFrame(tick);

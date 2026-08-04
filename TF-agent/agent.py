@@ -264,14 +264,29 @@ def trigger_spatial_analysis(
 
 
 @tool
-def change_map_view(location_name: str, lat: float, lon: float, zoom: int) -> str:
+def change_map_view(
+    location_name: str,
+    lat: float,
+    lon: float,
+    zoom: int,
+    preset: Optional[str] = None,
+    label: Optional[str] = None,
+) -> str:
     """
     地图视角跳转。用户表达查看/定位/跳到某地时必须立即调用。
     可与 dispatch_system_command 合并；单独跳转时用本工具。
+    preset: 可选，地名预设（如 杭州湾/乐清湾/中国），用于高度档位与展示。
+    label: 可选，状态栏展示名（默认取 location_name）。
     """
     import json as _json
 
     payload = {"map": {"lat": lat, "lon": lon, "zoom": int(zoom)}}
+    if preset:
+        payload["map"]["preset"] = str(preset)
+    if label:
+        payload["map"]["label"] = str(label)
+    elif location_name:
+        payload["map"]["label"] = str(location_name)
     return f"[SYSTEM_COMMAND_JSON]\n{_json.dumps(payload, ensure_ascii=False)}\n[/SYSTEM_COMMAND_JSON]"
 
 

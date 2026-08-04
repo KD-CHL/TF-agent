@@ -26,6 +26,37 @@ _server_version_started: int = 0
 _probe_cache: dict[str, tuple[float, bool]] = {}
 _PROBE_TTL_SEC = 30.0
 
+# CSTF_MAP_V1 协议状态：iframe 内 JS 通过同源 fetch 上报，供 Streamlit 侧读取
+_MAP_STATE: dict = {
+    "ready_ts": None,
+    "ready_count": 0,
+    "ack": None,
+    "ack_ts": None,
+}
+
+
+def map_protocol_state() -> dict:
+    """读取地图协议状态（READY 时间 / 最近一次 FLY_ACK）。"""
+    with _lock:
+        return dict(_MAP_STATE)
+
+
+def reset_map_protocol_state() -> None:
+    with _lock:
+        _MAP_STATE.update({"ready_ts": None, "ready_count": 0, "ack": None, "ack_ts": None})
+
+
+def wait_map_ack(command_id: str, timeout: float = 1.5) -> Optional[dict]:
+    """轮询等待指定 command_id 的 FLY_ACK；超时返回 None。"""
+    deadline = time.time() + float(timeout)
+    while time.time() < deadline:
+        with _lock:
+            ack = _MAP_STATE.get("ack")
+            if ack and ack.get("command_id") == command_id:
+                return dict(ack)
+        time.sleep(0.1)
+    return None
+
 
 def html_dir() -> Path:
     d = Path(tempfile.gettempdir()) / "yyglobe_html"
@@ -287,6 +318,29 @@ class _GlobeHandler(BaseHTTPRequestHandler):
             self._send(200, _build_minimal_html().encode("utf-8"))
             return
         if path == "/health":
+            self._send(200, b"ok", "text/plain; charset=utf-8")
+            return
+        if path == "/api/map/ready":
+            with _lock:
+                _MAP_STATE["ready_ts"] = time.time()
+                _MAP_STATE["ready_count"] = int(_MAP_STATE.get("ready_count") or 0) + 1
+            self._send(200, b"ok", "text/plain; charset=utf-8")
+            return
+        if path == "/api/map/ack":
+            import urllib.parse
+
+            q = {}
+            for part in query.split("&"):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    q[k] = urllib.parse.unquote(v)
+            with _lock:
+                _MAP_STATE["ack"] = {
+                    "command_id": q.get("command_id", ""),
+                    "ok": q.get("ok") == "1",
+                    "ts": time.time(),
+                }
+                _MAP_STATE["ack_ts"] = time.time()
             self._send(200, b"ok", "text/plain; charset=utf-8")
             return
         self._send(404, b"not found", "text/plain; charset=utf-8")

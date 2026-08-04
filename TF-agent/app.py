@@ -1504,6 +1504,8 @@ from agent_command_bridge import (
     queue_agent_command,
 )
 
+import map_protocol as _map_proto
+
 init_ui_session_defaults(st.session_state)
 _agent_flush = flush_pending_agent_commands(st.session_state)
 if _agent_flush.applied and _agent_flush.errors:
@@ -2905,28 +2907,55 @@ with col_map:
                         _fly_lat = float(_fly["lat"])
                         _fly_lon = float(_fly["lon"])
                         _fly_zoom = int(_fly.get("zoom", 9))
-                        _fly_h = float(_globe.zoom_to_height_m(_fly_zoom, _fly_lat))
-                        _fly_payload = {
-                            "type": "CSTF_FLY",
-                            "lat": _fly_lat,
-                            "lon": _fly_lon,
-                            "height": _fly_h,
-                            "pitch": float(_globe.DEFAULT_CAMERA["pitch_deg"]),
-                            "heading": float(_globe.DEFAULT_CAMERA["heading_deg"]),
-                            "duration": 1.0,
-                            "source": str(_fly.get("source") or "agent"),
-                            "label": f"({_fly_lat:.2f}°N, {_fly_lon:.2f}°E)",
-                        }
-                        import json as _json
+                        _fly_height = _fly.get("height")
+                        if _fly_height is None:
+                            _fly_height = float(_globe.zoom_to_height_m(_fly_zoom, _fly_lat))
+                        _fly_label = _fly.get("label") or f"({_fly_lat:.2f}°N, {_fly_lon:.2f}°E)"
+                        _fly_payload, _fly_errs = _map_proto.make_fly_message(
+                            _fly_lon,
+                            _fly_lat,
+                            zoom=_fly_zoom,
+                            height=_fly_height,
+                            pitch=float(_globe.DEFAULT_CAMERA["pitch_deg"]),
+                            heading=float(_globe.DEFAULT_CAMERA["heading_deg"]),
+                            duration=float(_fly.get("duration", 1.0)),
+                            preset=_fly.get("preset"),
+                            label=_fly_label,
+                            source=str(_fly.get("source") or "agent"),
+                        )
+                        if _fly_payload is None:
+                            st.warning("地图跳转参数无效：" + "; ".join(_fly_errs or []))
+                        else:
+                            # READY 握手：等 Cesium 就绪后发；等待窗口超 3s 仍未就绪则带警告发送
+                            _mp_state = _globe_srv.map_protocol_state()
+                            _ready_ok = bool(_mp_state.get("ready_ts"))
+                            if not _ready_ok:
+                                _wait_started = st.session_state.get("_map_ready_wait_started")
+                                if _wait_started is None:
+                                    st.session_state._map_ready_wait_started = time.time()
+                                elif (time.time() - float(_wait_started)) > 3.0:
+                                    st.caption("⚠️ 地图尚未确认就绪（可能仍在加载），已尝试跳转。")
+                            import json as _json
 
-                        _fly_js = _json.dumps(_fly_payload, ensure_ascii=False)
-                        components.html(
-                            f"""
+                            _fly_js = _json.dumps(_fly_payload, ensure_ascii=False)
+                            components.html(
+                                f"""
 <script>
 (() => {{
   const win = window.parent || window;
   const doc = win.document;
   const msg = {_fly_js};
+  // targetOrigin 收紧：从 iframe src 提取精确 origin；取不到时回退当前页面 origin
+  let origin = "*";
+  try {{
+    const iframes = doc.querySelectorAll("iframe");
+    iframes.forEach((ifr) => {{
+      const src = ifr.getAttribute("src") || "";
+      if (src.indexOf("/globe") >= 0 || src.indexOf(":8765") >= 0) {{
+        try {{ origin = new URL(src, win.location.href).origin; }} catch (e) {{}}
+      }}
+    }});
+  }} catch (e) {{}}
   const send = () => {{
     const iframes = doc.querySelectorAll("iframe");
     let sent = false;
@@ -2935,7 +2964,7 @@ with col_map:
       if (!src) return;
       if (src.indexOf("/globe") >= 0 || src.indexOf(":8765") >= 0) {{
         try {{
-          ifr.contentWindow.postMessage(msg, "*");
+          ifr.contentWindow.postMessage(msg, origin);
           sent = true;
         }} catch (e) {{}}
       }}
@@ -2951,8 +2980,16 @@ with col_map:
 }})();
 </script>
                             """,
-                            height=0,
-                        )
+                                height=0,
+                            )
+                            # 短等待 FLY_ACK（最多 ~1.2s），成功则 toast；未确认不阻塞
+                            _ack = _globe_srv.wait_map_ack(_fly_payload.get("command_id", ""), timeout=1.2)
+                            if _ack:
+                                st.session_state["_map_ready_wait_started"] = None
+                                if _ack.get("ok"):
+                                    st.toast(f"地图已定位：{_fly_label}", icon="🗺️")
+                                else:
+                                    st.warning("地图跳转未完成，请检查地球页面状态。")
                     except (TypeError, ValueError):
                         pass
             else:

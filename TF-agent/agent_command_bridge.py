@@ -819,12 +819,26 @@ def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> Appl
                 state["_map_view_synced_for"] = None
                 # 强制按 center 飞；优先 postMessage 到已有 iframe，避免重建 Cesium Viewer
                 state["_map_prefer_center"] = True
-                state["_pending_camera_fly"] = {
+                fly = {
                     "lat": float(lat),
                     "lon": float(lon),
                     "zoom": int(zoom),
                     "source": "agent",
                 }
+                preset = mp.get("preset")
+                if preset:
+                    fly["preset"] = str(preset)
+                label = mp.get("label")
+                if label:
+                    fly["label"] = str(label)
+                for k in ("height", "duration", "pitch", "heading"):
+                    v = mp.get(k)
+                    if v is not None:
+                        try:
+                            fly[k] = float(v)
+                        except (TypeError, ValueError):
+                            result.errors.append(f"map.{k} 参数无效: {v!r}")
+                state["_pending_camera_fly"] = fly
                 # 不递增 _globe_rev / 不清 iframe 缓存：仅相机变化时复用已加载地球页
                 result.map_updated = True
             except (TypeError, ValueError) as e:
