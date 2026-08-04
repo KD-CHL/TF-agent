@@ -4191,8 +4191,73 @@ def _pipeline_monitor_inner():
                         f"`{_ev.updated_at[11:19]}` {_icon} **{_ev.phase}**/"
                         f"{_ev.status} {_ev.message}{_pct}"
                     )
+                # ---- Phase E: PDF 报告入口（任务完成后生成）----
+                if st.button("📄 生成 PDF 报告", key="_btn_gen_pdf_report"):
+                    _build_pdf_report()
     except Exception:
         pass
+
+
+# ---- Phase E: PDF 报告生成（真实数据：时间线 + 能力 + 资产）----
+def _build_pdf_report():
+    try:
+        import report_generator as _rg
+
+        _tl = _get_task_timeline()
+        _events = _tl.events(limit=50)
+        if not _events:
+            st.warning("无任务时间线事件，无法生成报告")
+            return
+        _last = _events[-1]
+        _task_id = _last.task_id or "task_unknown"
+        _task_ctx = {"task_id": _task_id}
+        _det = {}
+        for _e in reversed(_events):
+            if isinstance(_e.details, dict):
+                _det.update(_e.details)
+        _task_ctx.update(
+            {
+                "task": _det.get("task") or _task_id,
+                "mode": _det.get("mode") or "",
+                "prob": _det.get("prob"),
+                "cnt": _det.get("cnt"),
+                "plan_id": _det.get("plan_id"),
+            }
+        )
+        _caps = {}
+        try:
+            _creg = st.session_state.get("_capability_reg")
+            if _creg is not None:
+                _caps = _creg.snapshot_for_agent()
+        except Exception:
+            pass
+        _assets = []
+        for _e in _events:
+            for _a in (_e.artifacts or []):
+                _assets.append({"path": str(_a), "kind": "artifact"})
+        _res = _rg.generate_task_report(
+            _task_ctx, capabilities=_caps, timeline=_events, assets=_assets,
+        )
+        if _res.success and _res.report_path:
+            st.success("✅ PDF 报告已生成")
+            st.markdown(f"`{_res.report_path}`")
+            try:
+                with open(_res.report_path, "rb") as _pf:
+                    st.download_button(
+                        "⬇️ 下载 PDF 报告",
+                        _pf.read(),
+                        file_name=os.path.basename(_res.report_path),
+                        mime="application/pdf",
+                        key="_btn_dl_pdf_report",
+                    )
+            except Exception:
+                pass
+        else:
+            st.warning(f"PDF 报告生成失败：{_res.error or '未知错误'}")
+        for _w in (_res.warnings or []):
+            st.caption("· " + _w)
+    except Exception as _re:
+        st.warning(f"PDF 报告生成异常：{_re}")
 
 
 _PIPELINE_USE_FRAGMENT = False
