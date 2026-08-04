@@ -17,6 +17,15 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+# Phase C: 统一任务执行时间线（设计文档 §5）—— 仅 re-export，不改变现有框架
+from task_timeline import (  # noqa: F401
+    PHASES as TIMELINE_PHASES,
+    STATUSES as TIMELINE_STATUSES,
+    TimelineEvent,
+    TimelineStore,
+    can_transition,
+)
+
 
 @dataclass
 class TaskPlan:

@@ -1506,6 +1506,58 @@ from agent_command_bridge import (
 
 import map_protocol as _map_proto
 
+# ---- Phase C: 统一任务执行时间线（惰性单例 + 原子账本）----
+def _get_task_timeline():
+    tl = st.session_state.get("_task_timeline")
+    if tl is None:
+        import task_timeline as _tt
+
+        _ledger = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "data", "timeline_ledger.json"
+        )
+        tl = _tt.TimelineStore(ledger_path=_ledger)
+        try:
+            tl.load()
+        except Exception:
+            pass
+        st.session_state._task_timeline = tl
+    return tl
+
+
+def _tl_add(task_id, phase, message, *, status="PENDING", plan_id=None, tool=None,
+            progress=None, details=None, artifacts=None, error=None):
+    """记录时间线事件并原子落盘（失败静默，不阻塞主流程）。"""
+    try:
+        tl = _get_task_timeline()
+        ev = tl.add(
+            task_id, phase, message, status=status, plan_id=plan_id,
+            tool=tool, progress=progress, details=details or {},
+            artifacts=artifacts or [], error=error,
+        )
+        try:
+            tl.save()
+        except Exception:
+            pass
+        return ev
+    except Exception:
+        return None
+
+
+def _tl_update(event_id, *, status=None, progress=None, message=None, error=None):
+    try:
+        tl = _get_task_timeline()
+        _ok, ev = tl.update(
+            event_id, status=status, progress=progress, message=message, error=error
+        )
+        try:
+            tl.save()
+        except Exception:
+            pass
+        return ev
+    except Exception:
+        return None
+
+
 init_ui_session_defaults(st.session_state)
 _agent_flush = flush_pending_agent_commands(st.session_state)
 if _agent_flush.applied and _agent_flush.errors:
@@ -2618,12 +2670,16 @@ with st.sidebar:
         st.session_state.pop("pending_autotune", None)
         if st.session_state.get("pipeline_stop_event") is not None:
             st.session_state.pipeline_stop_event.set()
+        _tl_add(selected_task or st.session_state.get("_tl_current_task") or "system",
+                "EXECUTE", "任务已被用户中断", status="CANCELLED", tool="stop_button")
         st.toast("正在请求安全终止…", icon="🛑")
         st.rerun()
 
     if tune_btn and _autotune_ready and _ref_id:
         _aoi_path = (task_aoi_shp or "").strip()
         _aoi_use = _aoi_path if _aoi_path and os.path.isfile(_aoi_path) else None
+        _tl_add(selected_task or "unknown", "QUEUED", "AutoTune 任务已入队",
+                status="QUEUED", tool="run_autotune")
         st.session_state.pending_autotune = {
             "task": selected_task,
             "reference_id": _ref_id,
@@ -2642,6 +2698,8 @@ with st.sidebar:
         elif not os.path.isfile(m4_roi_path):
             st.error(f"ROI 矢量不存在: {m4_roi_path}")
         else:
+            _tl_add(selected_task or "unknown", "QUEUED", "GEE 下载任务已入队",
+                    status="QUEUED", tool="run_m4")
             st.session_state.pending_task = {
                 "task": selected_task,
                 "mode": "m4",
@@ -2674,8 +2732,13 @@ with st.sidebar:
             st.session_state.asset_just_loaded = True
             st.session_state._map_view_synced_for = None
             st.session_state._globe_rev = int(st.session_state.get("_globe_rev", 0)) + 1
+            _tl_add(selected_task or "unknown", "REGISTER", "加载缓存成果",
+                    status="SUCCEEDED", tool="cache_load",
+                    artifacts=[os.path.basename(str(cache_hit["file_path"]))])
             st.rerun()
         else:
+            _tl_add(selected_task or "unknown", "QUEUED", "推理任务已入队",
+                    status="QUEUED", tool="run_pipeline")
             st.session_state.pending_task = {
                 "task": selected_task,
                 "prob": prob_th,
@@ -3550,6 +3613,7 @@ def finalize_background_pipeline():
         e1_report = shared.get("e1_report")
         e1_verification = shared.get("e1_verification")
         job_kind = shared.get("job_kind")
+    _tl_task = st.session_state.get("_tl_current_task") or "unknown"
     st.session_state.pipeline_log_snapshot = lines
     st.session_state.pipeline_progress_value = prog
     st.session_state.is_running = False
@@ -3643,11 +3707,26 @@ def finalize_background_pipeline():
     if success and asset_path and job_kind not in ("m5", "e1"):
         st.session_state.asset_override = asset_path
     if success:
+        _tl_add(_tl_task, "EXECUTE", f"任务执行完成（{job_kind or 'pipeline'}）",
+                status="SUCCEEDED", progress=100, tool=job_kind or "run_pipeline")
+        if asset_path:
+            _tl_add(_tl_task, "REGISTER", "成果已登记",
+                    status="SUCCEEDED", tool="register_asset",
+                    artifacts=[os.path.basename(str(asset_path))])
+        if m5_report:
+            _tl_add(_tl_task, "VERIFY", "M5 变化检测校验通过",
+                    status="SUCCEEDED", tool="verify_m5")
+        if e1_report:
+            _tl_add(_tl_task, "VERIFY", "E1 多源一致性校验通过",
+                    status="SUCCEEDED", tool="verify_e1")
         try:
             st.balloons()
         except Exception:
             pass
     else:
+        _tl_add(_tl_task, "EXECUTE", "任务执行失败",
+                status="FAILED", error="任务执行失败，详见终端日志",
+                tool=job_kind or "run_pipeline")
         time.sleep(2)
     return True
 
@@ -3773,9 +3852,12 @@ def maybe_start_pipeline_thread():
         st.session_state.pipeline_log_snapshot = []
         st.session_state.pipeline_progress_value = 0
         st.session_state.executing_pipeline = True
+        st.session_state._tl_current_task = at_info["task"]
 
         stop_ev = threading.Event()
         st.session_state.pipeline_stop_event = stop_ev
+        _tl_add(at_info["task"], "EXECUTE", "AutoTune 参数搜索已启动",
+                status="RUNNING", tool="run_autotune", progress=0)
         shared = {
             "lock": threading.Lock(),
             "log_lines": [],
@@ -3822,9 +3904,13 @@ def maybe_start_pipeline_thread():
     st.session_state.pipeline_log_snapshot = []
     st.session_state.pipeline_progress_value = 0
     st.session_state.executing_pipeline = True
+    st.session_state._tl_current_task = task_info.get("task") or "unknown"
 
     stop_ev = threading.Event()
     st.session_state.pipeline_stop_event = stop_ev
+    _tl_add(task_info.get("task") or "unknown", "EXECUTE",
+            f"任务已启动（{task_info.get('mode', 'dl')}）",
+            status="RUNNING", tool="run_pipeline", progress=0)
     shared = {
         "lock": threading.Lock(),
         "log_lines": [],
@@ -3960,6 +4046,30 @@ def _pipeline_monitor_inner():
             st.caption("任务启动中…")
         else:
             st.caption("暂无日志。运行推理或 GEE 下载后，终端输出将显示在此处。")
+
+    # ---- Phase C: 任务时间线（倒序事件 + 阶段/状态徽章）----
+    try:
+        _tl = _get_task_timeline()
+        _tl_events = _tl.events(limit=12)
+        if _tl_events:
+            with st.expander(f"📋 任务时间线（{len(_tl_events)}）", expanded=False):
+                if _tl.restored_from == "disk":
+                    st.caption("历史记录（进程重启后恢复），非实时状态")
+                _status_icons = {
+                    "PENDING": "⏳", "WAITING_CONFIRMATION": "❓",
+                    "QUEUED": "🕓", "RUNNING": "🔵", "SUCCEEDED": "✅",
+                    "FAILED": "❌", "BLOCKED": "⛔", "CANCELLED": "🚫",
+                    "WARNING": "⚠️",
+                }
+                for _ev in reversed(_tl_events):
+                    _icon = _status_icons.get(_ev.status, "•")
+                    _pct = f" {_ev.progress}%" if _ev.progress is not None else ""
+                    st.markdown(
+                        f"`{_ev.updated_at[11:19]}` {_icon} **{_ev.phase}**/"
+                        f"{_ev.status} {_ev.message}{_pct}"
+                    )
+    except Exception:
+        pass
 
 
 _PIPELINE_USE_FRAGMENT = False
