@@ -667,6 +667,7 @@ def chat_with_vlm(
     available_tasks: list = None,
     dataset_catalog_text: str = None,
     sidebar_context: str = None,
+    capability_summary: str = None,
 ) -> str:
     """处理对话，完美支持多模态视觉能力与物理感知"""
 
@@ -676,6 +677,12 @@ def chat_with_vlm(
         dynamic_prompt += "\n\n" + sidebar_context.strip()
     if dataset_catalog_text and dataset_catalog_text.strip():
         dynamic_prompt += "\n\n【数据集资产目录 · AutoTune reference_id 从此选取】\n" + dataset_catalog_text.strip()
+    if capability_summary and capability_summary.strip():
+        dynamic_prompt += (
+            "\n\n【能力状态（只读参考，每轮会话快照一次）】\n"
+            + capability_summary.strip()
+            + "\n铁律：已 BLOCKED/UNKNOWN 的能力不得声称执行成功；CONDITIONAL 的能力需先确认前置条件。"
+        )
 
     messages = [SystemMessage(content=dynamic_prompt)]
 

@@ -2688,6 +2688,51 @@ with st.sidebar:
             st.session_state.stop_requested = False
             st.rerun()
 
+    # ---- 能力状态面板（B 阶段）：折叠、可刷新、不含敏感路径 ----
+    with st.expander("能力状态", expanded=False):
+        try:
+            import capability_registry as _cap
+        except Exception:
+            _cap = None
+        if _cap is not None:
+            _app_dir = os.path.dirname(os.path.abspath(__file__))
+            _cap_ctx = {
+                "model_path": st.session_state.get("ui_model_path") or "",
+                "autotune_script": os.path.join(_app_dir, "auto_tune.py"),
+                "knowledge_db_dir": os.path.normpath(
+                    os.path.join(_app_dir, "..", "rs_knowledge_db")
+                ),
+                "task": selected_task or "",
+            }
+            _cap_sig = hashlib.md5(
+                (f"{_cap_ctx['model_path']}|{_cap_ctx['task']}").encode("utf-8", errors="replace")
+            ).hexdigest()[:12]
+            _cap_reg = st.session_state.get("_capability_reg")
+            if _cap_reg is None or st.session_state.get("_capability_ctx_sig") != _cap_sig:
+                _cap_reg = _cap.CapabilityRegistry(context=_cap_ctx)
+                st.session_state._capability_reg = _cap_reg
+                st.session_state._capability_ctx_sig = _cap_sig
+            _cap_c1, _cap_c2 = st.columns([3, 1])
+            with _cap_c1:
+                st.caption("动态能力状态（不含敏感路径）")
+            with _cap_c2:
+                if st.button("刷新", key="cap_refresh_btn", use_container_width=True):
+                    _cap_reg.bump()
+                    st.rerun()
+            _status_labels = {
+                "AVAILABLE": "🟢 可用",
+                "CONDITIONAL": "🟡 受限",
+                "BLOCKED": "🔴 阻断",
+                "UNAVAILABLE": "⚪ 未启用",
+                "UNKNOWN": "❔ 未知",
+            }
+            for _cid in _cap_reg.ids():
+                _cst = _cap_reg.check(_cid)
+                st.markdown(
+                    f"**{_cst.label}** · {_status_labels.get(_cst.status, _cst.status)}"
+                )
+                st.caption(_cst.summary)
+
     st.session_state["map_display_path"] = map_display_path
 
 # ---- 主舱布局：中央地球 + 右侧指挥台（上：状态/日志，下：Copilot）----
@@ -3383,6 +3428,29 @@ if _user_submitted:
                         _ds_cat = ""
 
                     _sidebar_ctx = build_agent_sidebar_context(st.session_state)
+                    # 能力状态快照（白名单，无路径/密钥）：仅首条消息或刷新后注入一次
+                    _cap_snap_text = None
+                    try:
+                        import capability_registry as _cap
+                        _cap_reg = st.session_state.get("_capability_reg")
+                        if _cap_reg is None:
+                            _cap_reg = _cap.CapabilityRegistry(context={})
+                            st.session_state._capability_reg = _cap_reg
+                        if not st.session_state.get("_cap_snapshot_injected"):
+                            _snap = _cap_reg.snapshot_for_agent()
+                            _groups = _cap_reg.grouped_summary()
+                            _lines = [
+                                "可用: " + ",".join(_groups.get("AVAILABLE", [])),
+                                "受限: " + ",".join(_groups.get("CONDITIONAL", [])),
+                                "阻断: " + ",".join(_groups.get("BLOCKED", [])),
+                                "未启用: " + ",".join(_groups.get("UNAVAILABLE", [])),
+                                "未知: " + ",".join(_groups.get("UNKNOWN", [])),
+                            ]
+                            _reasons = {cid: e["summary"] for cid, e in _snap.items()}
+                            _cap_snap_text = "\n".join(_lines) + "\n原因: " + str(_reasons)
+                            st.session_state._cap_snapshot_injected = True
+                    except Exception:
+                        _cap_snap_text = None
                     reply = agent.chat_with_vlm(
                         full_prompt_for_agent,
                         st.session_state.messages,
@@ -3390,6 +3458,7 @@ if _user_submitted:
                         available_tasks=task_options,
                         dataset_catalog_text=_ds_cat or None,
                         sidebar_context=_sidebar_ctx,
+                        capability_summary=_cap_snap_text,
                     )
 
                     if temp_img_path and os.path.exists(temp_img_path):
