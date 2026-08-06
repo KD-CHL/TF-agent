@@ -4192,10 +4192,85 @@ def _pipeline_monitor_inner():
                         f"{_ev.status} {_ev.message}{_pct}"
                     )
                 # ---- Phase E: PDF 报告入口（任务完成后生成）----
-                if st.button("📄 生成 PDF 报告", key="_btn_gen_pdf_report"):
-                    _build_pdf_report()
+                _tl_col1, _tl_col2 = st.columns(2)
+                with _tl_col1:
+                    if st.button("📄 生成 PDF 报告", key="_btn_gen_pdf_report"):
+                        _build_pdf_report()
+                with _tl_col2:
+                    if st.button("🗺️ 生成成果报告", key="_btn_gen_asset_report"):
+                        _build_asset_report()
+                    _amsg = st.session_state.get("_asset_report_msg")
+                    if _amsg:
+                        if _amsg.get("level") == "success":
+                            st.markdown("✅ **成果报告已生成**")
+                            st.code(_amsg.get("path", ""))
+                            try:
+                                with open(_amsg["path"], "rb") as _pf:
+                                    st.download_button(
+                                        "⬇️ 下载成果报告",
+                                        _pf.read(),
+                                        file_name=os.path.basename(_amsg["path"]),
+                                        mime="application/pdf",
+                                        key="_btn_dl_asset_report",
+                                    )
+                            except Exception:
+                                pass
+                        else:
+                            st.markdown(f"⚠️ **{_amsg.get('text', '未知错误')}**")
+                        for _w in (_amsg.get("warnings") or []):
+                            st.caption(_w)
     except Exception:
         pass
+
+
+# ---- Phase E+: 成果报告生成（集成自 E:\\Code\\pdf report_engine.py，栅格统计 + 参考真值对比）----
+def _build_asset_report():
+    try:
+        import asset_report_engine as _are
+
+        _tl = _get_task_timeline()
+        _events = _tl.events(limit=50)
+        _task = ""
+        if _events:
+            for _e in reversed(_events):
+                # 顶层 task_id 为权威字段；details.task 为兼容回退
+                if getattr(_e, "task_id", None):
+                    _task = str(_e.task_id)
+                    break
+                if isinstance(_e.details, dict) and _e.details.get("task"):
+                    _task = str(_e.details["task"])
+                    break
+        if not _task:
+            _task = str(st.session_state.get("selected_task") or "") or ""
+        if not _task:
+            st.session_state["_asset_report_msg"] = {
+                "level": "warning",
+                "text": "未识别到目标任务，请在左侧选择目标任务",
+            }
+            return
+        _res = _are.generate_asset_report(
+            _task, progress_callback=lambda p, m: None,
+        )
+        if _res.success and _res.report_path:
+            st.session_state["_asset_report_msg"] = {
+                "level": "success",
+                "text": "✅ 成果报告已生成",
+                "path": _res.report_path,
+            }
+        else:
+            _msg = {
+                "level": "warning",
+                "text": f"成果报告生成失败：{_res.error or '未知错误'}",
+            }
+            _warns = [("· " + w) for w in (_res.warnings or [])]
+            if _warns:
+                _msg["warnings"] = _warns
+            st.session_state["_asset_report_msg"] = _msg
+    except Exception as _re:
+        st.session_state["_asset_report_msg"] = {
+            "level": "warning",
+            "text": f"成果报告生成异常：{_re}",
+        }
 
 
 # ---- Phase E: PDF 报告生成（真实数据：时间线 + 能力 + 资产）----
