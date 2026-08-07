@@ -72,9 +72,12 @@ def raster_tidal_flat_to_shp(
 # =======================================================
 def generate_double_constraint_complete(source_folder, mask_folder, output_path, shp_path,
                                         prob_threshold=0.05, min_absolute_count=2, logger=print,
-                                        stop_callback=None):
+                                        stop_callback=None, keep_final_tif=False):
     """
     logger: 传入 st.write 或自定义函数，用于在网页上显示日志
+
+    keep_final_tif: True 时把合成的 work 栅格保留为 Final TIF（output_path 若为 .tif），
+                    默认 False 保持历史行为（仅生成 Final SHP，删除中间 work 栅格）。
     """
     logger(f"\n📊 [Post-Process] 启动双重约束合成")
     logger(f"   🎯 策略: 概率 > {prob_threshold:.1%}  且  绝对次数 >= {min_absolute_count}")
@@ -297,10 +300,28 @@ def generate_double_constraint_complete(source_folder, mask_folder, output_path,
         if not raster_tidal_flat_to_shp(work_tif_path, final_shp_path, tidal_value=255, logger=logger):
             return False
 
-        try:
-            os.remove(work_tif_path)
-        except OSError:
-            logger(f"   ⚠️ 未能删除临时栅格: {work_tif_path}")
+        # ✅ 保留 Final TIF：work 栅格内容即最终双重约束合成结果，
+        #    把它原子重命名为 output_path（要求 output_path 以 .tif 结尾）。
+        if keep_final_tif:
+            _final_tif_candidates = [output_path]
+            if output_path.lower().endswith(".tif") or output_path.lower().endswith(".tiff"):
+                _final_tif = output_path
+            else:
+                _final_tif = output_stem(output_path) + ".tif"
+            try:
+                os.replace(work_tif_path, _final_tif)
+                logger(f"✅ Final TIF 已保留: {_final_tif}")
+            except OSError:
+                logger(f"   ⚠️ 未能保留 Final TIF: {_final_tif}")
+                try:
+                    os.remove(work_tif_path)
+                except OSError:
+                    pass
+        else:
+            try:
+                os.remove(work_tif_path)
+            except OSError:
+                logger(f"   ⚠️ 未能删除临时栅格: {work_tif_path}")
 
         logger(f"🎉 成功！双重约束潮滩矢量已生成: {final_shp_path}")
         return True

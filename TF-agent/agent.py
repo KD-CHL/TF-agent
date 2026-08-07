@@ -119,6 +119,7 @@ def dispatch_system_command(command_json: str) -> str:
 
     口语速查：
     「跑/推理/合成/开始」→ pending_action.run_pipeline（confirmed=true）
+    「本地影像推理/潮滩推理/模型跑图」→ local_tidal_flat_inference，确认后 confirm_inference
     「下载/GEE/下影像」→ workflow_tab=GEE数据下载；「开始下载」→ run_m4（confirmed=true）
     「调参/搜最优/AutoTune」→ adaptive_mode=true + run_autotune（confirmed=true）
     「5%/百分之五」→ prob_th=0.05；「频次2/两次」→ min_cnt=2
@@ -332,6 +333,65 @@ def assist_gee_download(
     return f"[SYSTEM_COMMAND_JSON]\n{_json.dumps(payload, ensure_ascii=False)}\n[/SYSTEM_COMMAND_JSON]"
 
 
+@tool
+def local_tidal_flat_inference(
+    task_id: Optional[str] = None,
+    prob_th: Optional[float] = None,
+    cnt: Optional[int] = None,
+    run_now: bool = False,
+) -> str:
+    """
+    【本地潮滩推理 · 生成执行计划】
+    用户要对「本地遥感影像」做潮滩推理（深度学习/CDNet/模型跑图/推理）时调用。
+    只接收 task_id / prob_th / cnt / run_now，**不接收任何路径参数**（路径一律使用
+    侧栏已配置的合法值或已登记资产，禁止编造路径）。
+    - 先调用本工具生成计划（propose）；plan 展示后必须等用户确认，再调用 confirm_inference。
+    - run_now=true 表示用户已明确要求启动（等价「开始/执行/跑」），此时会直接进入
+      计划→校验→确认（自动确认）→执行闭环；否则只生成计划等待确认。
+    prob_th 范围 0.01~0.50；cnt 范围 1~10；越界将由系统校验拒绝。
+    """
+    import json as _json
+
+    action: dict = {"type": "propose_inference"}
+    if task_id and str(task_id).strip():
+        action["task"] = str(task_id).strip()
+    if prob_th is not None:
+        action["prob_th"] = float(prob_th)
+    if cnt is not None:
+        action["cnt"] = int(cnt)
+    if run_now:
+        action["run_now"] = True
+    payload = {"pending_action": action}
+    if task_id and str(task_id).strip():
+        payload["sidebar_states"] = {"selected_task": str(task_id).strip()}
+    return (
+        "[SYSTEM_COMMAND_JSON]\n"
+        + _json.dumps(payload, ensure_ascii=False)
+        + "\n[/SYSTEM_COMMAND_JSON]"
+    )
+
+
+@tool
+def confirm_inference(plan_id: Optional[str] = None) -> str:
+    """
+    【本地潮滩推理 · 确认执行】
+    仅在用户已明确确认推理计划后调用（如「确认」「开始执行」）。
+    同一 plan_id 只确认一次；将真实调用现有 pre_engine / post_engine。
+    禁止在未确认时调用；禁止编造 plan_id（从计划中获取）。
+    """
+    import json as _json
+
+    action: dict = {"type": "confirm_inference", "confirmed": True}
+    if plan_id and str(plan_id).strip():
+        action["plan_id"] = str(plan_id).strip()
+    payload = {"pending_action": action}
+    return (
+        "[SYSTEM_COMMAND_JSON]\n"
+        + _json.dumps(payload, ensure_ascii=False)
+        + "\n[/SYSTEM_COMMAND_JSON]"
+    )
+
+
 # ==========================================
 # 2. 通义千问 API（阿里云百炼 DashScope · OpenAI 兼容模式）
 # ==========================================
@@ -366,6 +426,8 @@ llm = ChatOpenAI(
 
 tools = [
     dispatch_system_command,
+    local_tidal_flat_inference,
+    confirm_inference,
     prepare_m5_change_detection,
     confirm_and_run_m5,
     prepare_e1_consistency_check,
@@ -394,6 +456,12 @@ D. 只跳地图 → map 字段（可合并进 dispatch_system_command）
    例：「看看杭州湾」「定位到南流江口」「地图挪到舟山」
 E. 承前省略 / 指代 → 结合【侧栏快照】与对话上文补全 task/参数
    例：「那就跑吧」「同样参数再跑一遍」「云量改成 20 再下」
+H. **本地潮滩推理可信执行闭环**
+   - 「对本地影像跑推理 / 潮滩推理 / 模型跑图」→ **local_tidal_flat_inference**（生成计划）
+   - 展示计划后必须等用户确认；用户说「确认/开始执行」→ **confirm_inference(plan_id)**
+   - **禁止**编造权重路径/输入目录；路径一律用侧栏合法值；参数越界由系统校验
+   - run_now=true 仅当用户已明确说「开始/执行/跑」；否则只生成计划
+   - 同一 plan_id 只确认一次；完成后 Copilot 只回复工具真实输出
 F. **M5 时空变化检测闭环**
    - 「做变化检测 / 跑 M5 / 两期对比 / 看萎缩淤积」→ **prepare_m5_change_detection**（propose_m5）
    - 展示计划后等用户确认；用户说「确认/开始执行」→ **confirm_and_run_m5**
@@ -409,6 +477,7 @@ G. **E1 多源一致性闭环**
 第二步 · 工具选择
 ═══════════════════════════════════════
 - **首选** dispatch_system_command：可同时改多个侧栏项 + 跳地图 + 启动流程
+- local_tidal_flat_inference / confirm_inference：本地潮滩推理可信执行闭环（先计划后确认）
 - prepare_m5_change_detection / confirm_and_run_m5：独立 M5 变化检测闭环
 - prepare_e1_consistency_check / confirm_and_run_e1：独立 E1 多源一致性闭环
 - change_map_view：仅当地图跳转且无任何侧栏/运行需求时用

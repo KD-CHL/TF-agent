@@ -92,6 +92,7 @@ HEAVY_ACTION_LABELS = {
     "run_pipeline": "推理任务（深度学习/指数法推理）",
     "run": "推理任务（深度学习/指数法推理）",
     "": "推理任务（深度学习/指数法推理）",
+    "run_inference": "本地潮滩推理（可信执行闭环）",
     "run_m4": "GEE 影像下载",
     "run_autotune": "AutoTune 阈值搜索",
 }
@@ -110,6 +111,8 @@ class ApplyResult:
     m5_plan_text: str = ""
     e1_plan: Optional[Dict[str, Any]] = None
     e1_plan_text: str = ""
+    inference_plan: Optional[Dict[str, Any]] = None
+    inference_plan_text: str = ""
 
 
 PENDING_AGENT_COMMANDS_KEY = "_pending_agent_commands"
@@ -502,6 +505,24 @@ def build_agent_sidebar_context(state: Dict[str, Any]) -> str:
         )
     except Exception:
         pass
+    try:
+        import inference_agent_loop
+
+        lines.append(
+            inference_agent_loop.build_inference_context_for_agent(
+                root_dir=str(s.get("ui_root_dir") or ""),
+                task_options=None,
+                model_path=str(s.get("ui_model_path") or ""),
+                prob_threshold=s.get("ui_prob_th"),
+                count_threshold=s.get("ui_min_cnt"),
+                device="",
+                pending_plan=state.get("_inference_pending_plan")
+                if isinstance(state.get("_inference_pending_plan"), dict)
+                else None,
+            )
+        )
+    except Exception:
+        pass
     return "\n".join(lines)
 
 
@@ -623,6 +644,69 @@ def propose_m5_plan(state: Dict[str, Any], action: Optional[Dict[str, Any]] = No
     state["_m5_plan_confirmed"] = False
     errors = list(plan.get("blockers") or []) if not plan.get("ready") else []
     return plan, errors
+
+def propose_inference_plan(state: Dict[str, Any], action: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], List[str]]:
+    """根据侧栏合法配置与输入目录生成本地潮滩推理计划，写入 state['_inference_pending_plan']。
+
+    路径一律来自侧栏合法值；task 必须存在于 root_dir 子目录（build_inference_plan 校验）。
+    """
+    import inference_agent_loop
+
+    action = action or {}
+    init_ui_session_defaults(state)
+    task = (
+        (action.get("task") or state.get("ui_selected_task") or "")
+        .strip()
+        or None
+    )
+    if task:
+        state["ui_selected_task"] = task
+    prob = action.get("prob_th")
+    if prob is None:
+        prob = state.get("ui_prob_th")
+    cnt = action.get("min_cnt")
+    if cnt is None:
+        cnt = state.get("ui_min_cnt")
+    try:
+        prob_f = float(prob) if prob is not None else None
+    except (TypeError, ValueError):
+        prob_f = None
+    try:
+        cnt_i = int(cnt) if cnt is not None else None
+    except (TypeError, ValueError):
+        cnt_i = None
+
+    plan = inference_agent_loop.build_inference_plan(
+        task_id=str(task or ""),
+        root_dir=str(state.get("ui_root_dir") or ""),
+        final_root=str(state.get("ui_final_root") or ""),
+        mask_root=str(state.get("ui_mask_root") or ""),
+        model_path=str(state.get("ui_model_path") or ""),
+        prob_threshold=prob_f if prob_f is not None else 0.05,
+        count_threshold=cnt_i if cnt_i is not None else 2,
+        input_asset_id=action.get("input_asset_id"),
+        weight_id=action.get("weight_id"),
+        device_policy=str(action.get("device_policy") or "auto"),
+        shp_path=str(state.get("ui_shp_path") or ""),
+    )
+    state["_inference_pending_plan"] = plan
+    state["_inference_plan_confirmed"] = set()
+    errors = list(plan.get("blockers") or []) if not plan.get("ready") else []
+    return plan, errors
+
+
+def confirm_inference_plan(state: Dict[str, Any], plan_id: str) -> Tuple[bool, Optional[str]]:
+    """与 UI 确认按钮共用的推理计划确认门闩（委托 inference_agent_loop）。"""
+    import inference_agent_loop
+
+    return inference_agent_loop.confirm_inference_plan(state, plan_id)
+
+
+def is_inference_plan_confirmed(state: Dict[str, Any], plan_id: Optional[str]) -> bool:
+    import inference_agent_loop
+
+    return inference_agent_loop.is_plan_confirmed(state, plan_id)
+
 
 def build_pending_task(state: Dict[str, Any], action: Dict[str, Any]) -> Tuple[Optional[Dict], Optional[Dict], List[str]]:
     """
@@ -775,6 +859,39 @@ def build_pending_task(state: Dict[str, Any], action: Dict[str, Any]) -> Tuple[O
             },
         }, None, errors
 
+    if atype == "run_inference":
+        pid = action.get("plan_id") or (state.get("_inference_pending_plan") or {}).get("plan_id")
+        confirmed = bool(action.get("confirmed")) or is_inference_plan_confirmed(state, pid)
+        if not confirmed:
+            errors.append("本地潮滩推理需用户确认后才能执行（confirmed=true 或侧栏确认）。")
+            return None, None, errors
+        plan = state.get("_inference_pending_plan")
+        if not isinstance(plan, dict) or not plan.get("ready"):
+            plan, plan_errs = propose_inference_plan(state, action)
+            errors.extend(plan_errs)
+        if not isinstance(plan, dict) or not plan.get("ready"):
+            errors.append("推理执行条件未满足，无法启动。")
+            return None, None, errors
+        if pid and str(pid) != str(plan.get("plan_id")):
+            errors.append(f"确认的 plan_id 与当前计划不一致（{pid} != {plan.get('plan_id')}）。")
+            return None, None, errors
+        # 与 UI 确认按钮同一逻辑（confirm_inference_plan），确保幂等集已写入
+        if not is_inference_plan_confirmed(state, str(plan.get("plan_id"))):
+            ok, cerr = confirm_inference_plan(state, str(plan.get("plan_id")))
+            if not ok:
+                errors.append(cerr or "推理计划确认失败。")
+                return None, None, errors
+        return {
+            "task": plan["task_id"],
+            "prob": plan.get("prob_threshold"),
+            "cnt": plan.get("count_threshold"),
+            "mode": "dl",
+            "plan_id": plan["plan_id"],
+            "inference_plan": plan,
+            "points_shp": None,
+            "force_rerun": False,
+        }, None, errors
+
     if atype in ("run_pipeline", "run", ""):
         confirmed = bool(action.get("confirmed")) or bool(state.get("_pipeline_plan_confirmed"))
         if not confirmed:
@@ -900,12 +1017,41 @@ def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> Appl
             }
             result.action_type = "run_e1"
 
+        # 本地潮滩推理闭环：propose → confirm → run_inference
+        if atype in ("propose_inference", "plan_inference"):
+            import inference_agent_loop
+
+            plan, errs = propose_inference_plan(state, action)
+            result.inference_plan = plan
+            result.inference_plan_text = inference_agent_loop.format_inference_plan_for_user(plan)
+            result.errors.extend(errs)
+            return result
+
+        if atype == "confirm_inference":
+            pid = action.get("plan_id") or (
+                state.get("_inference_pending_plan") or {}
+            ).get("plan_id")
+            if pid:
+                ok, cerr = confirm_inference_plan(state, str(pid))
+                if not ok:
+                    result.errors.append(cerr or "推理计划确认失败。")
+                    return result
+            action = {
+                "type": "run_inference",
+                "confirmed": True,
+                "task": action.get("task"),
+                "plan_id": action.get("plan_id"),
+                "prob_th": action.get("prob_th"),
+                "min_cnt": action.get("min_cnt"),
+            }
+            result.action_type = "run_inference"
+
         pt, at, errs = build_pending_task(state, action)
         result.errors.extend(errs)
-        # 重型工具确认门闩：run_pipeline/run_m4/run_autotune 未确认时，
+        # 重型工具确认门闩：run_pipeline/run_inference/run_m4/run_autotune 未确认时，
         # 仅记录待确认请求（供 UI 弹出确认），绝不写入 pending_task/pending_autotune。
         # 手动侧栏按钮直接写 session_state 的路径不受影响。
-        is_heavy = atype in ("run_pipeline", "run", "", "run_m4", "run_autotune")
+        is_heavy = atype in ("run_pipeline", "run", "", "run_inference", "run_m4", "run_autotune")
         if is_heavy and not bool(action.get("confirmed")):
             if errs and any("确认" in e for e in errs):
                 state["_pending_heavy_confirm"] = {
@@ -927,6 +1073,8 @@ def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> Appl
                 state.pop("_m5_pending_plan", None)
             if pt.get("mode") == "e1":
                 state.pop("_e1_pending_plan", None)
+            if pt.get("inference_plan"):
+                state.pop("_inference_pending_plan", None)
         elif at and not errs:
             state["pending_autotune"] = at
             state["is_running"] = True
@@ -972,6 +1120,9 @@ def flush_pending_agent_commands(state: Dict[str, Any]) -> ApplyResult:
         if one.e1_plan is not None:
             merged.e1_plan = one.e1_plan
             merged.e1_plan_text = one.e1_plan_text or merged.e1_plan_text
+        if one.inference_plan is not None:
+            merged.inference_plan = one.inference_plan
+            merged.inference_plan_text = one.inference_plan_text or merged.inference_plan_text
     return merged
 
 

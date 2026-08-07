@@ -19,11 +19,15 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 # 阶段与状态枚举（与设计文档 5.1 一致）
+# INFERENCE / POST_PROCESS 为本地潮滩推理闭环细化阶段；
+# M5/E1 等既有闭环继续使用通用 EXECUTE，向后兼容。
 PHASES: Tuple[str, ...] = (
     "PLAN",
     "VALIDATE",
     "CONFIRM",
     "QUEUED",
+    "INFERENCE",
+    "POST_PROCESS",
     "EXECUTE",
     "VERIFY",
     "REGISTER",

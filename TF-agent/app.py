@@ -1432,6 +1432,112 @@ def _pipeline_worker_entry(ctx, shared, stop_event):
             shared["done"] = True
 
 
+def _inference_worker_entry(ctx, shared, stop_event):
+    """本地潮滩推理可信执行闭环后台线程（只写 shared / 文件，不调用 Streamlit API）。
+
+    顺序：真实推理 → 真实后处理 → 磁盘校验 → 验证通过才登记资产。
+    任何一步失败：不登记、不伪报完成；shared['inference_result'] 保留真实失败信息。
+    """
+    import time as _time
+
+    ok = False
+    try:
+        import inference_agent_loop as ial
+
+        plan = ctx.get("inference_plan")
+        if not isinstance(plan, dict) or not plan.get("ready"):
+            with shared["lock"]:
+                shared["status"] = ("error", "推理计划未就绪，无法执行。")
+            return
+
+        task_id = plan.get("task_id") or ctx.get("task") or "unknown"
+
+        def check_stop():
+            return stop_event.is_set()
+
+        def push_log(msg):
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            with shared["lock"]:
+                lines = list(shared.get("log_lines") or [])
+                lines.append(f"[{ts}] root@cstf: {msg}")
+                shared["log_lines"] = lines[-30:]
+            print(msg)
+
+        def push_progress(pct):
+            with shared["lock"]:
+                shared["progress"] = int(min(100, max(0, pct)))
+
+        def push_status(kind, text):
+            with shared["lock"]:
+                shared["status"] = (kind, text)
+
+        started = _time.time()
+        push_status("info", "正在启动本地潮滩推理（可信执行闭环）…")
+        push_log(f"PLAN: {plan.get('plan_id')} | TASK: {task_id} | "
+                 f"P={plan.get('prob_threshold')} C={plan.get('count_threshold')} | "
+                 f"DEVICE={plan.get('device') or plan.get('device_policy')}")
+
+        result = ial.execute_local_inference(
+            plan,
+            stop_event=stop_event,
+            push_log=push_log,
+            push_progress=push_progress,
+        )
+        if not result or result.get("success") is not True:
+            err = (result or {}).get("error") or "推理失败"
+            push_status("error", f"❌ {err}")
+            with shared["lock"]:
+                shared["inference_result"] = result or {}
+            return
+
+        push_status("info", "推理完成，正在校验磁盘成果…")
+        verification = ial.verify_inference_outputs(plan, result, started_at=started)
+        if not verification or verification.get("ok") is not True:
+            failed = [c.get("name") for c in (verification or {}).get("checks") or []
+                      if not c.get("passed")]
+            push_status("error", f"❌ 成果校验未通过: {', '.join(failed) or '未知'}")
+            with shared["lock"]:
+                shared["inference_result"] = result
+                shared["inference_verification"] = verification or {}
+            return
+
+        asset_id = ial.register_inference_asset(plan, result, verification)
+        if not asset_id:
+            push_status("error", "❌ 校验通过但资产登记失败（未登记成果）。")
+            with shared["lock"]:
+                shared["inference_result"] = result
+                shared["inference_verification"] = verification
+            return
+
+        final_tif = (result.get("outputs") or {}).get("final_tif") or ""
+        final_shp = (result.get("outputs") or {}).get("final_shp") or ""
+        push_log(f"✅ 推理闭环完成 | asset_id={asset_id} | Final TIF={os.path.basename(str(final_tif))} | "
+                 f"Final SHP={os.path.basename(str(final_shp))}")
+        push_status("success", "🎉 本地潮滩推理完成：成果已验证并登记。")
+        with shared["lock"]:
+            shared["inference_result"] = result
+            shared["inference_verification"] = verification
+            shared["asset_id"] = asset_id
+            # 绝对路径（供地图加载与资产登记使用）
+            _abs_map = os.path.abspath(str(final_shp or final_tif or ""))
+            shared["asset_path"] = _abs_map if os.path.isfile(_abs_map) else None
+            shared["progress"] = 100
+        ok = True
+    except Exception as e:
+        tb_lines = traceback.format_exc().split("\n")[:25]
+        with shared["lock"]:
+            lines = list(shared.get("log_lines") or [])
+            lines.append(f"[CRASH] {e}")
+            lines.extend(tb_lines)
+            shared["log_lines"] = lines[-30:]
+            shared["status"] = ("error", f"推理线程异常: {e}")
+        ok = False
+    finally:
+        with shared["lock"]:
+            shared["success"] = ok
+            shared["done"] = True
+
+
 # =======================================================
 #  1. 页面全局配置与状态机初始化 (Session State)
 # =======================================================
@@ -1703,6 +1809,18 @@ if _agent_flush.applied and _agent_flush.e1_plan_text:
 if _agent_flush.applied and _agent_flush.action_type == "run_e1":
     try:
         st.toast("E1 诊断已确认，正在执行…", icon="📊")
+    except Exception:
+        pass
+if _agent_flush.applied and _agent_flush.inference_plan_text:
+    st.session_state._inference_plan_notice = _agent_flush.inference_plan_text
+    _msgs_inf = list(st.session_state.get("messages") or [])
+    _last_inf = (_msgs_inf[-1].get("content") if _msgs_inf else "") or ""
+    if "本地潮滩推理 · 执行计划" not in str(_last_inf):
+        _msgs_inf.append({"role": "assistant", "content": _agent_flush.inference_plan_text})
+        st.session_state.messages = _msgs_inf
+if _agent_flush.applied and _agent_flush.action_type == "run_inference":
+    try:
+        st.toast("本地潮滩推理已确认，正在执行…", icon="🌊")
     except Exception:
         pass
 
@@ -2594,6 +2712,52 @@ with st.sidebar:
                     st.session_state.pop("_e1_pending_plan", None)
                     st.session_state.pop("_e1_plan_confirmed", None)
                     st.session_state.pop("_e1_plan_notice", None)
+                    st.rerun()
+
+    # 本地潮滩推理执行计划（可信执行闭环：先计划后确认）
+    _inf_plan = st.session_state.get("_inference_pending_plan")
+    if isinstance(_inf_plan, dict) and not st.session_state.is_running:
+        sbui.section("本地潮滩推理计划")
+        with st.container(border=True):
+            if _inf_plan.get("ready"):
+                st.success("条件已满足，确认后将真实调用推理/后处理代码")
+            else:
+                st.warning("条件未满足，暂不可执行")
+                for _b in _inf_plan.get("blockers") or []:
+                    st.caption(f"· {_b}")
+            st.caption(
+                f"任务 `{_inf_plan.get('task_id') or '—'}` · "
+                f"P={_inf_plan.get('prob_threshold')} C={_inf_plan.get('count_threshold')} · "
+                f"设备策略 `{_inf_plan.get('device_policy') or 'auto'}`"
+                + (f"（实际 `{_inf_plan.get('device')}`）" if _inf_plan.get("device") else "")
+            )
+            _infc1, _infc2 = st.columns(2)
+            with _infc1:
+                if st.button(
+                    "确认执行推理",
+                    key="confirm_inference_plan_btn",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not bool(_inf_plan.get("ready")),
+                ):
+                    from agent_command_bridge import confirm_inference_plan as _bridge_confirm_inf
+
+                    _pid = _inf_plan.get("plan_id")
+                    _ok, _cerr = _bridge_confirm_inf(st.session_state, str(_pid))
+                    if not _ok:
+                        st.warning(_cerr or "确认失败，请重新生成计划。")
+                        st.rerun()
+                    queue_agent_command(
+                        st.session_state,
+                        {"pending_action": {"type": "run_inference", "confirmed": True,
+                                            "task": _inf_plan.get("task_id"), "plan_id": _pid}},
+                    )
+                    st.rerun()
+            with _infc2:
+                if st.button("取消推理计划", key="cancel_inference_plan_btn", use_container_width=True):
+                    st.session_state.pop("_inference_pending_plan", None)
+                    st.session_state.pop("_inference_plan_confirmed", None)
+                    st.session_state.pop("_inference_plan_notice", None)
                     st.rerun()
 
     # 重型工具确认门闩：Agent 请求 run_pipeline/run_m4/run_autotune 未确认时在此待命
@@ -3736,6 +3900,9 @@ def finalize_background_pipeline():
         e1_report = shared.get("e1_report")
         e1_verification = shared.get("e1_verification")
         job_kind = shared.get("job_kind")
+        inference_result = shared.get("inference_result")
+        inference_verification = shared.get("inference_verification")
+        inference_asset_id = shared.get("asset_id")
     _tl_task = st.session_state.get("_tl_current_task") or "unknown"
     st.session_state.pipeline_log_snapshot = lines
     st.session_state.pipeline_progress_value = prog
@@ -3747,6 +3914,63 @@ def finalize_background_pipeline():
     st.session_state.executing_pipeline = False
     if at_result:
         st.session_state.autotune_result = at_result
+    # ---- 本地潮滩推理可信执行闭环收尾 ----
+    if inference_result is not None or inference_asset_id:
+        _iv_ok = bool(inference_verification and inference_verification.get("ok") is True)
+        if success and _iv_ok:
+            # 真实结果写回 Copilot（只展示真实数据）
+            try:
+                import inference_agent_loop as _ial
+
+                summary = _ial.summarize_inference_result_for_chat(
+                    inference_result, inference_verification
+                )
+                st.session_state.messages = list(st.session_state.get("messages") or [])
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": summary}
+                )
+                st.session_state._inference_last_summary = summary
+            except Exception:
+                pass
+            _tl_add(_tl_task, "INFERENCE", "深度学习推理完成",
+                    status="SUCCEEDED", tool="run_inference")
+            _tl_add(_tl_task, "POST_PROCESS", "双重约束后处理完成（Final TIF/SHP）",
+                    status="SUCCEEDED", tool="post_engine")
+            _tl_add(_tl_task, "VERIFY", "成果校验通过（Final TIF/SHP）",
+                    status="SUCCEEDED", tool="verify_inference")
+            if inference_asset_id:
+                _tl_add(_tl_task, "REGISTER", "预测资产已登记",
+                        status="SUCCEEDED", tool="register_inference",
+                        artifacts=[str(inference_asset_id)])
+            # 地图加载（不重建 iframe / 不重置相机）：成果路径已由校验确认
+            _map_path = (inference_verification or {}).get("final_tif") or \
+                        (inference_verification or {}).get("final_shp") or \
+                        (asset_path or "")
+            if _map_path and os.path.isfile(str(_map_path)):
+                st.session_state.asset_override = os.path.abspath(str(_map_path))
+                st.session_state._asset_pinned = True
+                st.session_state.asset_just_loaded = True
+                st.session_state._map_view_synced_for = None
+                st.session_state._map_prefer_center = False
+                st.session_state._globe_rev = int(st.session_state.get("_globe_rev", 0)) + 1
+                _tl_add(_tl_task, "MAP", "成果已加载到地图",
+                        status="SUCCEEDED", tool="map_load",
+                        artifacts=[os.path.basename(str(_map_path))])
+            _tl_add(_tl_task, "REPORT", "结果已回复 Copilot",
+                    status="SUCCEEDED", tool="report")
+            # 动态能力状态刷新（含深度学习推理能力）
+            try:
+                import capability_registry as _cap
+                _cap_reg = st.session_state.get("_capability_reg")
+                if _cap_reg is not None:
+                    _cap_reg.invalidate()
+                st.session_state._cap_snapshot_injected = False
+            except Exception:
+                pass
+        else:
+            _err = (inference_result or {}).get("error") or "推理失败（详见终端日志）"
+            _tl_add(_tl_task, "INFERENCE", f"推理未完成：{_err[:60]}",
+                    status="FAILED", error=_err, tool="run_inference")
     if m5_report:
         st.session_state.m5_report = m5_report
         _lvl = m5_report.get("alert_level", "GREEN")
@@ -3827,9 +4051,11 @@ def finalize_background_pipeline():
     m4_result = shared.get("m4_result") if shared else None
     if m4_result:
         st.session_state.m4_last_result = m4_result
-    if success and asset_path and job_kind not in ("m5", "e1"):
+    # 推理闭环已在上面自行登记 EXECUTE/REGISTER/VERIFY/MAP/REPORT，这里避免重复
+    _inference_handled = inference_result is not None or inference_asset_id is not None
+    if success and asset_path and job_kind not in ("m5", "e1") and not _inference_handled:
         st.session_state.asset_override = asset_path
-    if success:
+    if success and not _inference_handled:
         _tl_add(_tl_task, "EXECUTE", f"任务执行完成（{job_kind or 'pipeline'}）",
                 status="SUCCEEDED", progress=100, tool=job_kind or "run_pipeline")
         if asset_path:
@@ -3847,9 +4073,10 @@ def finalize_background_pipeline():
         except Exception:
             pass
     else:
-        _tl_add(_tl_task, "EXECUTE", "任务执行失败",
-                status="FAILED", error="任务执行失败，详见终端日志",
-                tool=job_kind or "run_pipeline")
+        if not _inference_handled:
+            _tl_add(_tl_task, "EXECUTE", "任务执行失败",
+                    status="FAILED", error="任务执行失败，详见终端日志",
+                    tool=job_kind or "run_pipeline")
         time.sleep(2)
     return True
 
@@ -4048,6 +4275,28 @@ def maybe_start_pipeline_thread():
         "job_kind": task_info.get("mode"),
     }
     st.session_state.pipeline_shared = shared
+
+    # 本地潮滩推理可信执行闭环（不进入 run_pipeline_sync 旧路径）
+    if task_info.get("inference_plan") or task_info.get("mode") == "dl_inference":
+        shared["status"] = ("info", "正在启动本地潮滩推理（可信执行闭环）…")
+        _tl_add(task_info.get("task") or "unknown", "INFERENCE",
+                "本地潮滩推理已启动", status="RUNNING", tool="run_inference", progress=0)
+        ctx = {
+            "root_dir": root_dir,
+            "final_root": final_root,
+            "mask_root": mask_root,
+            "model_path": model_path,
+            "shp_path": shp_path,
+            "task_options": list(task_options),
+            "task": task_info.get("task"),
+            "inference_plan": task_info.get("inference_plan"),
+        }
+        threading.Thread(
+            target=_inference_worker_entry,
+            args=(ctx, shared, stop_ev),
+            daemon=True,
+        ).start()
+        return
 
     # 独立 M5 闭环（不跑推理）
     if task_info.get("mode") == "m5":
