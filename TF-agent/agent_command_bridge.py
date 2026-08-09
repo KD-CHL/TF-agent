@@ -96,6 +96,7 @@ HEAVY_ACTION_LABELS = {
     "run_m4": "GEE 影像下载",
     "run_gee_download": "GEE 影像下载（可信执行闭环）",
     "run_autotune": "AutoTune 阈值搜索",
+    "run_workflow": "潮滩分析 Workflow（GEE→推理→E1/M5→PDF）",
 }
 
 
@@ -116,6 +117,8 @@ class ApplyResult:
     inference_plan_text: str = ""
     gee_plan: Optional[Dict[str, Any]] = None
     gee_plan_text: str = ""
+    workflow_plan: Optional[Dict[str, Any]] = None
+    workflow_plan_text: str = ""
 
 
 PENDING_AGENT_COMMANDS_KEY = "_pending_agent_commands"
@@ -836,6 +839,169 @@ def is_gee_plan_confirmed(state: Dict[str, Any], plan_id: Optional[str]) -> bool
     return gee_agent_loop.is_gee_plan_confirmed(state, plan_id)
 
 
+def propose_workflow_plan(state: Dict[str, Any], action: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], List[str]]:
+    """生成端到端「潮滩分析 Workflow」计划（AOI→GEE→推理→E1/M5→PDF）。
+
+    复用 workflow_orchestrator.build_analysis_workflow（确定性结构），
+    写入 state['_workflow_pending_plan']；任何参数修改 → 重新 build（新 workflow_id）。
+    """
+    import workflow_orchestrator as wo
+
+    action = action or {}
+    init_ui_session_defaults(state)
+    errors: List[str] = []
+
+    # ---- 参数解析（action 优先，其次侧栏） ----
+    target_year = action.get("target_year")
+    if target_year is None:
+        target_year = state.get("ui_workflow_target_year") or 2024
+    baseline_year = action.get("baseline_year")
+    if baseline_year is None:
+        baseline_year = state.get("ui_workflow_baseline_year") or 2022
+    prob = _pick_float(action.get("prob_th") or action.get("prob"), 0.01, 0.50,
+                       state.get("ui_prob_th") or 0.05)
+    cnt = _pick_int(action.get("min_cnt") or action.get("cnt"), 1, 10,
+                    state.get("ui_min_cnt") or 2)
+
+    region = str(action.get("region") or state.get("ui_workflow_region") or "").strip()
+    task = (action.get("task") or state.get("ui_selected_task") or "").strip()
+    root_dir = str(action.get("root_dir") or state.get("ui_root_dir") or "").strip()
+    final_root = str(action.get("final_root") or state.get("ui_final_root") or "").strip()
+    mask_root = str(action.get("mask_root") or state.get("ui_mask_root") or "").strip()
+    model_path = str(action.get("model_path") or state.get("ui_model_path") or "").strip()
+    e1_data_root = str(action.get("e1_data_root") or state.get("ui_e1_data_root") or "").strip()
+    e1_reference = str(action.get("e1_reference") or state.get("ui_e1_reference") or "师姐_2020").strip()
+    start_date = _coerce_date_str(action.get("start_date")) or ""
+    end_date = _coerce_date_str(action.get("end_date")) or ""
+    if not start_date:
+        start_date = f"{int(target_year)}-01-01"
+    if not end_date:
+        end_date = f"{int(target_year)}-12-31"
+    export_to = str(action.get("export_to") or state.get("ui_m4_export_to") or "local").lower()
+
+    # ---- 用户意图 ----
+    intent: Dict[str, Any] = {}
+    for k in ("need_e1", "need_m5", "need_report"):
+        v = action.get(k)
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            intent[k] = v
+        else:
+            s = str(v).strip().lower()
+            if s in ("true", "1", "yes", "on", "开", "开启", "要", "需要"):
+                intent[k] = True
+            elif s in ("false", "0", "no", "off", "关", "关闭", "不要", "不需要", "跳过"):
+                intent[k] = False
+    if action.get("skip_e1") is True:
+        intent["need_e1"] = False
+    if action.get("skip_m5") is True:
+        intent["need_m5"] = False
+
+    # ---- AOI 解析 ----
+    aoi_dict: Dict[str, Any] = {}
+    aoi_warnings: List[str] = []
+    aoi_src = action.get("aoi")
+    if isinstance(aoi_src, dict) and aoi_src.get("type") == "Polygon":
+        try:
+            from aoi_context import validate_aoi
+            ctx = validate_aoi(aoi_src, source=action.get("aoi_source") or "map_polygon",
+                               label=task or None)
+            aoi_dict = ctx.to_dict()
+            aoi_warnings = list(ctx.warnings or [])
+        except Exception as e:  # noqa: BLE001
+            aoi_warnings.append(f"AOI 解析失败: {e}")
+    elif action.get("aoi_id"):
+        aoi_dict = {"aoi_id": str(action["aoi_id"]), "valid": True}
+    elif state.get("_active_aoi"):
+        aoi_dict = dict(state["_active_aoi"])
+    elif state.get("ui_m4_roi_path"):
+        try:
+            import geopandas as gpd
+            gdf = gpd.read_file(state["ui_m4_roi_path"])
+            if not gdf.empty:
+                from aoi_context import aoi_from_bbox
+                b = gdf.total_bounds
+                ctx = aoi_from_bbox(float(b[0]), float(b[1]), float(b[2]), float(b[3]),
+                                    source="shapefile_bbox", label=task or None)
+                aoi_dict = ctx.to_dict()
+                aoi_warnings.append("AOI 来自矢量文件外接矩形（bbox），非精确面。")
+        except Exception as e:  # noqa: BLE001
+            aoi_warnings.append(f"读取 AOI 矢量失败: {e}")
+    if not aoi_dict or not aoi_dict.get("valid"):
+        errors.append("未解析到有效 AOI（请先在三维地图绘制 AOI 或配置 ROI 矢量）。")
+
+    goal = str(action.get("goal") or "").strip()
+    try:
+        wf = wo.build_analysis_workflow(
+            aoi=aoi_dict,
+            target_year=int(target_year),
+            baseline_year=int(baseline_year) if baseline_year else None,
+            user_intent=intent,
+            goal=goal,
+            task_id=task or None,
+            region=region,
+            prob=prob,
+            cnt=cnt,
+            root_dir=root_dir,
+            final_root=final_root,
+            mask_root=mask_root,
+            model_path=model_path,
+            e1_data_root=e1_data_root,
+            e1_reference=e1_reference,
+            start_date=start_date or None,
+            end_date=end_date or None,
+            export_to=export_to,
+            gee_proxy_url=str(action.get("gee_proxy_url") or state.get("ui_m4_gee_proxy") or ""),
+            gee_project_id=str(action.get("gee_project_id") or state.get("ui_m4_gee_project") or ""),
+        )
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"Workflow 构建失败: {e}")
+        wf = {"workflow_id": "wf_error", "status": "PENDING", "steps": [],
+              "warnings": [], "blockers": [f"Workflow 构建失败: {e}"]}
+
+    for w in aoi_warnings:
+        if w not in wf["warnings"]:
+            wf["warnings"].append(w)
+
+    # 全局校验（只读磁盘现状）
+    try:
+        import capability_registry
+        import assets_registry as _ar
+        import dataset_assets as _da
+        ok, blockers, warnings = wo.validate_analysis_workflow(
+            wf,
+            capabilities=capability_registry.load_capabilities(),
+            registry=_ar.load_assets_registry(),
+            dataset_registry=_da.load_registry(),
+        )
+        wf["blockers"] = list(blockers)
+        wf["warnings"] = list(set(wf.get("warnings") or []) | set(warnings))
+        if blockers and not errors:
+            errors = list(blockers)
+    except Exception as e:  # noqa: BLE001
+        pass
+
+    state["_workflow_pending_plan"] = wf
+    state[wo.STATE_WORKFLOW_PLAN_CONFIRMED] = set()  # 新计划 → 重置确认
+    return wf, errors
+
+
+def confirm_workflow_plan(state: Dict[str, Any], workflow_id: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+    """Workflow 级单次确认（父确认）。
+
+    与 UI 确认按钮共用：委托 workflow_orchestrator.confirm_workflow。
+    幂等：同一 workflow_id 只确认一次。
+    """
+    import workflow_orchestrator as wo
+
+    plan = state.get("_workflow_pending_plan")
+    if not isinstance(plan, dict) or not plan.get("workflow_id"):
+        return False, "当前没有待确认的潮滩分析 Workflow。"
+    wid = workflow_id or str(plan.get("workflow_id") or "")
+    return wo.confirm_workflow(state, wid)
+
+
 def build_pending_task(state: Dict[str, Any], action: Dict[str, Any]) -> Tuple[Optional[Dict], Optional[Dict], List[str]]:
     """
     返回 (pending_task, pending_autotune, errors)
@@ -1073,6 +1239,43 @@ def build_pending_task(state: Dict[str, Any], action: Dict[str, Any]) -> Tuple[O
             "force_rerun": bool(state.get("ui_force_rerun", False)),
         }, None, errors
 
+    if atype == "run_workflow":
+        import workflow_orchestrator as _wo
+
+        confirmed = bool(action.get("confirmed")) or _wo.is_workflow_confirmed(
+            state, action.get("workflow_id") or (state.get("_workflow_pending_plan") or {}).get("workflow_id"))
+        if not confirmed:
+            errors.append("潮滩分析 Workflow 需用户确认后才能执行（confirmed=true 或侧栏确认）。")
+            return None, None, errors
+        plan = state.get("_workflow_pending_plan")
+        if not isinstance(plan, dict) or not plan.get("workflow_id"):
+            plan, plan_errs = propose_workflow_plan(state, action)
+            errors.extend(plan_errs)
+        wid = action.get("workflow_id") or (plan or {}).get("workflow_id")
+        if not wid:
+            errors.append("Workflow 未生成，无法执行。")
+            return None, None, errors
+        if plan and plan.get("blockers"):
+            errors.append(f"Workflow 全局校验未通过，无法执行: {'; '.join(plan['blockers'])}")
+            return None, None, errors
+        if not _wo.is_workflow_confirmed(state, wid):
+            ok, cerr = _wo.confirm_workflow(state, wid)
+            if not ok:
+                errors.append(cerr or "Workflow 确认失败。")
+                return None, None, errors
+        # 参数变化检测：确认后参数被修改 → 需要重新确认
+        changes = _wo.check_params_changed(plan)
+        if changes:
+            errors.append(f"Workflow 参数已变化，需重新确认: {'; '.join(changes)}")
+            state["_workflow_notice"] = f"参数变化需重新确认: {'; '.join(changes)}"
+            return None, None, errors
+        return {
+            "task": plan.get("task_id") or action.get("task"),
+            "mode": "workflow",
+            "workflow_id": wid,
+            "workflow_plan": plan,
+        }, None, errors
+
     errors.append(f"未知 pending_action.type: {atype}")
     return None, None, errors
 
@@ -1237,13 +1440,41 @@ def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> Appl
             }
             result.action_type = "run_gee_download"
 
+        # 端到端潮滩分析 Workflow 闭环：propose → confirm → run_workflow
+        if atype in ("propose_workflow", "plan_workflow", "propose_analysis_workflow"):
+            import workflow_orchestrator as _wo
+
+            plan, errs = propose_workflow_plan(state, action)
+            result.workflow_plan = plan
+            result.workflow_plan_text = _wo.format_workflow_plan_for_user(plan)
+            result.errors.extend(errs)
+            return result
+
+        if atype == "confirm_workflow":
+            wid = action.get("workflow_id") or (
+                state.get("_workflow_pending_plan") or {}
+            ).get("workflow_id")
+            ok, cerr = confirm_workflow_plan(state, wid)
+            if not ok:
+                result.errors.append(cerr or "Workflow 确认失败。")
+                return result
+            action = {
+                "type": "run_workflow",
+                "confirmed": True,
+                "workflow_id": wid,
+                "task": action.get("task"),
+                "prob_th": action.get("prob_th"),
+                "min_cnt": action.get("min_cnt"),
+            }
+            result.action_type = "run_workflow"
+
         pt, at, errs = build_pending_task(state, action)
         result.errors.extend(errs)
         # 重型工具确认门闩：run_pipeline/run_inference/run_m4/run_gee_download/run_autotune
         # 未确认时，仅记录待确认请求（供 UI 弹出确认），绝不写入 pending_task/pending_autotune。
         # 手动侧栏按钮直接写 session_state 的路径不受影响。
         is_heavy = atype in ("run_pipeline", "run", "", "run_inference", "run_m4",
-                             "run_gee_download", "run_autotune")
+                             "run_gee_download", "run_autotune", "run_workflow")
         if is_heavy and not bool(action.get("confirmed")):
             if errs and any("确认" in e for e in errs):
                 state["_pending_heavy_confirm"] = {
@@ -1317,6 +1548,9 @@ def flush_pending_agent_commands(state: Dict[str, Any]) -> ApplyResult:
         if one.inference_plan is not None:
             merged.inference_plan = one.inference_plan
             merged.inference_plan_text = one.inference_plan_text or merged.inference_plan_text
+        if one.workflow_plan is not None:
+            merged.workflow_plan = one.workflow_plan
+            merged.workflow_plan_text = one.workflow_plan_text or merged.workflow_plan_text
     return merged
 
 

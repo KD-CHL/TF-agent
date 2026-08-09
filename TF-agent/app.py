@@ -1432,6 +1432,91 @@ def _pipeline_worker_entry(ctx, shared, stop_event):
             shared["done"] = True
 
 
+def _workflow_worker_entry(ctx, shared, stop_event):
+    """端到端潮滩分析 Workflow 后台线程：只调用 workflow_orchestrator（复用子闭环）。
+
+    不调用 Streamlit API；只写 shared / 文件。任何一步失败不伪造成功。
+    """
+    import time as _time
+
+    ok = False
+    try:
+        import workflow_orchestrator as _wo
+
+        wf = ctx.get("workflow_plan")
+        if not isinstance(wf, dict) or not wf.get("workflow_id"):
+            with shared["lock"]:
+                shared["status"] = ("error", "Workflow 计划未就绪，无法执行。")
+            return
+
+        def push_log(msg):
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            with shared["lock"]:
+                lines = list(shared.get("log_lines") or [])
+                lines.append(f"[{ts}] root@workflow: {msg}")
+                shared["log_lines"] = lines[-40:]
+            print(msg)
+
+        def push_progress(pct):
+            with shared["lock"]:
+                shared["progress"] = int(min(100, max(0, pct)))
+
+        def push_status(kind, text):
+            with shared["lock"]:
+                shared["status"] = (kind, text)
+
+        push_progress(2)
+        push_status("info", "潮滩分析 Workflow 启动…")
+        push_log(f"WORKFLOW: {wf.get('workflow_id')} | TASK: {wf.get('task_id')}")
+
+        exec_ctx = {
+            "aoi": ctx.get("aoi"),
+            "root_dir": ctx.get("root_dir"),
+            "final_root": ctx.get("final_root"),
+            "mask_root": ctx.get("mask_root"),
+            "model_path": ctx.get("model_path"),
+            "shp_path": ctx.get("shp_path"),
+            "e1_data_root": ctx.get("e1_data_root"),
+            "e1_reference": ctx.get("e1_reference"),
+            "registry": ctx.get("registry"),
+            "registry_path": ctx.get("registry_path"),
+            "report_output_dir": ctx.get("report_output_dir"),
+            "baseline_task": ctx.get("baseline_task"),
+            "push_progress": push_progress,
+        }
+        result = _wo.run_analysis_workflow(
+            wf, exec_ctx=exec_ctx, push_log=push_log, stop_event=stop_event,
+        )
+        with shared["lock"]:
+            shared["workflow_result"] = result
+        final_status = result.get("status")
+        ok = final_status in ("SUCCEEDED", "COMPLETED_WITH_WARNINGS")
+        summary = result.get("summary") or ""
+        if ok:
+            push_status(
+                "success" if final_status == "SUCCEEDED" else "warning",
+                f"Workflow 完成 · {final_status}",
+            )
+        else:
+            push_status("error", f"Workflow 未完成 · {final_status}")
+        push_log(summary.replace("\n", " | "))
+        push_progress(100)
+        return
+    except Exception as e:
+        tb_lines = traceback.format_exc().split("\n")[:25]
+        with shared["lock"]:
+            lines = list(shared.get("log_lines") or [])
+            lines.append(f"[CRASH] {e}")
+            lines.extend(tb_lines)
+            shared["log_lines"] = lines[-40:]
+            shared["status"] = ("error", str(e))
+        ok = False
+    finally:
+        with shared["lock"]:
+            shared["success"] = ok
+            shared["done"] = True
+
+
 def _inference_worker_entry(ctx, shared, stop_event):
     """本地潮滩推理可信执行闭环后台线程（只写 shared / 文件，不调用 Streamlit API）。
 
@@ -2921,6 +3006,68 @@ with st.sidebar:
                     st.session_state.pop("_gee_plan_notice", None)
                     st.rerun()
 
+    # 端到端潮滩分析 Workflow：先计划后确认（父级确认门闩）
+    _wf_plan = st.session_state.get("_workflow_pending_plan")
+    if isinstance(_wf_plan, dict) and not st.session_state.is_running:
+        sbui.section("潮滩分析 Workflow")
+        with st.container(border=True):
+            import workflow_orchestrator as _wo
+
+            _wf_id = str(_wf_plan.get("workflow_id") or "")
+            _wf_confirmed = _wo.is_workflow_confirmed(st.session_state, _wf_id)
+            _wf_status = str(_wf_plan.get("status") or "PENDING")
+            if _wf_status == "PAUSED":
+                st.warning("参数已变化，需重新确认后执行")
+            elif _wf_confirmed:
+                st.success(f"已确认 · `{_wf_id[:12]}…`")
+            else:
+                st.info(f"待确认 · `{_wf_id[:12]}…`")
+            _wf_blockers = _wf_plan.get("blockers") or []
+            if _wf_blockers:
+                st.warning("全局校验未通过，暂不可执行")
+                for _b in _wf_blockers:
+                    st.caption(f"· {_b}")
+            st.caption(
+                f"任务 `{_wf_plan.get('task_id') or '—'}` · "
+                f"{(_wf_plan.get('context') or {}).get('target_year')} 年潮滩"
+                + (f" · 基线 {(_wf_plan.get('context') or {}).get('baseline_year')}" if (_wf_plan.get('context') or {}).get('baseline_year') else "")
+            )
+            _wf_steps = _wf_plan.get("steps") or []
+            st.markdown(
+                "\n".join(
+                    f"- {'必' if s.get('required') else '选'} · "
+                    f"{_wo.TOOL_LABELS.get(s.get('tool'), s.get('tool'))}"
+                    f"（{s.get('status') or 'PENDING'}）"
+                    for s in _wf_steps
+                )
+            )
+            _wfc1, _wfc2 = st.columns(2)
+            with _wfc1:
+                if st.button(
+                    "确认执行 Workflow",
+                    key="confirm_workflow_btn",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=bool(_wf_blockers) or _wf_confirmed,
+                ):
+                    _ok, _cerr = _wo.confirm_workflow(st.session_state, _wf_id)
+                    if not _ok:
+                        st.warning(_cerr or "Workflow 确认失败。")
+                        st.rerun()
+                    queue_agent_command(
+                        st.session_state,
+                        {"pending_action": {"type": "run_workflow", "confirmed": True,
+                                            "workflow_id": _wf_id,
+                                            "task": _wf_plan.get("task_id")}},
+                    )
+                    st.rerun()
+            with _wfc2:
+                if st.button("取消 Workflow", key="cancel_workflow_btn", use_container_width=True):
+                    st.session_state.pop("_workflow_pending_plan", None)
+                    st.session_state.pop("_workflow_plan_confirmed", None)
+                    st.session_state.pop("_workflow_notice", None)
+                    st.rerun()
+
     # 重型工具确认门闩：Agent 请求 run_pipeline/run_m4/run_gee_download/run_autotune 未确认时在此待命
     _pending_heavy = st.session_state.get("_pending_heavy_confirm")
     if isinstance(_pending_heavy, dict) and not st.session_state.is_running:
@@ -4253,12 +4400,46 @@ def finalize_background_pipeline():
     m4_result = shared.get("m4_result") if shared else None
     if m4_result:
         st.session_state.m4_last_result = m4_result
+    # ---- 端到端潮滩分析 Workflow 收尾 ----
+    workflow_result = shared.get("workflow_result") if shared else None
+    if workflow_result:
+        st.session_state.workflow_last_result = workflow_result
+        wf_status = workflow_result.get("status")
+        try:
+            summary = workflow_result.get("summary") or ""
+            st.session_state.messages = list(st.session_state.get("messages") or [])
+            st.session_state.messages.append(
+                {"role": "assistant", "content": summary}
+            )
+            st.session_state._workflow_last_summary = summary
+        except Exception:
+            pass
+        step_line = " | ".join(
+            f"{sid}:{s.get('status')}"
+            for sid, s in (workflow_result.get("steps") or {}).items()
+        )
+        if success:
+            _tl_add(_tl_task, "WORKFLOW",
+                    f"Workflow 完成（{wf_status}）",
+                    status="SUCCEEDED", progress=100,
+                    tool="run_workflow",
+                    artifacts=[str(workflow_result.get("workflow_id") or "")])
+            _tl_add(_tl_task, "WORKFLOW", f"步骤: {step_line}",
+                    status="SUCCEEDED", tool="run_workflow")
+            try:
+                st.balloons()
+            except Exception:
+                pass
+        else:
+            _tl_add(_tl_task, "WORKFLOW", f"Workflow 未完成（{wf_status}）",
+                    status="FAILED", error=step_line, tool="run_workflow")
     # 推理闭环已在上面自行登记 EXECUTE/REGISTER/VERIFY/MAP/REPORT，这里避免重复
     _inference_handled = inference_result is not None or inference_asset_id is not None
     _gee_handled = gee_result is not None or gee_dataset_id is not None
-    if success and asset_path and job_kind not in ("m5", "e1") and not _inference_handled and not _gee_handled:
+    _workflow_handled = workflow_result is not None
+    if success and asset_path and job_kind not in ("m5", "e1") and not _inference_handled and not _gee_handled and not _workflow_handled:
         st.session_state.asset_override = asset_path
-    if success and not _inference_handled and not _gee_handled:
+    if success and not _inference_handled and not _gee_handled and not _workflow_handled:
         _tl_add(_tl_task, "EXECUTE", f"任务执行完成（{job_kind or 'pipeline'}）",
                 status="SUCCEEDED", progress=100, tool=job_kind or "run_pipeline")
         if asset_path:
@@ -4559,6 +4740,33 @@ def maybe_start_pipeline_thread():
         }
         threading.Thread(
             target=_e1_worker_entry,
+            args=(ctx, shared, stop_ev),
+            daemon=True,
+        ).start()
+        return
+
+    # 端到端潮滩分析 Workflow（复用子闭环编排）
+    if task_info.get("mode") == "workflow":
+        shared["status"] = ("info", "正在启动潮滩分析 Workflow（GEE→推理→E1/M5→PDF）…")
+        ctx = {
+            "root_dir": root_dir,
+            "final_root": final_root,
+            "mask_root": mask_root,
+            "model_path": model_path,
+            "shp_path": shp_path,
+            "e1_data_root": e1_data_root,
+            "e1_reference": e1_reference,
+            "task": task_info.get("task"),
+            "workflow_plan": task_info.get("workflow_plan"),
+            "aoi": st.session_state.get("_active_aoi"),
+            "registry": None,
+            "registry_path": os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "assets_registry.json"),
+            "report_output_dir": None,
+            "baseline_task": None,
+        }
+        threading.Thread(
+            target=_workflow_worker_entry,
             args=(ctx, shared, stop_ev),
             daemon=True,
         ).start()

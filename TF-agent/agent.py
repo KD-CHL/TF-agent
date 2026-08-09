@@ -234,6 +234,85 @@ def confirm_and_run_e1(task: Optional[str] = None) -> str:
 
 
 @tool
+def analyze_workflow(
+    target_year: Optional[int] = None,
+    baseline_year: Optional[int] = None,
+    need_e1: Optional[bool] = None,
+    need_m5: Optional[bool] = None,
+    skip_e1: Optional[bool] = None,
+    skip_m5: Optional[bool] = None,
+    region: Optional[str] = None,
+    task: Optional[str] = None,
+    goal: Optional[str] = None,
+) -> str:
+    """
+    【端到端潮滩分析 Workflow · 生成执行计划（必须先调用！）】
+    当用户要求「分析当前 AOI 的 XXXX 年潮滩 / 和 XXXX 年比较变化 / 评价精度 / 生成报告」时，
+    必须先调用本工具生成确定性执行计划（GEE→本地推理→E1 精度评价→M5 变化检测→PDF 报告），
+    展示给用户确认。未确认前绝不执行任何下载/推理。
+
+    - target_year: 分析年份（如 2024）。省略则用侧栏默认（ui_workflow_target_year）。
+    - baseline_year: 对比基线年份（如 2022）。省略则用侧栏默认；用户说「和XX年比较」时必填。
+    - need_e1: 用户明确要求「评价精度/和真值对比/师姐」→ True（必做，缺真值则阻塞）。
+      用户说「不要精度评价/跳过E1」→ False。省略 → 有真值才做，否则自动跳过。
+    - need_m5: 用户明确要求「变化检测/M5/萎缩淤积」→ True（必做，缺基线则阻塞）。
+      用户说「不要变化检测/跳过M5」→ False。省略 → 有基线才做，否则自动跳过。
+    - skip_e1 / skip_m5: 等价于 need_e1/need_m5=False。
+    - region: 区域标识（如 quanzhou）；省略则从当前 AOI 推导。
+    - task: 可省略（用侧栏当前任务 / AOI 自动命名）。
+    - goal: 可省略（由系统按年份/基线/意图自动生成）。
+    """
+    import json as _json
+
+    action: dict = {"type": "propose_workflow"}
+    if target_year is not None:
+        action["target_year"] = int(target_year)
+    if baseline_year is not None:
+        action["baseline_year"] = int(baseline_year)
+    if need_e1 is not None:
+        action["need_e1"] = bool(need_e1)
+    if need_m5 is not None:
+        action["need_m5"] = bool(need_m5)
+    if skip_e1 is True:
+        action["skip_e1"] = True
+    if skip_m5 is True:
+        action["skip_m5"] = True
+    if region and str(region).strip():
+        action["region"] = str(region).strip()
+    if task and str(task).strip():
+        action["task"] = str(task).strip()
+    if goal and str(goal).strip():
+        action["goal"] = str(goal).strip()
+    payload = {"pending_action": action}
+    return (
+        "[SYSTEM_COMMAND_JSON]\n"
+        + _json.dumps(payload, ensure_ascii=False)
+        + "\n[/SYSTEM_COMMAND_JSON]"
+    )
+
+
+@tool
+def confirm_workflow(workflow_id: Optional[str] = None) -> str:
+    """
+    【端到端潮滩分析 Workflow · 确认执行】
+    仅在用户已明确确认 Workflow 计划后调用（用户说「确认/开始/执行/就这么办」）。
+    真实按依赖顺序调用既有闭环（GEE→推理→E1/M5→PDF）；禁止未确认执行。
+    workflow_id 可省略（用当前待确认计划）。
+    """
+    import json as _json
+
+    action: dict = {"type": "confirm_workflow"}
+    if workflow_id and str(workflow_id).strip():
+        action["workflow_id"] = str(workflow_id).strip()
+    payload = {"pending_action": action}
+    return (
+        "[SYSTEM_COMMAND_JSON]\n"
+        + _json.dumps(payload, ensure_ascii=False)
+        + "\n[/SYSTEM_COMMAND_JSON]"
+    )
+
+
+@tool
 def trigger_spatial_analysis(
     task_node: str,
     prob_th: float,
@@ -504,6 +583,8 @@ tools = [
     confirm_and_run_m5,
     prepare_e1_consistency_check,
     confirm_and_run_e1,
+    analyze_workflow,
+    confirm_workflow,
     trigger_spatial_analysis,
     change_map_view,
     assist_gee_download,
@@ -544,6 +625,16 @@ G. **E1 多源一致性闭环**
    - 用户确认后 → **confirm_and_run_e1**
    - **禁止**用 run_pipeline 冒充独立 E1；**禁止**未确认就 run_e1
    - 结合【E1 账本】检查当期 SHP / data_root / reference；条件不足说明 blockers
+I. **端到端潮滩分析 Workflow（GEE→推理→E1/M5→PDF）**
+   - 「分析当前 AOI 的 2024 年潮滩」「和 2022 年比较变化」「评价精度/有真值就评」「生成报告」
+     这类**多阶段综合请求** → **analyze_workflow**（生成确定性执行计划，展示后等确认）
+   - 用户确认后 → **confirm_workflow**
+   - 参数映射：分析年份→target_year；比较年份→baseline_year；
+     「评价精度/和真值比」→need_e1=true；「不要E1/跳过精度」→skip_e1=true；
+     「变化检测/M5/萎缩淤积」→need_m5=true；「不要M5」→skip_m5=true；
+     区域（泉州湾→quanzhou）→region
+   - **禁止**：把端到端请求拆成零散 run_pipeline/run_m4/run_e1 逐个手动拼装；
+     未确认前绝不执行任何下载/推理；不得编造 scene_count/精度数值
 
 ═══════════════════════════════════════
 第二步 · 工具选择
@@ -552,6 +643,7 @@ G. **E1 多源一致性闭环**
 - local_tidal_flat_inference / confirm_inference：本地潮滩推理可信执行闭环（先计划后确认）
 - prepare_m5_change_detection / confirm_and_run_m5：独立 M5 变化检测闭环
 - prepare_e1_consistency_check / confirm_and_run_e1：独立 E1 多源一致性闭环
+- analyze_workflow / confirm_workflow：**端到端潮滩分析**（GEE→推理→E1/M5→PDF，先计划后确认）
 - change_map_view：仅当地图跳转且无任何侧栏/运行需求时用
 - assist_gee_download：用户明确要 GEE 下载时可快捷调用（等价于 dispatch + run_m4）
 - trigger_spatial_analysis：仅简单跑推理且无 M5/E1/Tab 变更时用
@@ -600,6 +692,13 @@ G. **E1 多源一致性闭环**
 【是否立即运行 · 关键判别】
 含以下动词 → 通常要 pending_action：跑、执行、开始、启动、下载、推理、合成、调参、来一轮
 仅含以下 → 通常**不要** pending_action：改成、设为、打开、关闭、切换、调到、看看（仅地图）
+
+【端到端潮滩分析 Workflow】
+- 「分析当前 AOI 的 2024 年潮滩，和 2022 年比较变化，有真值就评价精度，生成报告」
+  → analyze_workflow(target_year=2024, baseline_year=2022)（need_e1/need_m5 省略=有条件才做）
+- 用户明确要「评价精度」→ need_e1=true；「不要精度评价」→ skip_e1=true
+- 用户明确要「变化检测/M5」→ need_m5=true；「不要M5」→ skip_m5=true
+- 确认后 → confirm_workflow（一次确认，绝不逐个手动拼装）
 
 ═══════════════════════════════════════
 第四步 · 差量更新铁律
