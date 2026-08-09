@@ -1057,8 +1057,8 @@ def find_inference_asset(plan_id: Optional[str], task_id: Optional[str] = None,
 def format_inference_plan_for_user(plan: Dict[str, Any]) -> str:
     """确认前展示的执行计划（只含真实信息，路径用 basename/相对名）。"""
     if not plan:
-        return "尚未生成推理执行计划。"
-    lines = ["## 本地潮滩推理 · 执行计划", ""]
+        return "尚未生成提取计划。"
+    lines = ["## 潮滩智能提取 · 执行计划", ""]
     if plan.get("ready"):
         lines.append("**状态：可执行**（请回复「确认」或点击确认按钮后开始）")
     else:
@@ -1081,7 +1081,7 @@ def format_inference_plan_for_user(plan: Dict[str, Any]) -> str:
     for i, s in enumerate(plan.get("steps") or [], 1):
         lines.append(f"{i}. {s}")
     lines.append("")
-    lines.append("确认后将真实调用现有推理/后处理代码，并根据磁盘产物验证后回复。")
+    lines.append("确认后将真实运行提取与成果生成，并根据磁盘产物验证后回复。")
     return "\n".join(lines)
 
 
@@ -1091,9 +1091,9 @@ def summarize_inference_result_for_chat(
 ) -> str:
     """基于真实工具结果生成 Copilot 回复（禁止编造指标）。"""
     if not result or result.get("success") is not True:
-        err = (result or {}).get("error") or "推理失败"
+        err = (result or {}).get("error") or "提取失败"
         return (
-            "## 本地潮滩推理 · 未完成\n\n"
+            "## 潮滩智能提取 · 未完成\n\n"
             f"- 任务：`{(result or {}).get('task_id') or '—'}`\n"
             f"- 状态：**失败**\n"
             f"- 原因：{err}\n\n"
@@ -1103,7 +1103,7 @@ def summarize_inference_result_for_chat(
     metrics = result.get("metrics") or {}
     outputs = result.get("outputs") or {}
     v_ok = bool(verification and verification.get("ok") is True)
-    header = "## 潮滩推理已完成（已验证）" if v_ok else "## 潮滩推理已完成（校验未完全通过）"
+    header = "## 潮滩提取已完成（已验证）" if v_ok else "## 潮滩提取已完成（校验未完全通过）"
     lines = [
         header,
         "",
@@ -1126,7 +1126,7 @@ def summarize_inference_result_for_chat(
     else:
         lines.append("- 输出校验：**未完全通过**（请检查日志）。")
     lines.append("")
-    lines.append("以上均来自本次推理/后处理的真实输出，而非模型臆测。")
+    lines.append("以上均来自本次提取与成果生成的真实输出，而非模型臆测。")
     return "\n".join(lines)
 
 
@@ -1141,7 +1141,7 @@ def build_inference_context_for_agent(
     pending_plan: Optional[Dict[str, Any]] = None,
 ) -> str:
     """注入 Copilot 的推理闭环上下文（白名单信息，不含密钥/无关绝对路径）。"""
-    lines = ["【本地潮滩推理 · 可信执行闭环】"]
+    lines = ["【潮滩智能提取 · 可信执行闭环】"]
     lines.append(
         "可用工具：local_tidal_flat_inference(task_id, prob_th, cnt, run_now) 与 "
         "confirm_inference(plan_id)。"

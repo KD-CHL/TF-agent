@@ -432,7 +432,7 @@ def build_globe_payload(
                 gj = load_shp_geojson(e1_path)
                 if gj:
                     payload["geojsonLayers"].append(
-                        {"name": "E1", "data": gj, "color": "#ff6b35", "alpha": 0.65}
+                        {"name": "精度评价结果", "data": gj, "color": "#ff6b35", "alpha": 0.65}
                     )
             elif ext in {".tif", ".tiff"}:
                 tile = get_raster_tile_overlay(
@@ -441,7 +441,7 @@ def build_globe_payload(
                 if tile:
                     payload["imageryLayers"].append(
                         {
-                            "name": "E1",
+                            "name": "精度评价结果",
                             "url": tile["url"],
                             "west": tile["west"],
                             "south": tile["south"],

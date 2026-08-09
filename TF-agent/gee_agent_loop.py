@@ -912,8 +912,8 @@ def register_gee_dataset_asset(
     dataset_id = f"gee_{task_id}_{plan_id[:8]}"
     entry: Dict[str, Any] = {
         "id": dataset_id,
-        "title": f"GEE Sentinel-2 {task_id}（{plan.get('start_date')} ~ {plan.get('end_date')}）",
-        "description": "由 GEE 可信下载闭环导出的 Sentinel-2 多波段 GeoTIFF。",
+        "title": f"卫星影像 {task_id}（{plan.get('start_date')} ~ {plan.get('end_date')}）",
+        "description": "由影像获取闭环导出的 Sentinel-2 多波段 GeoTIFF。",
         "source": "open",
         "provider": "Earth Engine",
         "collection": plan.get("collection") or "COPERNICUS/S2_SR_HARMONIZED",
@@ -963,8 +963,8 @@ def register_gee_dataset_asset(
 def format_gee_plan_for_user(plan: Dict[str, Any]) -> str:
     """确认前展示的执行计划（只含真实信息，无凭证 / 无完整 GeoJSON）。"""
     if not plan:
-        return "尚未生成 GEE 下载执行计划。"
-    lines = ["## GEE 影像下载 · 执行计划", ""]
+        return "尚未生成影像获取计划。"
+    lines = ["## 获取卫星影像 · 执行计划", ""]
     if plan.get("ready"):
         lines.append("**状态：可执行**（请回复「确认」或点击确认按钮后开始）")
     else:
@@ -989,7 +989,7 @@ def format_gee_plan_for_user(plan: Dict[str, Any]) -> str:
     for i, s in enumerate(plan.get("steps") or [], 1):
         lines.append(f"{i}. {s}")
     lines.append("")
-    lines.append("确认后将真实调用现有 GEE 下载代码，并根据云端任务状态与磁盘产物验证后回复。")
+    lines.append("确认后将真实获取影像，并根据云端任务状态与磁盘产物验证后回复。")
     return "\n".join(lines)
 
 
@@ -999,9 +999,9 @@ def summarize_gee_result_for_chat(
 ) -> str:
     """基于真实工具结果生成 Copilot 回复（禁止编造指标 / 输出凭证）。"""
     if not result or result.get("success") is not True:
-        err = (result or {}).get("error") or "GEE 下载失败"
+        err = (result or {}).get("error") or "影像获取失败"
         return (
-            "## GEE 影像下载 · 未完成\n\n"
+            "## 获取卫星影像 · 未完成\n\n"
             f"- 任务：`{(result or {}).get('task_id') or '—'}`\n"
             f"- 状态：**失败**\n"
             f"- 原因：{err}\n\n"
@@ -1013,7 +1013,7 @@ def summarize_gee_result_for_chat(
     export_state = str(result.get("export_state") or "COMPLETED")
     scene_count = int(metrics.get("scene_count") or 0)
     lines = [
-        "## GEE 影像下载 · 完成",
+        "## 获取卫星影像 · 完成",
         "",
         f"- 任务：`{result.get('task_id') or '—'}`",
         f"- AOI：{inputs.get('aoi_summary') or '—'}",
@@ -1022,7 +1022,7 @@ def summarize_gee_result_for_chat(
         f"- 波段：{list(inputs.get('bands') or [])}（RGB 顺序）",
         f"- 分辨率：`{inputs.get('scale')} m` ｜ 导出方式：`{inputs.get('export_to')}`",
         f"- 云端导出状态：`{export_state}`",
-        f"- **scene_count：{scene_count} 景**",
+        f"- **共 {scene_count} 景影像**",
         f"- 耗时：{metrics.get('elapsed_seconds', 0.0):.1f}s",
     ]
     if verification:
@@ -1038,8 +1038,8 @@ def summarize_gee_result_for_chat(
     if local:
         lines.append(f"- 本地文件：{len(local)} 个 GeoTIFF（首个：`{os.path.basename(str(local[0]))}`）")
     lines.append("")
-    lines.append("> 数据已就绪（scene_count 与波段已登记）。**推理不会自动启动**——"
-                 "如需潮滩推理，请回复「对 XX 做潮滩推理」以生成推理计划，确认后再执行。")
+    lines.append("> 数据已就绪。**不会自动启动提取**——如需潮滩提取，"
+                 "请回复「对 XX 做潮滩提取」以生成提取计划，确认后再执行。")
     return "\n".join(lines)
 
 

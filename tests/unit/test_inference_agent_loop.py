@@ -713,7 +713,7 @@ class TestSummaryAndContext(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             plan, *_ = _happy_plan(Path(td))
             text = ial.format_inference_plan_for_user(plan)
-            self.assertIn("本地潮滩推理 · 执行计划", text)
+            self.assertIn("潮滩智能提取 · 执行计划", text)
             self.assertIn("task_a", text)
             self.assertIn("cdnet_resnet50", text)
             blocked = ial.format_inference_plan_for_user({"ready": False, "blockers": ["x"]})
@@ -731,7 +731,7 @@ class TestSummaryAndContext(unittest.TestCase):
                 device="cpu",
                 pending_plan=plan,
             )
-            self.assertIn("本地潮滩推理", ctx)
+            self.assertIn("潮滩智能提取", ctx)
             self.assertIn("local_tidal_flat_inference", ctx)
             self.assertIn("task_a", ctx)
             self.assertIn(plan["plan_id"][:8], ctx)
@@ -791,7 +791,7 @@ class TestBridgeInferenceFlow(unittest.TestCase):
             )
             self.assertEqual(r.action_type, "propose_inference")
             self.assertIsNotNone(r.inference_plan)
-            self.assertIn("本地潮滩推理", r.inference_plan_text)
+            self.assertIn("潮滩智能提取", r.inference_plan_text)
             self.assertTrue(state["_inference_pending_plan"]["ready"])
             self.assertNotIn("pending_task", state)
 

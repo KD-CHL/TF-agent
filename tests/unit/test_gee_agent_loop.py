@@ -552,8 +552,8 @@ class TestSummarizeAndCapability(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             plan, result, _ = _run_local(tmp, task="t22", scene_count=2)
             text = gal.summarize_gee_result_for_chat(result)
-            self.assertIn("scene_count：2", text)
-            self.assertIn("推理不会自动启动", text)
+            self.assertIn("共 2 景影像", text)
+            self.assertIn("不会自动启动提取", text)
             self.assertNotIn("GEE_TASK_", text)  # drive 无任务时不虚构
 
     def test_summarize_failure_honest(self):

@@ -89,14 +89,14 @@ AUTOTUNE_OBJECTIVE_MAP = {
 
 # 重型工具确认门闩：未确认时仅记录待确认请求，不写入 pending_task/pending_autotune。
 HEAVY_ACTION_LABELS = {
-    "run_pipeline": "推理任务（深度学习/指数法推理）",
-    "run": "推理任务（深度学习/指数法推理）",
-    "": "推理任务（深度学习/指数法推理）",
-    "run_inference": "本地潮滩推理（可信执行闭环）",
-    "run_m4": "GEE 影像下载",
-    "run_gee_download": "GEE 影像下载（可信执行闭环）",
-    "run_autotune": "AutoTune 阈值搜索",
-    "run_workflow": "潮滩分析 Workflow（GEE→推理→E1/M5→PDF）",
+    "run_pipeline": "潮滩智能提取（深度学习/指数法）",
+    "run": "潮滩智能提取（深度学习/指数法）",
+    "": "潮滩智能提取（深度学习/指数法）",
+    "run_inference": "潮滩智能提取",
+    "run_m4": "获取卫星影像",
+    "run_gee_download": "获取卫星影像",
+    "run_autotune": "参数自动优化",
+    "run_workflow": "一键潮滩分析（获取影像→提取→评价/变化→报告）",
 }
 
 
@@ -466,7 +466,7 @@ def build_agent_sidebar_context(state: Dict[str, Any]) -> str:
         "【当前侧栏状态快照】",
         "用户说「按侧栏/默认/当前设置/别改参数」时：只改其明确提到的项，其余省略；",
         "用户说「跑一下/开始/启动」且未给 prob/cnt/task 时：优先用下方快照中的值。",
-        f"- 工作台: {s.get('ui_workflow', '—')}",
+        f"- 工作台: {'潮滩智能提取' if s.get('ui_workflow') == '潮滩推理' else ('获取卫星影像' if s.get('ui_workflow') == 'GEE 数据下载' else s.get('ui_workflow', '—'))}",
         f"- 目标任务: {s.get('ui_selected_task') or '（未选）'}",
         f"- 原始影像目录: {s.get('ui_root_dir', '—')}",
         f"- 推理方式: {s.get('ui_inference_mode', '—')} (run_mode={'index' if s.get('ui_inference_mode') == '指数法' else 'dl'})",

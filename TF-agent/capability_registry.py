@@ -125,13 +125,13 @@ class CapabilityRegistry:
 
     def _register_defaults(self) -> None:
         self.register("map_navigation", "地图导航", "cheap", self._check_map_navigation)
-        self.register("map_layer_display", "地图图层展示", "cheap", self._check_map_layer_display)
-        self.register("deep_learning_inference", "深度学习推理", "expensive", self._check_deep_learning)
-        self.register("gee_download", "GEE 遥感下载", "cheap", self._check_gee_download)
-        self.register("e1_quality_evaluation", "E1 质量评估", "expensive", self._check_e1_evaluation)
-        self.register("m5_change_detection", "M5 时空变化检测", "expensive", self._check_m5_detection)
-        self.register("autotune", "自动调参", "expensive", self._check_autotune)
-        self.register("pdf_report", "PDF 报告", "cheap", self._check_pdf_report)
+        self.register("map_layer_display", "地图图层", "cheap", self._check_map_layer_display)
+        self.register("deep_learning_inference", "潮滩智能提取", "expensive", self._check_deep_learning)
+        self.register("gee_download", "获取卫星影像", "cheap", self._check_gee_download)
+        self.register("e1_quality_evaluation", "潮滩精度评价", "expensive", self._check_e1_evaluation)
+        self.register("m5_change_detection", "潮滩变化分析", "expensive", self._check_m5_detection)
+        self.register("autotune", "参数自动优化", "expensive", self._check_autotune)
+        self.register("pdf_report", "成果报告", "cheap", self._check_pdf_report)
         self.register("knowledge_search", "知识库检索", "cheap", self._check_knowledge_search)
 
     # ---- 查询 ----
@@ -296,7 +296,7 @@ class CapabilityRegistry:
         if not has_gee:
             return CapabilityStatus(
                 capability_id="gee_download", label="GEE 遥感下载", status=BLOCKED,
-                summary="GEE Python 包不可用",
+                summary="影像获取依赖不可用",
                 requirements=reqs, blockers=["gee 包不可导入"],
                 recommended_actions=["安装 gee 包"],
             )
@@ -337,13 +337,13 @@ class CapabilityRegistry:
         if not project:
             return CapabilityStatus(
                 capability_id="gee_download", label="GEE 遥感下载", status=UNAVAILABLE,
-                summary="未配置 GEE 项目（env / ~/.config/earthengine）",
+                summary="未配置影像获取项目（env / ~/.config/earthengine）",
                 requirements=reqs, blockers=["缺少 GEE 项目配置"],
                 recommended_actions=["配置 GEE_PROJECT/EE_PROJECT 环境变量或 earthengine 凭据后重启"],
             )
         return CapabilityStatus(
             capability_id="gee_download", label="GEE 遥感下载", status=CONDITIONAL,
-            summary="GEE 已配置，需项目与网络代理可用",
+            summary="影像获取已配置，需项目与网络代理可用",
             requirements=reqs,
             evidence={"gee_project_configured": True, "gee_importable": True},
             warnings=["下载需 GEE 认证与网络可达"],
@@ -355,13 +355,13 @@ class CapabilityRegistry:
         if not model_path or not _path_ok(model_path):
             return CapabilityStatus(
                 capability_id="e1_quality_evaluation", label="E1 质量评估", status=BLOCKED,
-                summary="E1 评估模型不可用",
+                summary="精度评价模型不可用",
                 requirements=reqs, blockers=["模型文件缺失"],
                 recommended_actions=["配置模型文件"],
             )
         return CapabilityStatus(
             capability_id="e1_quality_evaluation", label="E1 质量评估", status=AVAILABLE,
-            summary="E1 质量评估可用",
+            summary="精度评价可用",
             requirements=reqs,
             evidence={"model_present": True},
         )
@@ -372,13 +372,13 @@ class CapabilityRegistry:
         if not model_path or not _path_ok(model_path):
             return CapabilityStatus(
                 capability_id="m5_change_detection", label="M5 时空变化检测", status=BLOCKED,
-                summary="M5 模型不可用",
+                summary="变化分析模型不可用",
                 requirements=reqs, blockers=["模型文件缺失"],
                 recommended_actions=["配置模型文件"],
             )
         return CapabilityStatus(
             capability_id="m5_change_detection", label="M5 时空变化检测", status=AVAILABLE,
-            summary="M5 时空变化检测可用",
+            summary="变化分析可用",
             requirements=reqs,
             evidence={"model_present": True},
         )
@@ -406,7 +406,7 @@ class CapabilityRegistry:
         if not has_reportlab:
             return CapabilityStatus(
                 capability_id="pdf_report", label="PDF 报告", status=BLOCKED,
-                summary="PDF 报告依赖不可用",
+                summary="报告生成依赖不可用",
                 requirements=reqs, blockers=["reportlab 不可导入"],
                 recommended_actions=["安装 reportlab"],
             )
@@ -414,13 +414,13 @@ class CapabilityRegistry:
         font_ok = _find_chinese_font()
         st = CapabilityStatus(
             capability_id="pdf_report", label="PDF 报告", status=AVAILABLE,
-            summary="PDF 报告可用",
+            summary="报告生成可用",
             requirements=reqs,
             evidence={"reportlab_importable": True, "chinese_font_found": bool(font_ok)},
         )
         if not font_ok:
             st.status = CONDITIONAL
-            st.summary = "PDF 报告可用（缺中文字体，中文可能显示异常）"
+            st.summary = "报告生成可用（缺中文字体，中文可能显示异常）"
             st.warnings = ["未检测到中文字体（msyh.ttc 等），建议安装以正常显示中文"]
             st.recommended_actions = ["安装中文字体（如微软雅黑 msyh.ttc）"]
         return st

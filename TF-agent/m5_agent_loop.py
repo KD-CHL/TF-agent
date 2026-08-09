@@ -178,11 +178,11 @@ def build_m5_preflight(
         "prob": prob,
         "cnt": cnt,
         "steps": [
-            "读取当前任务与成果账本中的当期潮滩 SHP",
-            "匹配同区域更早时期基线 SHP",
-            "调用 M5 引擎做时空差集与告警指标",
-            "校验报告 JSON 与差异面文件",
-            "登记 M5 资产并加载到地图",
+            "读取当前任务与成果账本中的当期潮滩成果",
+            "匹配同区域更早时期的历史成果",
+            "运行变化分析，生成差异区域与告警指标",
+            "校验结果文件",
+            "保存分析成果并加载到地图",
         ],
     }
     return plan
@@ -191,8 +191,8 @@ def build_m5_preflight(
 def format_m5_plan_for_user(plan: Dict[str, Any]) -> str:
     """面向用户的计划说明（确认前展示）。"""
     if not plan:
-        return "尚未生成 M5 执行计划。"
-    lines = ["## M5 时空变化检测 · 执行计划", ""]
+        return "尚未生成变化分析计划。"
+    lines = ["## 潮滩变化分析 · 执行计划", ""]
     if plan.get("ready"):
         lines.append("**状态：可执行**（请回复「确认」或点击确认按钮后开始）")
     else:
@@ -213,7 +213,7 @@ def format_m5_plan_for_user(plan: Dict[str, Any]) -> str:
     for w in plan.get("warnings") or []:
         lines.append(f"- 注意：{w}")
     lines.append("")
-    lines.append("确认后将真实调用现有 M5 引擎，并根据磁盘上的报告与差异面回复结果。")
+    lines.append("确认后将真实运行变化分析，并根据磁盘报告与差异面回复结果。")
     return "\n".join(lines)
 
 
@@ -300,8 +300,8 @@ def summarize_m5_report_for_chat(
     """基于真实工具结果生成 Copilot 回复（禁止编造指标）。"""
     if not report:
         return (
-            "M5 变化检测未生成有效报告。"
-            "常见原因：缺少往年同区域基线 SHP，或当期成果路径无效。"
+            "变化分析未生成有效结果。"
+            "常见原因：缺少往年同区域基线成果，或当期成果路径无效。"
             "请检查成果目录后重试。"
         )
     qm = report.get("quantitative_metrics") or {}
@@ -309,7 +309,7 @@ def summarize_m5_report_for_chat(
     ct = qm.get("centroid_trajectory") or {}
     lvl = report.get("alert_level", "—")
     lines = [
-        "## M5 变化检测结果（已验证）",
+        "## 潮滩变化分析结果（已验证）",
         "",
         f"- 任务：`{report.get('target_roi') or '—'}`",
         f"- 基线：`{report.get('baseline_task') or os.path.basename(str(report.get('baseline_shp') or '')) or '—'}`",
@@ -336,7 +336,7 @@ def summarize_m5_report_for_chat(
             f"- 输出校验：{'通过' if verification.get('ok') else '未完全通过'}"
         )
     lines.append("")
-    lines.append("以上指标均来自本次 M5 引擎真实输出，而非模型臆测。")
+    lines.append("以上指标均来自本次变化分析的真实输出，而非模型臆测。")
     return "\n".join(lines)
 
 
@@ -347,7 +347,7 @@ def build_m5_context_for_agent(
     pending_plan: Optional[Dict[str, Any]] = None,
 ) -> str:
     """注入 Agent 提示的 M5 账本快照。"""
-    lines = ["【M5 变化检测账本】"]
+    lines = ["【潮滩变化分析账本】"]
     if not current_task:
         lines.append("- 当前任务：未选")
         return "\n".join(lines)

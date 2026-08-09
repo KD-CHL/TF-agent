@@ -3,6 +3,7 @@ import leafmap.foliumap as leafmap
 import streamlit.components.v1 as components
 from streamlit_folium import st_folium
 import sidebar_ui as sbui
+import ui_labels as uil
 import hashlib
 import os
 import re
@@ -753,7 +754,7 @@ def _run_m5_phase(ctx, shared, current_shp, actual_task, prob, cnt, push_log, ch
         return None
     if check_stop():
         return None
-    push_log(">>> [Phase 3]  时空异常检测与告警…")
+    push_log(">>> [Phase 3]  潮滩变化分析…")
     try:
         import m5_engine
 
@@ -772,12 +773,12 @@ def _run_m5_phase(ctx, shared, current_shp, actual_task, prob, cnt, push_log, ch
             with shared["lock"]:
                 shared["m5_report"] = report
             lvl = report.get("alert_level", "GREEN")
-            push_log(f"[M5] 检测完成，告警级别: {lvl}")
+            push_log(f"[M5] 变化分析完成，告警级别: {lvl}")
         else:
-            push_log("[M5] 未生成告警报告（可能缺少往年同区域基线）。")
+            push_log("[M5] 未生成变化告警（可能缺少往年同区域基线）。")
         return report
     except Exception as e:
-        push_log(f"[M5] 检测异常: {e}")
+        push_log(f"[M5] 变化分析异常: {e}")
         return None
 
 
@@ -805,7 +806,7 @@ def run_m5_sync(ctx, shared, stop_event):
             shared["status"] = (kind, text)
 
     push_progress(5)
-    push_status("info", "M5 变化检测启动…")
+    push_status("info", "潮滩变化分析启动…")
     m5_cfg = ctx.get("m5") or {}
     task = ctx.get("task") or m5_cfg.get("plan", {}).get("current_task")
     current_shp = m5_cfg.get("current_shp")
@@ -815,7 +816,7 @@ def run_m5_sync(ctx, shared, stop_event):
     push_log(f"BASELINE: {baseline_shp} ({m5_cfg.get('baseline_task') or '—'})")
 
     if check_stop():
-        push_status("warning", "M5 已中断")
+        push_status("warning", "变化分析已中断")
         return False
     if not current_shp or not os.path.isfile(str(current_shp)):
         push_status("error", "当期潮滩 SHP 不存在")
@@ -844,7 +845,7 @@ def run_m5_sync(ctx, shared, stop_event):
         )
         push_progress(80)
         if not report:
-            push_status("warning", "M5 未生成报告")
+            push_status("warning", "变化分析未生成结果")
             return False
         report["baseline_task"] = report.get("baseline_task") or m5_cfg.get("baseline_task")
         verification = m5_agent_loop.verify_m5_outputs(report, workspace_dir=ctx["final_root"])
@@ -864,16 +865,16 @@ def run_m5_sync(ctx, shared, stop_event):
         if verification.get("ok"):
             push_status(
                 "success",
-                f"M5 完成 · 告警 {report.get('alert_level', '—')}",
+                f"变化分析完成 · 告警 {report.get('alert_level', '—')}",
             )
         else:
-            push_status("warning", "M5 已完成但输出校验未完全通过")
+            push_status("warning", "变化分析已完成但输出校验未完全通过")
         push_progress(100)
         push_log(m5_agent_loop.summarize_m5_report_for_chat(report, verification).replace("\n", " | "))
         return True
     except Exception as e:
         push_log(f"[ERROR] {e}")
-        push_status("error", f"M5 异常: {e}")
+        push_status("error", f"变化分析异常: {e}")
         import traceback
 
         traceback.print_exc()
@@ -922,7 +923,7 @@ def run_e1_sync(ctx, shared, stop_event):
             shared["status"] = (kind, text)
 
     push_progress(5)
-    push_status("info", "E1 多源一致性诊断启动…")
+    push_status("info", "潮滩精度评价启动…")
     e1_cfg = ctx.get("e1") or {}
     task = ctx.get("task") or e1_cfg.get("plan", {}).get("current_task")
     target_shp = e1_cfg.get("target_shp")
@@ -931,7 +932,7 @@ def run_e1_sync(ctx, shared, stop_event):
     push_log(f"REF: {e1_cfg.get('reference')} | DATA: {e1_cfg.get('data_root')}")
 
     if check_stop():
-        push_status("warning", "E1 已中断")
+        push_status("warning", "精度评价已中断")
         return False
     if not target_shp or not os.path.isfile(str(target_shp)):
         push_status("error", "当期潮滩 SHP 不存在")
@@ -966,7 +967,7 @@ def run_e1_sync(ctx, shared, stop_event):
         )
         push_progress(80)
         if not report:
-            push_status("warning", "E1 未生成报告")
+            push_status("warning", "精度评价未生成结果")
             return False
         verification = e1_agent_loop.verify_e1_outputs(report)
         map_path = verification.get("map_candidate") or e1_agent_loop.pick_e1_map_path(report)
@@ -984,15 +985,15 @@ def run_e1_sync(ctx, shared, stop_event):
 
         n = len(report.get("comparisons") or {})
         if verification.get("ok"):
-            push_status("success", f"E1 完成 · {n} 组对比")
+            push_status("success", f"精度评价完成 · {n} 组对比")
         else:
-            push_status("warning", "E1 已完成但输出校验未完全通过")
+            push_status("warning", "精度评价已完成但输出校验未完全通过")
         push_progress(100)
         push_log(e1_agent_loop.summarize_e1_report_for_chat(report, verification).replace("\n", " | "))
         return True
     except Exception as e:
         push_log(f"[ERROR] {e}")
-        push_status("error", f"E1 异常: {e}")
+        push_status("error", f"精度评价异常: {e}")
         import traceback as _tb
 
         _tb.print_exc()
@@ -1023,7 +1024,7 @@ def _run_e1_phase(ctx, shared, current_shp, actual_task, push_log, check_stop):
         return None
     if check_stop():
         return None
-    push_log(">>> [Phase 4]  多源潮滩一致性诊断 (E1)…")
+    push_log(">>> [Phase 4]  潮滩精度评价…")
     try:
         import e1_engine
 
@@ -1053,12 +1054,12 @@ def _run_e1_phase(ctx, shared, current_shp, actual_task, push_log, check_stop):
         if report:
             with shared["lock"]:
                 shared["e1_report"] = report
-            push_log(f"[E1] 诊断完成，对比 {len(report.get('comparisons') or {})} 组产品。")
+            push_log(f"[E1] 精度评价完成，对比 {len(report.get('comparisons') or {})} 组产品。")
         else:
-            push_log("[E1] 未生成诊断报告。")
+            push_log("[E1] 未生成精度评价结果。")
         return report
     except Exception as e:
-        push_log(f"[E1] 诊断异常: {e}")
+        push_log(f"[E1] 精度评价异常: {e}")
         return None
 
 
@@ -1385,7 +1386,7 @@ def run_m4_download_sync(ctx, shared, stop_event):
             stop_callback=check_stop,
         )
         if check_stop():
-            push_status("warning", "GEE 下载已中止。")
+            push_status("warning", "影像获取已中止。")
             return False
         if not result:
             return False
@@ -1395,7 +1396,7 @@ def run_m4_download_sync(ctx, shared, stop_event):
         if result["export_to"] == "drive":
             push_status(
                 "success",
-                f"已提交 {n} 个 Drive 任务 → 文件夹「{result['drive_folder']}」。请在 GEE Tasks / 云盘查看。",
+                f"已提交 {n} 个 Drive 任务 → 文件夹「{result['drive_folder']}」。请在影像平台任务列表 / 云盘查看。",
             )
         else:
             push_status("success", f"本地下载完成 {n} 景 → {result['local_out_dir']}")
@@ -1403,7 +1404,7 @@ def run_m4_download_sync(ctx, shared, stop_event):
         return True
     except Exception as e:
         push_log(f"[SYSTEM] M4 异常: {e}\n{traceback.format_exc()}")
-        push_status("error", f"GEE 下载失败: {e}")
+        push_status("error", f"影像获取失败: {e}")
         return False
 
 
@@ -1446,7 +1447,7 @@ def _workflow_worker_entry(ctx, shared, stop_event):
         wf = ctx.get("workflow_plan")
         if not isinstance(wf, dict) or not wf.get("workflow_id"):
             with shared["lock"]:
-                shared["status"] = ("error", "Workflow 计划未就绪，无法执行。")
+                shared["status"] = ("error", "一键潮滩分析计划未就绪，无法执行。")
             return
 
         def push_log(msg):
@@ -1495,10 +1496,10 @@ def _workflow_worker_entry(ctx, shared, stop_event):
         if ok:
             push_status(
                 "success" if final_status == "SUCCEEDED" else "warning",
-                f"Workflow 完成 · {final_status}",
+                f"一键潮滩分析完成 · {uil.get_status_label(final_status)}",
             )
         else:
-            push_status("error", f"Workflow 未完成 · {final_status}")
+            push_status("error", f"一键潮滩分析未完成 · {uil.get_status_label(final_status)}")
         push_log(summary.replace("\n", " | "))
         push_progress(100)
         return
@@ -1557,7 +1558,7 @@ def _inference_worker_entry(ctx, shared, stop_event):
                 shared["status"] = (kind, text)
 
         started = _time.time()
-        push_status("info", "正在启动本地潮滩推理（可信执行闭环）…")
+        push_status("info", "正在启动潮滩智能提取…")
         push_log(f"PLAN: {plan.get('plan_id')} | TASK: {task_id} | "
                  f"P={plan.get('prob_threshold')} C={plan.get('count_threshold')} | "
                  f"DEVICE={plan.get('device') or plan.get('device_policy')}")
@@ -1569,13 +1570,13 @@ def _inference_worker_entry(ctx, shared, stop_event):
             push_progress=push_progress,
         )
         if not result or result.get("success") is not True:
-            err = (result or {}).get("error") or "推理失败"
+            err = (result or {}).get("error") or "提取失败"
             push_status("error", f"❌ {err}")
             with shared["lock"]:
                 shared["inference_result"] = result or {}
             return
 
-        push_status("info", "推理完成，正在校验磁盘成果…")
+        push_status("info", "提取完成，正在校验磁盘成果…")
         verification = ial.verify_inference_outputs(plan, result, started_at=started)
         if not verification or verification.get("ok") is not True:
             failed = [c.get("name") for c in (verification or {}).get("checks") or []
@@ -1596,9 +1597,9 @@ def _inference_worker_entry(ctx, shared, stop_event):
 
         final_tif = (result.get("outputs") or {}).get("final_tif") or ""
         final_shp = (result.get("outputs") or {}).get("final_shp") or ""
-        push_log(f"✅ 推理闭环完成 | asset_id={asset_id} | Final TIF={os.path.basename(str(final_tif))} | "
+        push_log(f"✅ 提取闭环完成 | asset_id={asset_id} | Final TIF={os.path.basename(str(final_tif))} | "
                  f"Final SHP={os.path.basename(str(final_shp))}")
-        push_status("success", "🎉 本地潮滩推理完成：成果已验证并登记。")
+        push_status("success", "🎉 潮滩智能提取完成：成果已验证并登记。")
         with shared["lock"]:
             shared["inference_result"] = result
             shared["inference_verification"] = verification
@@ -1663,7 +1664,7 @@ def _gee_worker_entry(ctx, shared, stop_event):
                 shared["status"] = (kind, text)
 
         started = _time.time()
-        push_status("info", "正在执行 GEE 影像下载（可信执行闭环）…")
+        push_status("info", "正在执行影像获取（可信执行闭环）…")
         push_log(f"PLAN: {plan.get('plan_id')} | TASK: {task_id} | "
                  f"BANDS={plan.get('bands')} | EXPORT={plan.get('export_to')} | "
                  f"COLLECTION={plan.get('collection')}")
@@ -1675,7 +1676,7 @@ def _gee_worker_entry(ctx, shared, stop_event):
             push_progress=push_progress,
         )
         if not result or result.get("success") is not True:
-            err = (result or {}).get("error") or "GEE 下载失败"
+            err = (result or {}).get("error") or "影像获取失败"
             push_status("error", f"❌ {err}")
             with shared["lock"]:
                 shared["gee_result"] = result or {}
@@ -1701,10 +1702,10 @@ def _gee_worker_entry(ctx, shared, stop_event):
             return
 
         n_tifs = len(verification.get("local_tifs") or [])
-        push_log(f"✅ GEE 下载闭环完成 | dataset_id={asset_id} | "
+        push_log(f"✅ 影像获取闭环完成 | dataset_id={asset_id} | "
                  f"scene_count={result.get('metrics', {}).get('scene_count')} | "
                  f"local_tifs={n_tifs}")
-        push_status("success", "🎉 GEE 影像下载完成：数据集已验证并登记。推理不会自动启动。")
+        push_status("success", "🎉 影像获取完成：影像数据已验证并登记。提取不会自动启动。")
         with shared["lock"]:
             shared["gee_result"] = result
             shared["gee_verification"] = verification
@@ -1893,7 +1894,7 @@ def _poll_aoi_messages():
         elif isinstance(_echo, dict):
             _send_globe_message(_echo)
         if not _r.get("ok"):
-            st.warning("AOI 无效：" + "; ".join(_r.get("errors") or []))
+            st.warning("研究区域无效：" + "; ".join(_r.get("errors") or []))
 
 
 def _aoi_sidebar_context():
@@ -1979,48 +1980,48 @@ if _agent_flush.applied and _agent_flush.m5_plan_text:
     # 将可验证计划写入对话，便于用户确认
     _msgs = list(st.session_state.get("messages") or [])
     _last = (_msgs[-1].get("content") if _msgs else "") or ""
-    if "M5 时空变化检测 · 执行计划" not in str(_last):
+    if "潮滩变化分析 · 执行计划" not in str(_last):
         _msgs.append({"role": "assistant", "content": _agent_flush.m5_plan_text})
         st.session_state.messages = _msgs
 if _agent_flush.applied and _agent_flush.action_type == "run_m5":
     try:
-        st.toast("M5 变化检测已确认，正在执行…", icon="🛰️")
+        st.toast("潮滩变化分析已确认，正在执行…", icon="🛰️")
     except Exception:
         pass
 if _agent_flush.applied and _agent_flush.e1_plan_text:
     st.session_state._e1_plan_notice = _agent_flush.e1_plan_text
     _msgs_e1 = list(st.session_state.get("messages") or [])
     _last_e1 = (_msgs_e1[-1].get("content") if _msgs_e1 else "") or ""
-    if "E1 多源一致性诊断 · 执行计划" not in str(_last_e1):
+    if "潮滩精度评价 · 执行计划" not in str(_last_e1):
         _msgs_e1.append({"role": "assistant", "content": _agent_flush.e1_plan_text})
         st.session_state.messages = _msgs_e1
 if _agent_flush.applied and _agent_flush.action_type == "run_e1":
     try:
-        st.toast("E1 诊断已确认，正在执行…", icon="📊")
+        st.toast("潮滩精度评价已确认，正在执行…", icon="📊")
     except Exception:
         pass
 if _agent_flush.applied and _agent_flush.inference_plan_text:
     st.session_state._inference_plan_notice = _agent_flush.inference_plan_text
     _msgs_inf = list(st.session_state.get("messages") or [])
     _last_inf = (_msgs_inf[-1].get("content") if _msgs_inf else "") or ""
-    if "本地潮滩推理 · 执行计划" not in str(_last_inf):
+    if "潮滩智能提取 · 执行计划" not in str(_last_inf):
         _msgs_inf.append({"role": "assistant", "content": _agent_flush.inference_plan_text})
         st.session_state.messages = _msgs_inf
 if _agent_flush.applied and _agent_flush.action_type == "run_inference":
     try:
-        st.toast("本地潮滩推理已确认，正在执行…", icon="🌊")
+        st.toast("潮滩智能提取已确认，正在执行…", icon="🌊")
     except Exception:
         pass
 if _agent_flush.applied and _agent_flush.gee_plan_text:
     st.session_state._gee_plan_notice = _agent_flush.gee_plan_text
     _msgs_gee = list(st.session_state.get("messages") or [])
     _last_gee = (_msgs_gee[-1].get("content") if _msgs_gee else "") or ""
-    if "GEE 影像下载 · 执行计划" not in str(_last_gee):
+    if "获取卫星影像 · 执行计划" not in str(_last_gee):
         _msgs_gee.append({"role": "assistant", "content": _agent_flush.gee_plan_text})
         st.session_state.messages = _msgs_gee
 if _agent_flush.applied and _agent_flush.action_type == "run_gee_download":
     try:
-        st.toast("GEE 影像下载已确认，正在执行…", icon="🛰️")
+        st.toast("获取卫星影像已确认，正在执行…", icon="🛰️")
     except Exception:
         pass
 
@@ -2377,9 +2378,10 @@ with st.sidebar:
     workflow = st.radio(
         "工作台",
         _wf_options,
+        format_func=lambda x: "潮滩智能提取" if x == "潮滩推理" else "获取卫星影像",
         horizontal=True,
         key="ui_workflow",
-        help="推理：本地 TIF 跑模型/指数法；下载：从 GEE 筛选 Sentinel-2 并导出。",
+        help="潮滩智能提取：用模型或指数法从本地影像提取潮滩；获取卫星影像：从影像平台筛选并导出 Sentinel-2 数据。",
     )
     use_gee_download = st.session_state.ui_workflow == "GEE 数据下载"
 
@@ -2443,9 +2445,9 @@ with st.sidebar:
     m4_gee_project = (st.session_state.get("ui_m4_gee_project") or os.environ.get("EE_PROJECT", "")).strip()
 
     if use_gee_download:
-        sbui.section("GEE 下载")
-        with st.expander("M4 参数配置", expanded=True):
-            m4_roi_path = st.text_input("ROI 矢量 (.shp)", key="ui_m4_roi_path")
+        sbui.section("获取卫星影像")
+        with st.expander("影像筛选参数", expanded=True):
+            m4_roi_path = st.text_input("研究区域矢量 (.shp)", key="ui_m4_roi_path")
             _roi_names = []
             try:
                 import m4_engine as _m4e
@@ -2454,9 +2456,9 @@ with st.sidebar:
                 pass
             if _roi_names:
                 _def_roi = selected_task if selected_task in _roi_names else _roi_names[0]
-                m4_roi_name = st.selectbox("ROI 名称 (name 字段)", _roi_names, index=_roi_names.index(_def_roi) if _def_roi in _roi_names else 0)
+                m4_roi_name = st.selectbox("研究区域名称 (name 字段)", _roi_names, index=_roi_names.index(_def_roi) if _def_roi in _roi_names else 0)
             else:
-                m4_roi_name = st.text_input("ROI 名称 (name 字段)", key="ui_m4_roi_name", placeholder=selected_task or "zhejiang1")
+                m4_roi_name = st.text_input("研究区域名称 (name 字段)", key="ui_m4_roi_name", placeholder=selected_task or "zhejiang1")
             _c1, _c2 = st.columns(2)
             with _c1:
                 m4_start_date = st.date_input("开始日期", key="ui_m4_start_date")
@@ -2467,7 +2469,7 @@ with st.sidebar:
             else:
                 _span_days = (m4_end_date - m4_start_date).days + 1
                 if _span_days > 31:
-                    st.caption(f"已选 {_span_days} 天，GEE 将自动按月分批筛选，避免单次查询超时。")
+                    st.caption(f"已选 {_span_days} 天，将自动按月分批筛选影像，避免单次查询超时。")
             m4_export_to = st.radio(
                 "导出方式",
                 ["drive", "local"],
@@ -2475,14 +2477,14 @@ with st.sidebar:
                 horizontal=True,
                 key="ui_m4_export_to",
             )
-            m4_drive_folder = st.text_input("Drive 文件夹 / 任务子目录名", key="ui_m4_drive_folder")
+            m4_drive_folder = st.text_input("云端文件夹 / 任务子目录名", key="ui_m4_drive_folder")
             if m4_export_to == "local":
                 m4_local_dir = st.text_input("本地下载目录", key="ui_m4_local_dir")
             else:
                 if not st.session_state.get("ui_m4_local_dir"):
                     st.session_state.ui_m4_local_dir = os.path.join(root_dir, m4_drive_folder)
                 m4_local_dir = st.session_state.ui_m4_local_dir
-                st.caption(f"本地推理目录建议：`{os.path.join(root_dir, m4_drive_folder)}`（Drive 同步后放此处）")
+                st.caption(f"本地提取目录建议：`{os.path.join(root_dir, m4_drive_folder)}`（云端同步后放此处）")
             m4_bands = st.multiselect(
                 "导出波段",
                 ["B8", "B4", "B3", "B2", "B11", "B8A", "B5", "B6", "B7", "B12"],
@@ -2500,13 +2502,13 @@ with st.sidebar:
                 st.session_state.ui_m4_scale = 10
             m4_scale = st.selectbox("导出分辨率 (m)", _scale_opts, key="ui_m4_scale")
             m4_gee_proxy = st.text_input(
-                "GEE 网络代理 (可选)",
+                "影像平台网络代理 (可选)",
                 key="ui_m4_gee_proxy",
                 placeholder=DEFAULT_CLASH_PROXY,
                 help="Clash 混合代理端口（默认 7892），与 Clash 设置保持一致。",
             )
             m4_gee_project = st.text_input(
-                "GEE Cloud Project ID（必填）",
+                "影像平台项目 ID（必填）",
                 key="ui_m4_gee_project",
                 placeholder="例如 ee-yourname 或 GCP 项目名",
                 help="在 https://code.earthengine.google.com 登录后，右上角可见；"
@@ -2530,37 +2532,37 @@ with st.sidebar:
         else:
             task_mask_dir, task_final_dir = "", ""
 
-        model_path = st.text_input("主模型权重 (.pth)", key="ui_model_path")
+        model_path = st.text_input("提取模型权重 (.pth)", key="ui_model_path")
         shp_path = st.text_input("岸线约束矢量 (.shp)", key="ui_shp_path")
         points_shp = st.text_input(
-            "海洋种子点 (.shp，指数法 M1)",
+            "海洋种子点 (.shp，指数法)",
             key="ui_points_shp",
-            help="M1_1.1 用于从水体中筛选真实海洋面，需落在海水上的点要素。",
+            help="用于从水体中筛选真实海洋面，需落在海水上的点要素。",
         )
         task_aoi_shp = st.text_input(
-            "任务分区 AOI（裁剪师姐真值，用于指标）",
+            "任务分区研究区域（裁剪参考真值，用于指标）",
             key="ui_task_aoi_shp",
-            help="与侧栏「目标任务」同名的要素用于裁剪师姐全国 SHP，再与预测比 IoU/F1；自适应与 combine 一致。文件不存在则跳过裁剪。",
+            help="与侧栏「目标任务」同名的要素用于裁剪参考真值，再与预测比交并比/F1；自适应与合成阶段一致。文件不存在则跳过裁剪。",
         )
 
     if not use_gee_download:
-        with st.expander("推理参数", expanded=False):
+        with st.expander("提取参数", expanded=False):
             _im_opts = ["深度学习", "指数法"]
             if st.session_state.get("ui_inference_mode") not in _im_opts:
                 st.session_state.ui_inference_mode = "深度学习"
             inference_mode = st.radio(
-                "推理方式",
+                "提取方式",
                 _im_opts,
                 horizontal=True,
                 key="ui_inference_mode",
-                help="深度学习：CDNet 逐景掩膜 + 时空合成；指数法：mNDWI 海面 + ACWI 频率 + 空间交集。",
+                help="深度学习：模型逐景掩膜 + 时空合成；指数法：mNDWI 海面 + ACWI 频率 + 空间交集。",
             )
             use_index_mode = st.session_state.ui_inference_mode == "指数法"
             adaptive_mode = st.checkbox(
-                "自适应优化 AutoTune",
+                "参数自动优化",
                 key="ui_adaptive_mode",
                 disabled=use_index_mode,
-                help="自动搜索最优 (概率阈值, 频次阈值)，使合成图与参考真值的 IoU / F1 最优。",
+                help="自动搜索最优 (提取概率阈值, 最少有效影像次数)，使合成图与参考真值的交并比 / F1 最优。",
             )
             if use_index_mode:
                 adaptive_mode = False
@@ -2570,28 +2572,28 @@ with st.sidebar:
                 prob_th = 0.05
                 min_cnt = 2
             else:
-                prob_th = st.slider("概率阈值", 0.01, 0.50, step=0.01, key="ui_prob_th")
-                min_cnt = st.slider("频次阈值", 1, 10, step=1, key="ui_min_cnt")
+                prob_th = st.slider("提取概率阈值", 0.01, 0.50, step=0.01, key="ui_prob_th")
+                min_cnt = st.slider("最少有效影像次数", 1, 10, step=1, key="ui_min_cnt")
 
-        with st.expander("后置分析 M5 · E1", expanded=False):
+        with st.expander("成果分析", expanded=False):
             m5_enabled = st.checkbox(
-                "M5 时空异常检测",
+                "潮滩变化分析",
                 key="ui_m5_enabled",
-                help="合成完成后对比往年同区域潮滩，输出 RED/YELLOW/GREEN 告警。",
+                help="合成完成后对比往年同区域潮滩，输出变化告警。",
             )
             m5_baseline_shp = st.text_input(
-                "M5 基线 SHP（可选）",
+                "历史对比成果 SHP（可选）",
                 key="ui_m5_baseline_shp",
                 placeholder="留空自动匹配往年成果",
                 disabled=not m5_enabled,
             )
             e1_enabled = st.checkbox(
-                "E1 多源一致性诊断",
+                "潮滩精度评价",
                 key="ui_e1_enabled",
-                help="与开源潮滩产品做像元级对比，输出 IoU、分歧图与成因分析。",
+                help="与开源潮滩产品做像元级对比，输出交并比、分歧图与成因分析。",
             )
             e1_data_root = st.text_input(
-                "E1 数据集根目录",
+                "参考数据根目录",
                 key="ui_e1_data_root",
                 disabled=not e1_enabled,
             )
@@ -2599,7 +2601,7 @@ with st.sidebar:
             if st.session_state.get("ui_e1_reference") not in _e1_ref_options:
                 st.session_state.ui_e1_reference = _e1_ref_options[0]
             e1_reference = st.selectbox(
-                "Reference 产品",
+                "参考数据",
                 _e1_ref_options,
                 key="ui_e1_reference",
                 disabled=not e1_enabled,
@@ -2615,13 +2617,13 @@ with st.sidebar:
                     _e1_all = _e1e.list_e1_datasets(e1_data_root)
                     _e1_choices = [d for d in _e1_all if d != e1_reference and d not in _e1e._SKIP_COMPARE]
                     e1_compare_sources = st.multiselect(
-                        "对比产品",
+                        "对比数据",
                         _e1_choices,
                         default=[d for d in _e1_default_compare if d in _e1_choices],
                     )
                 except Exception:
                     e1_compare_sources = st.multiselect(
-                        "对比产品",
+                        "对比数据",
                         _e1_default_compare,
                         default=_e1_default_compare,
                     )
@@ -2655,14 +2657,14 @@ with st.sidebar:
     _tune_objective = "iou_f1"
 
     if adaptive_mode and selected_task and not use_gee_download:
-        with st.expander("AutoTune 配置", expanded=True):
+        with st.expander("参数自动优化配置", expanded=True):
             try:
                 from dataset_assets import list_datasets, get_primary_path as _ds_get_path
                 _ref_rows = list_datasets(role="reference_truth")
             except Exception:
                 _ref_rows = []
             if not _ref_rows:
-                st.warning("数据集资产库中无参考真值，请先登记（seed-advisor）。")
+                st.warning("参考数据中无真值数据，请先登记真值数据集。")
                 adaptive_mode = False
             else:
                 _ref_opts = {}
@@ -2680,15 +2682,15 @@ with st.sidebar:
                 _ref_id = _ref_opts[_ref_label]
                 _obj_label = st.radio(
                     "优化目标",
-                    ["IoU + F1 (均衡)", "IoU (交并比优先)", "F1 (精确-召回优先)"],
+                    ["交并比 + F1 (均衡)", "交并比 (优先)", "F1 (精确-召回优先)"],
                     horizontal=True,
                 )
-                _tune_objective = {"IoU + F1 (均衡)": "iou_f1", "IoU (交并比优先)": "iou", "F1 (精确-召回优先)": "f1"}[_obj_label]
+                _tune_objective = {"交并比 + F1 (均衡)": "iou_f1", "交并比 (优先)": "iou", "F1 (精确-召回优先)": "f1"}[_obj_label]
 
                 _task_mask_check = os.path.join(mask_root, selected_task) if selected_task else ""
                 _mask_count = len(glob.glob(os.path.join(_task_mask_check, "**", "*_mask.tif"), recursive=True)) if os.path.isdir(_task_mask_check) else 0
                 if _mask_count == 0:
-                    sbui.hint("尚无 Mask，请先运行推理", "warn")
+                    sbui.hint("尚无 Mask，请先运行提取", "warn")
                 else:
                     sbui.hint(f"可优化 · {_mask_count} 个 Mask", "ok")
                     _autotune_ready = True
@@ -2735,12 +2737,12 @@ with st.sidebar:
         elif final_tif_path and os.path.exists(final_tif_path):
             map_display_path = final_tif_path
 
-        sbui.section("成果资产")
+        sbui.section("成果管理")
         with st.container(border=True):
             if cache_hit:
                 sbui.hint(f"缓存命中 · {cache_hit['file_size_mb']} MB · {cache_hit['created_at']}", "ok")
             elif selected_task:
-                sbui.hint("暂无缓存，运行推理后生成")
+                sbui.hint("暂无缓存，运行提取后生成")
 
             st.slider(
                 "图层透明度",
@@ -2753,7 +2755,7 @@ with st.sidebar:
             if selected_task:
                 task_assets = get_task_assets(selected_task)
                 if task_assets:
-                    with st.expander(f"历史资产 ({len(task_assets)})", expanded=False):
+                    with st.expander(f"历史成果 ({len(task_assets)})", expanded=False):
                         for key, asset in task_assets.items():
                             a_cols = st.columns([5, 2])
                             with a_cols[0]:
@@ -2775,23 +2777,23 @@ with st.sidebar:
                                     st.rerun()
 
             if cache_hit and not adaptive_mode:
-                force_rerun = st.checkbox("强制重新生成", key="ui_force_rerun", help="忽略缓存，重新跑推理。")
+                force_rerun = st.checkbox("强制重新生成", key="ui_force_rerun", help="忽略缓存，重新运行提取。")
     elif st.session_state.asset_override and os.path.exists(st.session_state.asset_override):
         map_display_path = st.session_state.asset_override
 
     # --- 自适应优化历史结果 ---
     _at_res = st.session_state.get("autotune_result")
     if _at_res:
-        sbui.section("AutoTune 结果")
+        sbui.section("参数自动优化结果")
         with st.container(border=True):
-            st.caption(f"最优 P={_at_res['best_prob']:.2f} · C={_at_res['best_cnt']}")
+            st.caption(f"最优概率 P={_at_res['best_prob']:.2f} · 次数 C={_at_res['best_cnt']}")
             _mc1, _mc2 = st.columns(2)
             with _mc1:
-                st.metric("IoU", f"{_at_res['best_iou'] * 100:.1f}%")
+                st.metric("交并比 (IoU)", f"{_at_res['best_iou'] * 100:.1f}%")
             with _mc2:
-                st.metric("F1", f"{_at_res['best_f1'] * 100:.1f}%")
+                st.metric("F1 综合评分", f"{_at_res['best_f1'] * 100:.1f}%")
             st.caption(
-                f"Prec {_at_res['best_precision'] * 100:.1f}% · Rec {_at_res['best_recall'] * 100:.1f}% · "
+                f"精确率 {_at_res['best_precision'] * 100:.1f}% · 召回率 {_at_res['best_recall'] * 100:.1f}% · "
                 f"{_at_res['total_trials']} 组 · {_at_res['total_time_sec']:.0f}s"
             )
             _at_trials = _at_res.get("trials") or []
@@ -2803,15 +2805,15 @@ with st.sidebar:
                     st.dataframe(
                         pd.DataFrame({
                             "#": range(1, len(_top) + 1),
-                            "prob": [t["prob"] for t in _top],
-                            "cnt": [t["cnt"] for t in _top],
-                            "IoU%": [round(t["iou"] * 100, 2) for t in _top],
+                            "概率": [t["prob"] for t in _top],
+                            "次数": [t["cnt"] for t in _top],
+                            "交并比%": [round(t["iou"] * 100, 2) for t in _top],
                             "F1%": [round(t["f1"] * 100, 2) for t in _top],
                         }),
                         use_container_width=True,
                         hide_index=True,
                     )
-            if st.button("清除 AutoTune 结果", key="clear_autotune_result"):
+            if st.button("清除参数优化结果", key="clear_autotune_result"):
                 st.session_state.pop("autotune_result", None)
                 st.rerun()
 
@@ -2827,7 +2829,7 @@ with st.sidebar:
 
     # 独立 M5 预检入口（不经 LLM，便于验收与无模型时使用）
     if selected_task and final_root and not st.session_state.is_running:
-        if st.button("预检并生成 M5 计划", key="propose_m5_manual_btn", use_container_width=True):
+        if st.button("预检并生成变化分析计划", key="propose_m5_manual_btn", use_container_width=True):
             queue_agent_command(
                 st.session_state,
                 {
@@ -2845,23 +2847,23 @@ with st.sidebar:
     _m5_res = st.session_state.get("m5_report")
     _m5_plan = st.session_state.get("_m5_pending_plan")
     if isinstance(_m5_plan, dict) and not st.session_state.is_running:
-        sbui.section("M5 执行计划")
+        sbui.section("潮滩变化分析计划")
         with st.container(border=True):
             if _m5_plan.get("ready"):
-                st.success("条件已满足，确认后将调用 M5 引擎")
+                st.success("条件已满足，确认后将运行变化分析")
             else:
                 st.warning("条件未满足，暂不可执行")
                 for _b in _m5_plan.get("blockers") or []:
                     st.caption(f"· {_b}")
             st.caption(
                 f"当前 `{_m5_plan.get('current_task') or '—'}` · "
-                f"基线 `{_m5_plan.get('baseline_task') or '—'}` · "
+                f"历史对比成果 `{_m5_plan.get('baseline_task') or '—'}` · "
                 f"可用时期 {len(_m5_plan.get('available_periods') or [])}"
             )
             _pc1, _pc2 = st.columns(2)
             with _pc1:
                 if st.button(
-                    "确认执行 M5",
+                    "确认执行变化分析",
                     key="confirm_m5_plan_btn",
                     type="primary",
                     use_container_width=True,
@@ -2881,22 +2883,22 @@ with st.sidebar:
 
     _e1_plan = st.session_state.get("_e1_pending_plan")
     if isinstance(_e1_plan, dict) and not st.session_state.is_running:
-        sbui.section("E1 执行计划")
+        sbui.section("潮滩精度评价计划")
         with st.container(border=True):
             if _e1_plan.get("ready"):
-                st.success("条件已满足，确认后将调用 E1 引擎")
+                st.success("条件已满足，确认后将运行精度评价")
             else:
                 st.warning("条件未满足，暂不可执行")
                 for _b in _e1_plan.get("blockers") or []:
                     st.caption(f"· {_b}")
             st.caption(
                 f"当前 `{_e1_plan.get('current_task') or '—'}` · "
-                f"参考 `{_e1_plan.get('reference') or '—'}`"
+                f"参考数据 `{_e1_plan.get('reference') or '—'}`"
             )
             _ec1, _ec2 = st.columns(2)
             with _ec1:
                 if st.button(
-                    "确认执行 E1",
+                    "确认执行精度评价",
                     key="confirm_e1_plan_btn",
                     type="primary",
                     use_container_width=True,
@@ -2908,33 +2910,33 @@ with st.sidebar:
                     )
                     st.rerun()
             with _ec2:
-                if st.button("取消 E1 计划", key="cancel_e1_plan_btn", use_container_width=True):
+                if st.button("取消精度评价计划", key="cancel_e1_plan_btn", use_container_width=True):
                     st.session_state.pop("_e1_pending_plan", None)
                     st.session_state.pop("_e1_plan_confirmed", None)
                     st.session_state.pop("_e1_plan_notice", None)
                     st.rerun()
 
-    # 本地潮滩推理执行计划（可信执行闭环：先计划后确认）
+    # 潮滩智能提取执行计划（可信执行闭环：先计划后确认）
     _inf_plan = st.session_state.get("_inference_pending_plan")
     if isinstance(_inf_plan, dict) and not st.session_state.is_running:
-        sbui.section("本地潮滩推理计划")
+        sbui.section("潮滩智能提取计划")
         with st.container(border=True):
             if _inf_plan.get("ready"):
-                st.success("条件已满足，确认后将真实调用推理/后处理代码")
+                st.success("条件已满足，确认后将真实调用提取/成果生成代码")
             else:
                 st.warning("条件未满足，暂不可执行")
                 for _b in _inf_plan.get("blockers") or []:
                     st.caption(f"· {_b}")
             st.caption(
                 f"任务 `{_inf_plan.get('task_id') or '—'}` · "
-                f"P={_inf_plan.get('prob_threshold')} C={_inf_plan.get('count_threshold')} · "
+                f"概率 P={_inf_plan.get('prob_threshold')} 次数 C={_inf_plan.get('count_threshold')} · "
                 f"设备策略 `{_inf_plan.get('device_policy') or 'auto'}`"
                 + (f"（实际 `{_inf_plan.get('device')}`）" if _inf_plan.get("device") else "")
             )
             _infc1, _infc2 = st.columns(2)
             with _infc1:
                 if st.button(
-                    "确认执行推理",
+                    "确认执行提取",
                     key="confirm_inference_plan_btn",
                     type="primary",
                     use_container_width=True,
@@ -2954,19 +2956,19 @@ with st.sidebar:
                     )
                     st.rerun()
             with _infc2:
-                if st.button("取消推理计划", key="cancel_inference_plan_btn", use_container_width=True):
+                if st.button("取消计划", key="cancel_inference_plan_btn", use_container_width=True):
                     st.session_state.pop("_inference_pending_plan", None)
                     st.session_state.pop("_inference_plan_confirmed", None)
                     st.session_state.pop("_inference_plan_notice", None)
                     st.rerun()
 
-    # GEE 影像下载执行计划（可信执行闭环：先计划后确认）
+    # 获取卫星影像执行计划（可信执行闭环：先计划后确认）
     _gee_plan = st.session_state.get("_gee_pending_plan")
     if isinstance(_gee_plan, dict) and not st.session_state.is_running:
-        sbui.section("GEE 影像下载计划")
+        sbui.section("获取卫星影像计划")
         with st.container(border=True):
             if _gee_plan.get("ready"):
-                st.success("条件已满足，确认后将真实调用 GEE 下载（不自动启动推理）")
+                st.success("条件已满足，确认后将真实下载卫星影像（不自动启动提取）")
             else:
                 st.warning("条件未满足，暂不可执行")
                 for _b in _gee_plan.get("blockers") or []:
@@ -2980,7 +2982,7 @@ with st.sidebar:
             _gc1, _gc2 = st.columns(2)
             with _gc1:
                 if st.button(
-                    "确认执行下载",
+                    "确认下载影像",
                     key="confirm_gee_plan_btn",
                     type="primary",
                     use_container_width=True,
@@ -3000,16 +3002,16 @@ with st.sidebar:
                     )
                     st.rerun()
             with _gc2:
-                if st.button("取消下载计划", key="cancel_gee_plan_btn", use_container_width=True):
+                if st.button("取消计划", key="cancel_gee_plan_btn", use_container_width=True):
                     st.session_state.pop("_gee_pending_plan", None)
                     st.session_state.pop("_gee_plan_confirmed", None)
                     st.session_state.pop("_gee_plan_notice", None)
                     st.rerun()
 
-    # 端到端潮滩分析 Workflow：先计划后确认（父级确认门闩）
+    # 端到端一键潮滩分析：先计划后确认（父级确认门闩）
     _wf_plan = st.session_state.get("_workflow_pending_plan")
     if isinstance(_wf_plan, dict) and not st.session_state.is_running:
-        sbui.section("潮滩分析 Workflow")
+        sbui.section("一键潮滩分析")
         with st.container(border=True):
             import workflow_orchestrator as _wo
 
@@ -3030,21 +3032,21 @@ with st.sidebar:
             st.caption(
                 f"任务 `{_wf_plan.get('task_id') or '—'}` · "
                 f"{(_wf_plan.get('context') or {}).get('target_year')} 年潮滩"
-                + (f" · 基线 {(_wf_plan.get('context') or {}).get('baseline_year')}" if (_wf_plan.get('context') or {}).get('baseline_year') else "")
+                + (f" · 历史对比 {(_wf_plan.get('context') or {}).get('baseline_year')}" if (_wf_plan.get('context') or {}).get('baseline_year') else "")
             )
             _wf_steps = _wf_plan.get("steps") or []
             st.markdown(
                 "\n".join(
                     f"- {'必' if s.get('required') else '选'} · "
-                    f"{_wo.TOOL_LABELS.get(s.get('tool'), s.get('tool'))}"
-                    f"（{s.get('status') or 'PENDING'}）"
+                    f"{uil.get_tool_label(s.get('tool'))}"
+                    f"（{uil.get_status_label(s.get('status') or 'PENDING')}）"
                     for s in _wf_steps
                 )
             )
             _wfc1, _wfc2 = st.columns(2)
             with _wfc1:
                 if st.button(
-                    "确认执行 Workflow",
+                    "确认执行一键分析",
                     key="confirm_workflow_btn",
                     type="primary",
                     use_container_width=True,
@@ -3052,7 +3054,7 @@ with st.sidebar:
                 ):
                     _ok, _cerr = _wo.confirm_workflow(st.session_state, _wf_id)
                     if not _ok:
-                        st.warning(_cerr or "Workflow 确认失败。")
+                        st.warning(_cerr or "一键分析确认失败。")
                         st.rerun()
                     queue_agent_command(
                         st.session_state,
@@ -3062,7 +3064,7 @@ with st.sidebar:
                     )
                     st.rerun()
             with _wfc2:
-                if st.button("取消 Workflow", key="cancel_workflow_btn", use_container_width=True):
+                if st.button("取消一键分析", key="cancel_workflow_btn", use_container_width=True):
                     st.session_state.pop("_workflow_pending_plan", None)
                     st.session_state.pop("_workflow_plan_confirmed", None)
                     st.session_state.pop("_workflow_notice", None)
@@ -3073,7 +3075,7 @@ with st.sidebar:
     if isinstance(_pending_heavy, dict) and not st.session_state.is_running:
         sbui.section("待确认操作")
         with st.container(border=True):
-            _h_label = _pending_heavy.get("label") or _pending_heavy.get("action_type") or "推理任务"
+            _h_label = _pending_heavy.get("label") or _pending_heavy.get("action_type") or "潮滩智能提取"
             _h_task = _pending_heavy.get("task") or "—"
             st.warning(f"Agent 请求执行 **{_h_label}**（任务 `{_h_task}`），需要你确认后才会启动。")
             _hc1, _hc2 = st.columns(2)
@@ -3095,7 +3097,7 @@ with st.sidebar:
                     st.rerun()
 
     if _m5_res and (not selected_task or _m5_res.get("target_roi") == selected_task):
-        sbui.section("M5 告警")
+        sbui.section("潮滩变化分析结果")
         with st.container(border=True):
             _lvl = _m5_res.get("alert_level", "GREEN")
             _msg = _m5_res.get("diagnostic_message", "")
@@ -3109,7 +3111,7 @@ with st.sidebar:
             _ae = _qm.get("area_evolution") or {}
             _ct = _qm.get("centroid_trajectory") or {}
             st.caption(
-                f"基线 {_m5_res.get('baseline_task') or '—'} · "
+                f"历史对比成果 {_m5_res.get('baseline_task') or '—'} · "
                 f"面积 {_ae.get('baseline_area_km2', '?')}→{_ae.get('current_area_km2', '?')} km² "
                 f"({_ae.get('change_rate_percentage', '?')}%) · "
                 f"漂移 {_ct.get('drift_distance_meters', '?')} m"
@@ -3125,7 +3127,7 @@ with st.sidebar:
                     _loss_p
                     and str(_loss_p) != "None"
                     and os.path.isfile(str(_loss_p))
-                    and st.button("加载萎缩区", key="load_m5_loss", use_container_width=True)
+                    and st.button("加载变化区域（萎缩）", key="load_m5_loss", use_container_width=True)
                 ):
                     st.session_state.asset_override = _loss_p
                     st.session_state._asset_pinned = True
@@ -3139,7 +3141,7 @@ with st.sidebar:
                     _silt_p
                     and str(_silt_p) != "None"
                     and os.path.isfile(str(_silt_p))
-                    and st.button("加载淤积区", key="load_m5_silt", use_container_width=True)
+                    and st.button("加载变化区域（淤积）", key="load_m5_silt", use_container_width=True)
                 ):
                     st.session_state.asset_override = _silt_p
                     st.session_state._asset_pinned = True
@@ -3149,7 +3151,7 @@ with st.sidebar:
                     st.session_state._globe_rev = int(st.session_state.get("_globe_rev", 0)) + 1
                     st.rerun()
             with _mc3:
-                if st.button("清除 M5", key="clear_m5_report", use_container_width=True):
+                if st.button("清除变化分析结果", key="clear_m5_report", use_container_width=True):
                     st.session_state.pop("m5_report", None)
                     st.rerun()
 
@@ -3166,18 +3168,18 @@ with st.sidebar:
 
     _e1_res = st.session_state.get("e1_report")
     if _e1_res and (not selected_task or _e1_res.get("roi_name") == selected_task):
-        sbui.section("E1 诊断")
+        sbui.section("潮滩精度评价结果")
         with st.container(border=True):
             _comps = _e1_res.get("comparisons") or {}
             _rows = []
             _heat_path = None
             for _pair, _m in _comps.items():
                 if "error" in _m:
-                    _rows.append({"对比组": _pair, "IoU": "ERR", "交集 km²": "-"})
+                    _rows.append({"对比数据": _pair, "交并比 (IoU)": "ERR", "交集 km²": "-"})
                     continue
                 _rows.append({
-                    "对比组": _pair,
-                    "IoU": _m.get("jaccard_iou", "-"),
+                    "对比数据": _pair,
+                    "交并比 (IoU)": _m.get("jaccard_iou", "-"),
                     "交集 km²": _m.get("intersection_km2", "-"),
                 })
                 _maps = (_m.get("causal_analysis") or {}).get("disagreement_maps") or {}
@@ -3198,10 +3200,10 @@ with st.sidebar:
                     st.session_state._globe_rev = int(st.session_state.get("_globe_rev", 0)) + 1
                     st.rerun()
             with _e1c2:
-                if st.button("清除 E1", key="clear_e1_report", use_container_width=True):
+                if st.button("清除精度评价结果", key="clear_e1_report", use_container_width=True):
                     st.session_state.pop("e1_report", None)
                     st.rerun()
-            st.checkbox("球面叠加 E1 图层", key="globe_show_e1")
+            st.checkbox("球面叠加精度评价图层", key="globe_show_e1")
             with st.expander("详细报告", expanded=False):
                 _md_path = _e1_res.get("report_md_path") or ""
                 if _md_path and os.path.isfile(_md_path):
@@ -3219,26 +3221,26 @@ with st.sidebar:
 
     if use_gee_download:
         m4_run_btn = st.button(
-            "启动 GEE 下载",
+            "开始获取影像",
             type="primary",
             use_container_width=True,
             disabled=st.session_state.is_running,
         )
     elif adaptive_mode:
         tune_btn = st.button(
-            "运行 AutoTune",
+            "开始参数优化",
             type="primary",
             use_container_width=True,
             disabled=st.session_state.is_running or not _autotune_ready,
         )
     elif cache_hit and not force_rerun:
         run_btn = st.button(
-            "加载缓存成果",
+            "加载已有成果",
             type="primary",
             use_container_width=True,
         )
     else:
-        _run_label = "运行指数推理" if use_index_mode else "运行模型推理"
+        _run_label = "开始指数法提取" if use_index_mode else "开始模型提取"
         run_btn = st.button(
             _run_label,
             type="primary",
@@ -3267,7 +3269,7 @@ with st.sidebar:
     if tune_btn and _autotune_ready and _ref_id:
         _aoi_path = (task_aoi_shp or "").strip()
         _aoi_use = _aoi_path if _aoi_path and os.path.isfile(_aoi_path) else None
-        _tl_add(selected_task or "unknown", "QUEUED", "AutoTune 任务已入队",
+        _tl_add(selected_task or "unknown", "QUEUED", "参数优化任务已入队",
                 status="QUEUED", tool="run_autotune")
         st.session_state.pending_autotune = {
             "task": selected_task,
@@ -3285,9 +3287,9 @@ with st.sidebar:
         elif not m4_bands:
             st.error("请至少选择一个导出波段。")
         elif not os.path.isfile(m4_roi_path):
-            st.error(f"ROI 矢量不存在: {m4_roi_path}")
+            st.error(f"研究区域矢量不存在: {m4_roi_path}")
         else:
-            _tl_add(selected_task or "unknown", "QUEUED", "GEE 下载任务已入队",
+            _tl_add(selected_task or "unknown", "QUEUED", "影像获取任务已入队",
                     status="QUEUED", tool="run_m4")
             st.session_state.pending_task = {
                 "task": selected_task,
@@ -3326,7 +3328,7 @@ with st.sidebar:
                     artifacts=[os.path.basename(str(cache_hit["file_path"]))])
             st.rerun()
         else:
-            _tl_add(selected_task or "unknown", "QUEUED", "推理任务已入队",
+            _tl_add(selected_task or "unknown", "QUEUED", "提取任务已入队",
                     status="QUEUED", tool="run_pipeline")
             st.session_state.pending_task = {
                 "task": selected_task,
@@ -3340,8 +3342,8 @@ with st.sidebar:
             st.session_state.stop_requested = False
             st.rerun()
 
-    # ---- 能力状态面板（B 阶段）：折叠、可刷新、不含敏感路径 ----
-    with st.expander("能力状态", expanded=False):
+    # ---- 功能状态面板（B 阶段）：折叠、可刷新、不含敏感路径 ----
+    with st.expander("功能状态", expanded=False):
         try:
             import capability_registry as _cap
         except Exception:
@@ -3366,22 +3368,22 @@ with st.sidebar:
                 st.session_state._capability_ctx_sig = _cap_sig
             _cap_c1, _cap_c2 = st.columns([3, 1])
             with _cap_c1:
-                st.caption("动态能力状态（不含敏感路径）")
+                st.caption("动态功能状态（不含敏感路径）")
             with _cap_c2:
                 if st.button("刷新", key="cap_refresh_btn", use_container_width=True):
                     _cap_reg.bump()
                     st.rerun()
             _status_labels = {
                 "AVAILABLE": "🟢 可用",
-                "CONDITIONAL": "🟡 受限",
-                "BLOCKED": "🔴 阻断",
-                "UNAVAILABLE": "⚪ 未启用",
-                "UNKNOWN": "❔ 未知",
+                "CONDITIONAL": "🟡 条件可用",
+                "BLOCKED": "🔴 暂不可用",
+                "UNAVAILABLE": "⚪ 不可用",
+                "UNKNOWN": "❔ 状态未知",
             }
             for _cid in _cap_reg.ids():
                 _cst = _cap_reg.check(_cid)
                 st.markdown(
-                    f"**{_cst.label}** · {_status_labels.get(_cst.status, _cst.status)}"
+                    f"**{uil.get_capability_label(_cid)}** · {_status_labels.get(_cst.status, _cst.status)}"
                 )
                 st.caption(_cst.summary)
 
@@ -3718,7 +3720,7 @@ with col_map:
             layer_label = os.path.splitext(os.path.basename(map_display_path))[0]
             _rop = st.session_state.get("result_overlay_opacity_pct", 50) / 100.0
             _ok, _rerr = _add_result_to_map(
-                m, map_display_path, f"Result: {layer_label}", opacity=_rop
+                m, map_display_path, f"成果: {layer_label}", opacity=_rop
             )
             if not _ok:
                 raster_load_error = _rerr
@@ -3756,9 +3758,9 @@ with col_map:
                 icon="✅",
             )
         elif map_display_path:
-            st.toast("⚡ 资产路径已更新，但未能解析图层范围", icon="⚠️")
+            st.toast("⚡ 成果路径已更新，但未能解析图层范围", icon="⚠️")
         else:
-            st.toast("⚡ 缓存资产已加载到地图", icon="✅")
+            st.toast("⚡ 已有成果已加载到地图", icon="✅")
 
     if raster_load_error and not st.session_state.asset_just_loaded:
         st.toast(f"成果图层加载异常: {raster_load_error}", icon="⚠️")
@@ -3784,15 +3786,14 @@ with col_side:
     st.markdown('<div class="cstf-copilot-dock">', unsafe_allow_html=True)
     st.markdown('<div class="cockpit-copilot-zone-start"></div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="deck-section-title">🤖 CSTF-Copilot</div>',
+        '<div class="deck-section-title">🤖 智能分析助手</div>',
         unsafe_allow_html=True,
     )
 
     if "messages" not in st.session_state:
         st.session_state.messages = [
-            {"role": "assistant", "content": "您好！我是 CSTF 智能体。请下达调度指令或上传截图让我分析。"}
+            {"role": "assistant", "content": "您好！我是智能分析助手。请告诉我您想分析的区域和年份，或上传截图让我识别。"}
         ]
-
     st.markdown('<div class="cockpit-chat-anchor"></div>', unsafe_allow_html=True)
     chat_box = st.container(border=True)
 
@@ -3819,7 +3820,7 @@ with col_side:
         with _input_cols[0]:
             prompt = st.text_input(
                 "chat_input",
-                placeholder="问问 CSTF-Copilot…",
+                placeholder="问问智能分析助手…",
                 label_visibility="collapsed",
             )
         with _input_cols[1]:
@@ -3895,7 +3896,7 @@ with col_side:
                 setTimeout(() => {
                   const chatInput =
                     doc.querySelector('input[aria-label="chat_input"]') ||
-                    doc.querySelector('input[placeholder*="CSTF-Copilot"]');
+                    doc.querySelector('input[placeholder*="智能分析助手"]');
                   if (chatInput) chatInput.focus();
                 }, 60);
               });
@@ -3984,7 +3985,7 @@ if _user_submitted:
                     ):
                         if not _pending_m5.get("ready"):
                             _block = "；".join(_pending_m5.get("blockers") or ["条件未满足"])
-                            _msg = f"当前 M5 计划尚不可执行：{_block}"
+                            _msg = f"当前潮滩变化分析计划尚不可执行：{_block}"
                             st.warning(_msg)
                             st.session_state.messages.append(
                                 {"role": "assistant", "content": _msg}
@@ -4001,7 +4002,7 @@ if _user_submitted:
                                 },
                             )
                             _msg = (
-                                "已确认 M5 执行计划，正在调用现有 M5 引擎。"
+                                "已确认潮滩变化分析计划，正在调用现有分析引擎。"
                                 "完成后将根据真实报告与差异面回复。"
                             )
                             st.success(_msg)
@@ -4022,7 +4023,7 @@ if _user_submitted:
                         if not isinstance(_pending_m5_chk, dict) or "e1" in (prompt or "").lower() or "一致" in (prompt or ""):
                             if not _pending_e1.get("ready"):
                                 _block = "；".join(_pending_e1.get("blockers") or ["条件未满足"])
-                                _msg = f"当前 E1 计划尚不可执行：{_block}"
+                                _msg = f"当前潮滩精度评价计划尚不可执行：{_block}"
                                 st.warning(_msg)
                                 st.session_state.messages.append(
                                     {"role": "assistant", "content": _msg}
@@ -4039,8 +4040,8 @@ if _user_submitted:
                                     },
                                 )
                                 _msg = (
-                                    "已确认 E1 执行计划，正在调用现有 E1 引擎。"
-                                    "完成后将根据真实报告回复 IoU 等指标。"
+                                    "已确认潮滩精度评价计划，正在调用现有评价引擎。"
+                                    "完成后将根据真实报告回复交并比等指标。"
                                 )
                                 st.success(_msg)
                                 st.session_state.messages.append(
@@ -4240,14 +4241,14 @@ def finalize_background_pipeline():
                 st.session_state._inference_last_summary = summary
             except Exception:
                 pass
-            _tl_add(_tl_task, "INFERENCE", "深度学习推理完成",
+            _tl_add(_tl_task, "INFERENCE", "智能提取完成",
                     status="SUCCEEDED", tool="run_inference")
-            _tl_add(_tl_task, "POST_PROCESS", "双重约束后处理完成（Final TIF/SHP）",
+            _tl_add(_tl_task, "POST_PROCESS", "成果生成完成（潮滩栅格/矢量成果）",
                     status="SUCCEEDED", tool="post_engine")
-            _tl_add(_tl_task, "VERIFY", "成果校验通过（Final TIF/SHP）",
+            _tl_add(_tl_task, "VERIFY", "成果校验通过（潮滩栅格/矢量成果）",
                     status="SUCCEEDED", tool="verify_inference")
             if inference_asset_id:
-                _tl_add(_tl_task, "REGISTER", "预测资产已登记",
+                _tl_add(_tl_task, "REGISTER", "提取成果已登记",
                         status="SUCCEEDED", tool="register_inference",
                         artifacts=[str(inference_asset_id)])
             # 地图加载（不重建 iframe / 不重置相机）：成果路径已由校验确认
@@ -4264,7 +4265,7 @@ def finalize_background_pipeline():
                 _tl_add(_tl_task, "MAP", "成果已加载到地图",
                         status="SUCCEEDED", tool="map_load",
                         artifacts=[os.path.basename(str(_map_path))])
-            _tl_add(_tl_task, "REPORT", "结果已回复 Copilot",
+            _tl_add(_tl_task, "REPORT", "结果已回复智能助手",
                     status="SUCCEEDED", tool="report")
             # 动态能力状态刷新（含深度学习推理能力）
             try:
@@ -4276,8 +4277,8 @@ def finalize_background_pipeline():
             except Exception:
                 pass
         else:
-            _err = (inference_result or {}).get("error") or "推理失败（详见终端日志）"
-            _tl_add(_tl_task, "INFERENCE", f"推理未完成：{_err[:60]}",
+            _err = (inference_result or {}).get("error") or "提取失败（详见终端日志）"
+            _tl_add(_tl_task, "INFERENCE", f"提取未完成：{_err[:60]}",
                     status="FAILED", error=_err, tool="run_inference")
     # ---- GEE 影像下载可信执行闭环收尾 ----
     gee_result = shared.get("gee_result") if shared else None
@@ -4297,15 +4298,15 @@ def finalize_background_pipeline():
                 st.session_state._gee_last_summary = summary
             except Exception:
                 pass
-            _tl_add(_tl_task, "GEE_EXPORT", "GEE 影像下载完成",
+            _tl_add(_tl_task, "GEE_EXPORT", "影像获取完成",
                     status="SUCCEEDED", tool="run_gee_download")
-            _tl_add(_tl_task, "VERIFY", "数据集校验通过",
+            _tl_add(_tl_task, "VERIFY", "影像校验通过",
                     status="SUCCEEDED", tool="verify_gee")
             if gee_dataset_id:
-                _tl_add(_tl_task, "REGISTER", "数据集资产已登记",
+                _tl_add(_tl_task, "REGISTER", "影像数据已登记",
                         status="SUCCEEDED", tool="register_gee",
                         artifacts=[str(gee_dataset_id)])
-            _tl_add(_tl_task, "REPORT", "结果已回复 Copilot",
+            _tl_add(_tl_task, "REPORT", "结果已回复智能助手",
                     status="SUCCEEDED", tool="report")
             # 动态能力状态刷新（GEE 能力 / 推理能力 scene_count 感知）
             try:
@@ -4317,8 +4318,8 @@ def finalize_background_pipeline():
             except Exception:
                 pass
         else:
-            _err = (gee_result or {}).get("error") or "GEE 下载失败（详见终端日志）"
-            _tl_add(_tl_task, "GEE_EXPORT", f"下载未完成：{_err[:60]}",
+            _err = (gee_result or {}).get("error") or "影像获取失败（详见终端日志）"
+            _tl_add(_tl_task, "GEE_EXPORT", f"获取未完成：{_err[:60]}",
                     status="FAILED", error=_err, tool="run_gee_download")
     if m5_report:
         st.session_state.m5_report = m5_report
@@ -4326,7 +4327,7 @@ def finalize_background_pipeline():
         if _lvl in ("RED", "YELLOW"):
             try:
                 st.toast(
-                    f"M5 告警 [{_lvl}]: {m5_report.get('diagnostic_message', '')[:80]}",
+                    f"变化分析告警 [{_lvl}]: {m5_report.get('diagnostic_message', '')[:80]}",
                     icon="🚨" if _lvl == "RED" else "⚠️",
                 )
             except Exception:
@@ -4364,7 +4365,7 @@ def finalize_background_pipeline():
     if e1_report:
         st.session_state.e1_report = e1_report
         try:
-            st.toast("E1 多源一致性诊断已完成", icon="📊")
+            st.toast("精度评价已完成", icon="📊")
         except Exception:
             pass
         # 独立 E1 闭环：真实指标写回 Copilot，并优先加载分歧热力图
@@ -4420,7 +4421,7 @@ def finalize_background_pipeline():
         )
         if success:
             _tl_add(_tl_task, "WORKFLOW",
-                    f"Workflow 完成（{wf_status}）",
+                    f"一键潮滩分析完成（{uil.get_status_label(wf_status)}）",
                     status="SUCCEEDED", progress=100,
                     tool="run_workflow",
                     artifacts=[str(workflow_result.get("workflow_id") or "")])
@@ -4431,7 +4432,7 @@ def finalize_background_pipeline():
             except Exception:
                 pass
         else:
-            _tl_add(_tl_task, "WORKFLOW", f"Workflow 未完成（{wf_status}）",
+            _tl_add(_tl_task, "WORKFLOW", f"一键潮滩分析未完成（{uil.get_status_label(wf_status)}）",
                     status="FAILED", error=step_line, tool="run_workflow")
     # 推理闭环已在上面自行登记 EXECUTE/REGISTER/VERIFY/MAP/REPORT，这里避免重复
     _inference_handled = inference_result is not None or inference_asset_id is not None
@@ -4447,10 +4448,10 @@ def finalize_background_pipeline():
                     status="SUCCEEDED", tool="register_asset",
                     artifacts=[os.path.basename(str(asset_path))])
         if m5_report:
-            _tl_add(_tl_task, "VERIFY", "M5 变化检测校验通过",
+            _tl_add(_tl_task, "VERIFY", "变化分析校验通过",
                     status="SUCCEEDED", tool="verify_m5")
         if e1_report:
-            _tl_add(_tl_task, "VERIFY", "E1 多源一致性校验通过",
+            _tl_add(_tl_task, "VERIFY", "精度评价校验通过",
                     status="SUCCEEDED", tool="verify_e1")
         try:
             st.balloons()
@@ -4491,7 +4492,7 @@ def run_autotune_sync(ctx, shared, stop_event):
             shared["status"] = (kind, text)
 
     push_progress(0)
-    push_status("info", "🔬 自适应优化启动…")
+    push_status("info", "🔬 参数自动优化启动…")
 
     task = ctx["task"]
     task_options_local = ctx["task_options"]
@@ -4508,7 +4509,7 @@ def run_autotune_sync(ctx, shared, stop_event):
 
     push_log(f"TASK: {actual_task} | REF: {ctx['reference_id']} | OBJ: {ctx['objective']}")
     push_progress(80)
-    push_status("info", "🔬 正在执行自适应参数搜索…")
+    push_status("info", "🔬 正在搜索最优参数…")
 
     try:
         import auto_tune
@@ -4542,18 +4543,18 @@ def run_autotune_sync(ctx, shared, stop_event):
             _run_e1_phase(ctx, shared, result["best_shp_path"], actual_task, push_log, check_stop)
             push_status(
                 "success",
-                f"🏆 最优: P={result['best_prob']:.2f} C={result['best_cnt']} | "
-                f"IoU={result['best_iou'] * 100:.1f}% F1={result['best_f1'] * 100:.1f}%",
+                f"🏆 最优参数: P={result['best_prob']:.2f} C={result['best_cnt']} | "
+                f"交并比={result['best_iou'] * 100:.1f}% F1={result['best_f1'] * 100:.1f}%",
             )
             with shared["lock"]:
                 shared["asset_path"] = result["best_shp_path"]
                 shared["autotune_result"] = result
             return True
-        push_status("warning", "自适应优化未能得出结果（可能被中断或无有效真值像元）。")
+        push_status("warning", "参数优化未能得出结果（可能被中断或无有效真值像元）。")
         return False
     except Exception as e:
         push_log(f"[ERROR] {e}")
-        push_status("error", f"自适应优化异常: {e}")
+        push_status("error", f"参数优化异常: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -4590,13 +4591,13 @@ def maybe_start_pipeline_thread():
 
         stop_ev = threading.Event()
         st.session_state.pipeline_stop_event = stop_ev
-        _tl_add(at_info["task"], "EXECUTE", "AutoTune 参数搜索已启动",
+        _tl_add(at_info["task"], "EXECUTE", "参数自动优化已启动",
                 status="RUNNING", tool="run_autotune", progress=0)
         shared = {
             "lock": threading.Lock(),
             "log_lines": [],
             "progress": 0,
-            "status": ("info", "🔬 正在启动自适应优化线程…"),
+            "status": ("info", "🔬 正在启动参数优化线程…"),
             "done": False,
             "success": False,
             "asset_path": None,
@@ -4642,8 +4643,11 @@ def maybe_start_pipeline_thread():
 
     stop_ev = threading.Event()
     st.session_state.pipeline_stop_event = stop_ev
+    _mode_txt = {"m4": "获取卫星影像", "index": "指数法提取", "dl": "深度学习提取"}.get(
+        task_info.get("mode"), task_info.get("mode") or "提取"
+    )
     _tl_add(task_info.get("task") or "unknown", "EXECUTE",
-            f"任务已启动（{task_info.get('mode', 'dl')}）",
+            f"任务已启动（{_mode_txt}）",
             status="RUNNING", tool="run_pipeline", progress=0)
     shared = {
         "lock": threading.Lock(),
@@ -4662,9 +4666,9 @@ def maybe_start_pipeline_thread():
 
     # 本地潮滩推理可信执行闭环（不进入 run_pipeline_sync 旧路径）
     if task_info.get("inference_plan") or task_info.get("mode") == "dl_inference":
-        shared["status"] = ("info", "正在启动本地潮滩推理（可信执行闭环）…")
+        shared["status"] = ("info", "正在启动潮滩智能提取…")
         _tl_add(task_info.get("task") or "unknown", "INFERENCE",
-                "本地潮滩推理已启动", status="RUNNING", tool="run_inference", progress=0)
+                "潮滩智能提取已启动", status="RUNNING", tool="run_inference", progress=0)
         ctx = {
             "root_dir": root_dir,
             "final_root": final_root,
@@ -4684,9 +4688,9 @@ def maybe_start_pipeline_thread():
 
     # GEE 影像下载可信执行闭环（不跑推理）
     if task_info.get("mode") == "gee":
-        shared["status"] = ("info", "正在启动 GEE 影像下载（可信执行闭环）…")
+        shared["status"] = ("info", "正在启动影像获取…")
         _tl_add(task_info.get("task") or "unknown", "GEE_EXPORT",
-                "GEE 下载已启动", status="RUNNING", tool="run_gee_download", progress=0)
+                "影像获取已启动", status="RUNNING", tool="run_gee_download", progress=0)
         ctx = {
             "root_dir": root_dir,
             "task": task_info.get("task"),
@@ -4701,7 +4705,7 @@ def maybe_start_pipeline_thread():
 
     # 独立 M5 闭环（不跑推理）
     if task_info.get("mode") == "m5":
-        shared["status"] = ("info", "正在启动 M5 变化检测…")
+        shared["status"] = ("info", "正在启动潮滩变化分析…")
         ctx = {
             "root_dir": root_dir,
             "final_root": final_root,
@@ -4721,7 +4725,7 @@ def maybe_start_pipeline_thread():
 
     # 独立 E1 闭环（不跑推理）
     if task_info.get("mode") == "e1":
-        shared["status"] = ("info", "正在启动 E1 多源一致性诊断…")
+        shared["status"] = ("info", "正在启动潮滩精度评价…")
         shared["e1_verification"] = None
         ctx = {
             "root_dir": root_dir,
@@ -4747,7 +4751,7 @@ def maybe_start_pipeline_thread():
 
     # 端到端潮滩分析 Workflow（复用子闭环编排）
     if task_info.get("mode") == "workflow":
-        shared["status"] = ("info", "正在启动潮滩分析 Workflow（GEE→推理→E1/M5→PDF）…")
+        shared["status"] = ("info", "正在启动一键潮滩分析（获取影像→提取→评价/变化→报告）…")
         ctx = {
             "root_dir": root_dir,
             "final_root": final_root,
@@ -4845,14 +4849,14 @@ def _pipeline_monitor_inner():
         elif st.session_state.is_running:
             st.caption("任务启动中…")
         else:
-            st.caption("暂无日志。运行推理或 GEE 下载后，终端输出将显示在此处。")
+            st.caption("暂无日志。运行提取或影像获取后，终端输出将显示在此处。")
 
     # ---- Phase C: 任务时间线（倒序事件 + 阶段/状态徽章）----
     try:
         _tl = _get_task_timeline()
         _tl_events = _tl.events(limit=12)
         if _tl_events:
-            with st.expander(f"📋 任务时间线（{len(_tl_events)}）", expanded=False):
+            with st.expander(f"📋 任务进度（{len(_tl_events)}）", expanded=False):
                 if _tl.restored_from == "disk":
                     st.caption("历史记录（进程重启后恢复），非实时状态")
                 _status_icons = {
@@ -4865,16 +4869,16 @@ def _pipeline_monitor_inner():
                     _icon = _status_icons.get(_ev.status, "•")
                     _pct = f" {_ev.progress}%" if _ev.progress is not None else ""
                     st.markdown(
-                        f"`{_ev.updated_at[11:19]}` {_icon} **{_ev.phase}**/"
-                        f"{_ev.status} {_ev.message}{_pct}"
+                        f"`{_ev.updated_at[11:19]}` {_icon} **{uil.get_phase_label(_ev.phase)}**/"
+                        f"{uil.get_status_label(_ev.status)} {_ev.message}{_pct}"
                     )
                 # ---- Phase E: PDF 报告入口（任务完成后生成）----
                 _tl_col1, _tl_col2 = st.columns(2)
                 with _tl_col1:
-                    if st.button("📄 生成 PDF 报告", key="_btn_gen_pdf_report"):
+                    if st.button("📄 生成成果报告", key="_btn_gen_pdf_report"):
                         _build_pdf_report()
                 with _tl_col2:
-                    if st.button("🗺️ 生成成果报告", key="_btn_gen_asset_report"):
+                    if st.button("🗺️ 生成监测报告", key="_btn_gen_asset_report"):
                         _build_asset_report()
                     _amsg = st.session_state.get("_asset_report_msg")
                     if _amsg:
@@ -4958,7 +4962,7 @@ def _build_pdf_report():
         _tl = _get_task_timeline()
         _events = _tl.events(limit=50)
         if not _events:
-            st.warning("无任务时间线事件，无法生成报告")
+            st.warning("无任务进度记录，无法生成报告")
             return
         _last = _events[-1]
         _task_id = _last.task_id or "task_unknown"
@@ -4991,12 +4995,12 @@ def _build_pdf_report():
             _task_ctx, capabilities=_caps, timeline=_events, assets=_assets,
         )
         if _res.success and _res.report_path:
-            st.success("✅ PDF 报告已生成")
+            st.success("✅ 成果报告已生成")
             st.markdown(f"`{_res.report_path}`")
             try:
                 with open(_res.report_path, "rb") as _pf:
                     st.download_button(
-                        "⬇️ 下载 PDF 报告",
+                        "⬇️ 下载成果报告",
                         _pf.read(),
                         file_name=os.path.basename(_res.report_path),
                         mime="application/pdf",
@@ -5005,11 +5009,11 @@ def _build_pdf_report():
             except Exception:
                 pass
         else:
-            st.warning(f"PDF 报告生成失败：{_res.error or '未知错误'}")
+            st.warning(f"成果报告生成失败：{_res.error or '未知错误'}")
         for _w in (_res.warnings or []):
             st.caption("· " + _w)
     except Exception as _re:
-        st.warning(f"PDF 报告生成异常：{_re}")
+        st.warning(f"成果报告生成异常：{_re}")
 
 
 _PIPELINE_USE_FRAGMENT = False

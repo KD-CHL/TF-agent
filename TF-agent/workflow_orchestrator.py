@@ -70,11 +70,11 @@ TOOL_M5_CHANGE = "m5_change_detection"
 TOOL_PDF_REPORT = "pdf_report"
 
 TOOL_LABELS = {
-    TOOL_GEE_DOWNLOAD: "GEE 影像下载",
-    TOOL_LOCAL_INFERENCE: "本地潮滩推理",
-    TOOL_E1_QUALITY: "E1 多源一致性评价",
-    TOOL_M5_CHANGE: "M5 时空变化检测",
-    TOOL_PDF_REPORT: "PDF 成果报告",
+    TOOL_GEE_DOWNLOAD: "获取卫星影像",
+    TOOL_LOCAL_INFERENCE: "潮滩智能提取",
+    TOOL_E1_QUALITY: "潮滩精度评价",
+    TOOL_M5_CHANGE: "潮滩变化分析",
+    TOOL_PDF_REPORT: "成果报告",
 }
 
 # 重型步骤：同一时刻只允许一个 RUNNING
@@ -450,12 +450,12 @@ def validate_analysis_workflow(
 def format_workflow_plan_for_user(workflow: Optional[Dict[str, Any]]) -> str:
     """面向用户的「潮滩分析计划」文本（只含真实信息）。"""
     if not workflow:
-        return "尚未生成潮滩分析 Workflow。"
-    lines = ["## 潮滩分析 Workflow · 执行计划", ""]
+        return "尚未生成一键潮滩分析计划。"
+    lines = ["## 一键潮滩分析 · 执行计划", ""]
     if workflow.get("status") in (WF_PENDING, WF_CONFIRMED):
         lines.append("**状态：待确认**（请回复「确认」或点击确认按钮后开始）")
     elif workflow.get("status") == WF_RUNNING:
-        lines.append("**状态：执行中**")
+        lines.append("**状态：处理中**")
     elif workflow.get("status") == WF_PAUSED:
         lines.append("**状态：已暂停（参数变化，需重新确认）**")
     else:
@@ -494,7 +494,7 @@ def format_workflow_plan_for_user(workflow: Optional[Dict[str, Any]]) -> str:
         lines.append(f"{i}. [{'必' if s.get('required') else '选'}] "
                      f"{TOOL_LABELS.get(tool, tool)}（{cond_txt}）")
     lines.append("")
-    lines.append("确认后将按依赖顺序真实调用现有闭环（GEE→推理→E1/M5→PDF），"
+    lines.append("确认后将按依赖顺序真实调用现有闭环（获取影像→提取→评价/变化→报告），"
                  "每一步仅基于真实工具结果登记资产与血缘。")
     return "\n".join(lines)
 
@@ -1534,7 +1534,19 @@ def summarize_workflow_result_for_chat(
     status = status or workflow.get("status") or WF_PENDING
     ctx = workflow.get("context") or {}
     task_id = str(workflow.get("task_id") or "")
-    lines = [f"## 潮滩分析 Workflow · {status}", ""]
+    try:
+        from ui_labels import get_status_label as _sl
+
+        def _status_label(v: str) -> str:
+            return _sl(v)
+
+        status_txt = _status_label(status)
+    except Exception:  # noqa: BLE001
+        def _status_label(v: str) -> str:  # type: ignore[misc]
+            return str(v)
+
+        status_txt = _status_label(status)
+    lines = [f"## 一键潮滩分析 · {status_txt}", ""]
     lines.append(f"- Workflow ID：`{workflow.get('workflow_id') or '—'}`")
     lines.append(f"- 任务：`{task_id or '—'}`")
     lines.append(
@@ -1554,7 +1566,7 @@ def summarize_workflow_result_for_chat(
             r = s.get("result") or {}
             metrics = r.get("metrics") or {}
             if s.get("tool") == TOOL_GEE_DOWNLOAD:
-                extra = f"（scene_count={metrics.get('scene_count', '?')} 景）"
+                extra = f"（共 {metrics.get('scene_count', '?')} 景）"
             elif s.get("tool") == TOOL_LOCAL_INFERENCE:
                 extra = f"（耗时 {metrics.get('elapsed_seconds', '?')}s）"
             elif s.get("tool") == TOOL_PDF_REPORT:
@@ -1569,7 +1581,7 @@ def summarize_workflow_result_for_chat(
             extra = "（复用既有资产）"
         elif st == STEP_BLOCKED:
             extra = "（被阻塞）"
-        line = f"- {tool}：**{st}**{extra}"
+        line = f"- {tool}：**{_status_label(st)}**{extra}"
         if plan_id:
             line += f" `plan={plan_id[:8]}`"
         if asset_id:
@@ -1585,7 +1597,7 @@ def summarize_workflow_result_for_chat(
     elif status == WF_PAUSED:
         lines.append("任务暂停：参数已变化，请重新确认后继续。")
     lines.append("")
-    lines.append("以上结果均来自本次 Workflow 各步骤的真实工具输出，而非模型臆测。")
+    lines.append("以上结果均来自本次分析各步骤的真实工具输出，而非模型臆测。")
     return "\n".join(lines)
 
 

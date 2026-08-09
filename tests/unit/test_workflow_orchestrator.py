@@ -525,9 +525,9 @@ class TestSummarize(WorkflowOrchestratorTestBase):
         wf = self._build(user_intent={"need_e1": True, "need_m5": True})
         self._run(wf)
         summary = wf["final_result"]["summary"]
-        self.assertIn("SUCCEEDED", summary)
-        self.assertIn("GEE 影像下载", summary)
-        self.assertIn("PDF 成果报告", summary)
+        self.assertIn("已完成", summary)
+        self.assertIn("获取卫星影像", summary)
+        self.assertIn("成果报告", summary)
         self.assertIn("asset_gee_download", summary)
 
     def test_summary_no_llm_forged_success(self):
@@ -539,7 +539,6 @@ class TestSummarize(WorkflowOrchestratorTestBase):
             by_id[sid]["status"] = wo.STEP_BLOCKED
         status = wo._evaluate_workflow_status(wf)
         summary = wo.summarize_workflow_result_for_chat(wf, status)
-        self.assertIn("FAILED", summary)
         self.assertIn("失败", summary)
         self.assertNotIn("全部必需步骤成功", summary)
 
@@ -551,10 +550,10 @@ class TestSummarize(WorkflowOrchestratorTestBase):
     def test_format_plan_for_user(self):
         wf = self._build(user_intent={"need_e1": True, "need_m5": True})
         text = wo.format_workflow_plan_for_user(wf)
-        self.assertIn("潮滩分析 Workflow", text)
+        self.assertIn("一键潮滩分析", text)
         self.assertIn("24quanzhou", text)
-        self.assertIn("GEE 影像下载", text)
-        self.assertIn("PDF 成果报告", text)
+        self.assertIn("获取卫星影像", text)
+        self.assertIn("成果报告", text)
         self.assertIn("2024", text)
 
     def test_summary_failed_uses_real_error(self):

@@ -137,19 +137,19 @@ def build_e1_preflight(
         "prob": prob,
         "cnt": cnt,
         "steps": [
-            "读取当期潮滩 SHP",
-            "解析任务 ROI（可选 AOI）",
-            "调用 e1_engine.run_e1_after_synthesis 做多源像元对比",
+            "读取当期潮滩成果",
+            "解析任务研究区域（可选 AOI）",
+            "运行精度评价，逐像元对比多个产品",
             "校验报告 JSON 与可选热力图",
-            "登记 E1 资产并根据真实指标回复",
+            "保存评价成果并根据真实指标回复",
         ],
     }
 
 
 def format_e1_plan_for_user(plan: Dict[str, Any]) -> str:
     if not plan:
-        return "尚未生成 E1 执行计划。"
-    lines = ["## E1 多源一致性诊断 · 执行计划", ""]
+        return "尚未生成精度评价计划。"
+    lines = ["## 潮滩精度评价 · 执行计划", ""]
     if plan.get("ready"):
         lines.append("**状态：可执行**（请回复「确认」或点击确认按钮后开始）")
     else:
@@ -167,7 +167,7 @@ def format_e1_plan_for_user(plan: Dict[str, Any]) -> str:
     for w in plan.get("warnings") or []:
         lines.append(f"- 注意：{w}")
     lines.append("")
-    lines.append("确认后将真实调用现有 E1 引擎，并根据磁盘报告回复 IoU 等指标。")
+    lines.append("确认后将真实运行精度评价，并根据磁盘报告回复交并比等指标。")
     return "\n".join(lines)
 
 
@@ -242,11 +242,11 @@ def summarize_e1_report_for_chat(
 ) -> str:
     if not report:
         return (
-            "E1 多源一致性诊断未生成有效报告。"
-            "请检查当期 SHP、数据集根目录与参考产品后重试。"
+            "精度评价未生成有效结果。"
+            "请检查当期成果、数据集根目录与参考产品后重试。"
         )
     lines = [
-        "## E1 多源一致性诊断结果（已验证）",
+        "## 潮滩精度评价结果（已验证）",
         "",
         f"- 任务 / ROI：`{report.get('roi_name') or '—'}`",
         f"- 参考产品：`{report.get('reference') or '—'}`",
@@ -258,7 +258,7 @@ def summarize_e1_report_for_chat(
             continue
         iou = m.get("jaccard_iou", "—")
         inter = m.get("intersection_km2", "—")
-        lines.append(f"- `{pair}`：IoU={iou} · 交集 {inter} km²")
+        lines.append(f"- `{pair}`：交并比={iou} · 交集 {inter} km²")
         shown += 1
         if shown >= 8:
             break
@@ -275,7 +275,7 @@ def summarize_e1_report_for_chat(
             f"- 输出校验：{'通过' if verification.get('ok') else '未完全通过'}"
         )
     lines.append("")
-    lines.append("以上指标均来自本次 E1 引擎真实输出，而非模型臆测。")
+    lines.append("以上指标均来自本次精度评价的真实输出，而非模型臆测。")
     return "\n".join(lines)
 
 
@@ -286,7 +286,7 @@ def build_e1_context_for_agent(
     reference: str = "师姐_2020",
     pending_plan: Optional[Dict[str, Any]] = None,
 ) -> str:
-    lines = ["【E1 多源一致性账本】"]
+    lines = ["【潮滩精度评价账本】"]
     lines.append(f"- 当前任务：{current_task or '未选'}")
     lines.append(f"- 参考：{reference or '—'}")
     lines.append(f"- 数据集根：{data_root or '—'}")
