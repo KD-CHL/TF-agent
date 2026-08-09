@@ -291,22 +291,55 @@ class CapabilityRegistry:
         )
 
     def _check_gee_download(self, ctx: Dict[str, Any]) -> CapabilityStatus:
-        reqs = ["GEE 项目配置（环境变量键）", "gee 包可导入"]
-        has_project = _env_key_present("GEE_PROJECT")
+        reqs = ["GEE 项目配置（环境/凭据）", "gee 包可导入"]
         has_gee = _module_importable("gee")
-        if not has_project:
-            return CapabilityStatus(
-                capability_id="gee_download", label="GEE 遥感下载", status=UNAVAILABLE,
-                summary="未配置 GEE 项目（需 GEE_PROJECT）",
-                requirements=reqs, blockers=["缺少 GEE_PROJECT 配置"],
-                recommended_actions=["配置 GEE_PROJECT 环境变量后重启"],
-            )
         if not has_gee:
             return CapabilityStatus(
                 capability_id="gee_download", label="GEE 遥感下载", status=BLOCKED,
                 summary="GEE Python 包不可用",
                 requirements=reqs, blockers=["gee 包不可导入"],
                 recommended_actions=["安装 gee 包"],
+            )
+        # 项目解析：env → 凭据文件 → credentials JSON（与 m4_engine._resolve_ee_project 同语义）
+        project = None
+        for key in ("EE_PROJECT", "GOOGLE_CLOUD_PROJECT", "EARTHENGINE_PROJECT"):
+            v = os.environ.get(key)
+            if v and str(v).strip():
+                project = str(v).strip()
+                break
+        if not project:
+            try:
+                cred_dir = os.path.join(os.path.expanduser("~"), ".config", "earthengine")
+                for fname in ("project", "project_id"):
+                    p = os.path.join(cred_dir, fname)
+                    if os.path.isfile(p):
+                        with open(p, "r", encoding="utf-8") as f:
+                            v = f.read().strip()
+                        if v:
+                            project = v
+                            break
+            except Exception:  # noqa: BLE001
+                project = None
+        if not project:
+            try:
+                cred_path = os.path.join(os.path.expanduser("~"), ".config",
+                                         "earthengine", "credentials")
+                if os.path.isfile(cred_path):
+                    import json
+                    with open(cred_path, "r", encoding="utf-8") as f:
+                        cred = json.load(f)
+                    for key in ("project", "project_id", "cloud_project"):
+                        if cred.get(key):
+                            project = str(cred[key])
+                            break
+            except Exception:  # noqa: BLE001
+                project = None
+        if not project:
+            return CapabilityStatus(
+                capability_id="gee_download", label="GEE 遥感下载", status=UNAVAILABLE,
+                summary="未配置 GEE 项目（env / ~/.config/earthengine）",
+                requirements=reqs, blockers=["缺少 GEE 项目配置"],
+                recommended_actions=["配置 GEE_PROJECT/EE_PROJECT 环境变量或 earthengine 凭据后重启"],
             )
         return CapabilityStatus(
             capability_id="gee_download", label="GEE 遥感下载", status=CONDITIONAL,

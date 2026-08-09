@@ -1538,6 +1538,109 @@ def _inference_worker_entry(ctx, shared, stop_event):
             shared["done"] = True
 
 
+def _gee_worker_entry(ctx, shared, stop_event):
+    """GEE 影像下载可信执行闭环后台线程（B 阶段）。
+
+    顺序：真实 m4_engine 下载 → 磁盘/远程校验 → 验证通过才登记 dataset asset。
+    任何一步失败：不登记、不伪报完成；shared['gee_result'] 保留真实失败信息。
+    """
+    import time as _time
+
+    ok = False
+    try:
+        import gee_agent_loop as gal
+
+        plan = ctx.get("gee_plan")
+        if not isinstance(plan, dict) or not plan.get("ready"):
+            with shared["lock"]:
+                shared["status"] = ("error", "GEE 下载计划未就绪，无法执行。")
+            return
+
+        task_id = plan.get("task_id") or ctx.get("task") or "unknown"
+
+        def check_stop():
+            return stop_event.is_set()
+
+        def push_log(msg):
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            with shared["lock"]:
+                lines = list(shared.get("log_lines") or [])
+                lines.append(f"[{ts}] root@cstf: {msg}")
+                shared["log_lines"] = lines[-30:]
+            print(msg)
+
+        def push_progress(pct):
+            with shared["lock"]:
+                shared["progress"] = int(min(100, max(0, pct)))
+
+        def push_status(kind, text):
+            with shared["lock"]:
+                shared["status"] = (kind, text)
+
+        started = _time.time()
+        push_status("info", "正在执行 GEE 影像下载（可信执行闭环）…")
+        push_log(f"PLAN: {plan.get('plan_id')} | TASK: {task_id} | "
+                 f"BANDS={plan.get('bands')} | EXPORT={plan.get('export_to')} | "
+                 f"COLLECTION={plan.get('collection')}")
+
+        result = gal.execute_gee_download(
+            plan,
+            stop_event=stop_event,
+            push_log=push_log,
+            push_progress=push_progress,
+        )
+        if not result or result.get("success") is not True:
+            err = (result or {}).get("error") or "GEE 下载失败"
+            push_status("error", f"❌ {err}")
+            with shared["lock"]:
+                shared["gee_result"] = result or {}
+            return
+
+        push_status("info", "下载结束，正在校验成果…")
+        verification = gal.verify_gee_outputs(plan, result, started_at=started)
+        if not verification or verification.get("ok") is not True:
+            failed = [c.get("name") for c in (verification or {}).get("checks") or []
+                      if not c.get("passed")]
+            push_status("error", f"❌ 成果校验未通过: {', '.join(failed) or '未知'}")
+            with shared["lock"]:
+                shared["gee_result"] = result
+                shared["gee_verification"] = verification or {}
+            return
+
+        asset_id = gal.register_gee_dataset_asset(plan, result, verification)
+        if not asset_id:
+            push_status("error", "❌ 校验通过但资产登记失败（未登记数据集）。")
+            with shared["lock"]:
+                shared["gee_result"] = result
+                shared["gee_verification"] = verification
+            return
+
+        n_tifs = len(verification.get("local_tifs") or [])
+        push_log(f"✅ GEE 下载闭环完成 | dataset_id={asset_id} | "
+                 f"scene_count={result.get('metrics', {}).get('scene_count')} | "
+                 f"local_tifs={n_tifs}")
+        push_status("success", "🎉 GEE 影像下载完成：数据集已验证并登记。推理不会自动启动。")
+        with shared["lock"]:
+            shared["gee_result"] = result
+            shared["gee_verification"] = verification
+            shared["dataset_id"] = asset_id
+            shared["progress"] = 100
+        ok = True
+    except Exception as e:
+        tb_lines = traceback.format_exc().split("\n")[:25]
+        with shared["lock"]:
+            lines = list(shared.get("log_lines") or [])
+            lines.append(f"[CRASH] {e}")
+            lines.extend(tb_lines)
+            shared["log_lines"] = lines[-30:]
+            shared["status"] = ("error", f"GEE 下载线程异常: {e}")
+        ok = False
+    finally:
+        with shared["lock"]:
+            shared["success"] = ok
+            shared["done"] = True
+
+
 # =======================================================
 #  1. 页面全局配置与状态机初始化 (Session State)
 # =======================================================
@@ -1821,6 +1924,18 @@ if _agent_flush.applied and _agent_flush.inference_plan_text:
 if _agent_flush.applied and _agent_flush.action_type == "run_inference":
     try:
         st.toast("本地潮滩推理已确认，正在执行…", icon="🌊")
+    except Exception:
+        pass
+if _agent_flush.applied and _agent_flush.gee_plan_text:
+    st.session_state._gee_plan_notice = _agent_flush.gee_plan_text
+    _msgs_gee = list(st.session_state.get("messages") or [])
+    _last_gee = (_msgs_gee[-1].get("content") if _msgs_gee else "") or ""
+    if "GEE 影像下载 · 执行计划" not in str(_last_gee):
+        _msgs_gee.append({"role": "assistant", "content": _agent_flush.gee_plan_text})
+        st.session_state.messages = _msgs_gee
+if _agent_flush.applied and _agent_flush.action_type == "run_gee_download":
+    try:
+        st.toast("GEE 影像下载已确认，正在执行…", icon="🛰️")
     except Exception:
         pass
 
@@ -2760,7 +2875,53 @@ with st.sidebar:
                     st.session_state.pop("_inference_plan_notice", None)
                     st.rerun()
 
-    # 重型工具确认门闩：Agent 请求 run_pipeline/run_m4/run_autotune 未确认时在此待命
+    # GEE 影像下载执行计划（可信执行闭环：先计划后确认）
+    _gee_plan = st.session_state.get("_gee_pending_plan")
+    if isinstance(_gee_plan, dict) and not st.session_state.is_running:
+        sbui.section("GEE 影像下载计划")
+        with st.container(border=True):
+            if _gee_plan.get("ready"):
+                st.success("条件已满足，确认后将真实调用 GEE 下载（不自动启动推理）")
+            else:
+                st.warning("条件未满足，暂不可执行")
+                for _b in _gee_plan.get("blockers") or []:
+                    st.caption(f"· {_b}")
+            st.caption(
+                f"任务 `{_gee_plan.get('task_id') or '—'}` · "
+                f"{_gee_plan.get('start_date') or '—'} → {_gee_plan.get('end_date') or '—'} · "
+                f"波段 {','.join((_gee_plan.get('bands') or ['B4','B3','B2']))} · "
+                f"导出 `{_gee_plan.get('export_to')}`"
+            )
+            _gc1, _gc2 = st.columns(2)
+            with _gc1:
+                if st.button(
+                    "确认执行下载",
+                    key="confirm_gee_plan_btn",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not bool(_gee_plan.get("ready")),
+                ):
+                    from agent_command_bridge import confirm_gee_plan as _bridge_confirm_gee
+
+                    _gpid = _gee_plan.get("plan_id")
+                    _gok, _gcerr = _bridge_confirm_gee(st.session_state, str(_gpid))
+                    if not _gok:
+                        st.warning(_gcerr or "确认失败，请重新生成计划。")
+                        st.rerun()
+                    queue_agent_command(
+                        st.session_state,
+                        {"pending_action": {"type": "run_gee_download", "confirmed": True,
+                                            "task": _gee_plan.get("task_id"), "plan_id": _gpid}},
+                    )
+                    st.rerun()
+            with _gc2:
+                if st.button("取消下载计划", key="cancel_gee_plan_btn", use_container_width=True):
+                    st.session_state.pop("_gee_pending_plan", None)
+                    st.session_state.pop("_gee_plan_confirmed", None)
+                    st.session_state.pop("_gee_plan_notice", None)
+                    st.rerun()
+
+    # 重型工具确认门闩：Agent 请求 run_pipeline/run_m4/run_gee_download/run_autotune 未确认时在此待命
     _pending_heavy = st.session_state.get("_pending_heavy_confirm")
     if isinstance(_pending_heavy, dict) and not st.session_state.is_running:
         sbui.section("待确认操作")
@@ -3971,6 +4132,47 @@ def finalize_background_pipeline():
             _err = (inference_result or {}).get("error") or "推理失败（详见终端日志）"
             _tl_add(_tl_task, "INFERENCE", f"推理未完成：{_err[:60]}",
                     status="FAILED", error=_err, tool="run_inference")
+    # ---- GEE 影像下载可信执行闭环收尾 ----
+    gee_result = shared.get("gee_result") if shared else None
+    gee_verification = shared.get("gee_verification") if shared else None
+    gee_dataset_id = shared.get("dataset_id") if shared else None
+    if gee_result is not None or gee_dataset_id:
+        _gv_ok = bool(gee_verification and gee_verification.get("ok") is True)
+        if success and _gv_ok:
+            try:
+                import gee_agent_loop as _gal
+
+                summary = _gal.summarize_gee_result_for_chat(gee_result, gee_verification)
+                st.session_state.messages = list(st.session_state.get("messages") or [])
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": summary}
+                )
+                st.session_state._gee_last_summary = summary
+            except Exception:
+                pass
+            _tl_add(_tl_task, "GEE_EXPORT", "GEE 影像下载完成",
+                    status="SUCCEEDED", tool="run_gee_download")
+            _tl_add(_tl_task, "VERIFY", "数据集校验通过",
+                    status="SUCCEEDED", tool="verify_gee")
+            if gee_dataset_id:
+                _tl_add(_tl_task, "REGISTER", "数据集资产已登记",
+                        status="SUCCEEDED", tool="register_gee",
+                        artifacts=[str(gee_dataset_id)])
+            _tl_add(_tl_task, "REPORT", "结果已回复 Copilot",
+                    status="SUCCEEDED", tool="report")
+            # 动态能力状态刷新（GEE 能力 / 推理能力 scene_count 感知）
+            try:
+                import capability_registry as _cap
+                _cap_reg = st.session_state.get("_capability_reg")
+                if _cap_reg is not None:
+                    _cap_reg.invalidate()
+                st.session_state._cap_snapshot_injected = False
+            except Exception:
+                pass
+        else:
+            _err = (gee_result or {}).get("error") or "GEE 下载失败（详见终端日志）"
+            _tl_add(_tl_task, "GEE_EXPORT", f"下载未完成：{_err[:60]}",
+                    status="FAILED", error=_err, tool="run_gee_download")
     if m5_report:
         st.session_state.m5_report = m5_report
         _lvl = m5_report.get("alert_level", "GREEN")
@@ -4053,9 +4255,10 @@ def finalize_background_pipeline():
         st.session_state.m4_last_result = m4_result
     # 推理闭环已在上面自行登记 EXECUTE/REGISTER/VERIFY/MAP/REPORT，这里避免重复
     _inference_handled = inference_result is not None or inference_asset_id is not None
-    if success and asset_path and job_kind not in ("m5", "e1") and not _inference_handled:
+    _gee_handled = gee_result is not None or gee_dataset_id is not None
+    if success and asset_path and job_kind not in ("m5", "e1") and not _inference_handled and not _gee_handled:
         st.session_state.asset_override = asset_path
-    if success and not _inference_handled:
+    if success and not _inference_handled and not _gee_handled:
         _tl_add(_tl_task, "EXECUTE", f"任务执行完成（{job_kind or 'pipeline'}）",
                 status="SUCCEEDED", progress=100, tool=job_kind or "run_pipeline")
         if asset_path:
@@ -4073,7 +4276,7 @@ def finalize_background_pipeline():
         except Exception:
             pass
     else:
-        if not _inference_handled:
+        if not _inference_handled and not _gee_handled:
             _tl_add(_tl_task, "EXECUTE", "任务执行失败",
                     status="FAILED", error="任务执行失败，详见终端日志",
                     tool=job_kind or "run_pipeline")
@@ -4293,6 +4496,23 @@ def maybe_start_pipeline_thread():
         }
         threading.Thread(
             target=_inference_worker_entry,
+            args=(ctx, shared, stop_ev),
+            daemon=True,
+        ).start()
+        return
+
+    # GEE 影像下载可信执行闭环（不跑推理）
+    if task_info.get("mode") == "gee":
+        shared["status"] = ("info", "正在启动 GEE 影像下载（可信执行闭环）…")
+        _tl_add(task_info.get("task") or "unknown", "GEE_EXPORT",
+                "GEE 下载已启动", status="RUNNING", tool="run_gee_download", progress=0)
+        ctx = {
+            "root_dir": root_dir,
+            "task": task_info.get("task"),
+            "gee_plan": task_info.get("gee_plan"),
+        }
+        threading.Thread(
+            target=_gee_worker_entry,
             args=(ctx, shared, stop_ev),
             daemon=True,
         ).start()

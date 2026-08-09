@@ -120,7 +120,8 @@ def dispatch_system_command(command_json: str) -> str:
     口语速查：
     「跑/推理/合成/开始」→ pending_action.run_pipeline（confirmed=true）
     「本地影像推理/潮滩推理/模型跑图」→ local_tidal_flat_inference，确认后 confirm_inference
-    「下载/GEE/下影像」→ workflow_tab=GEE数据下载；「开始下载」→ run_m4（confirmed=true）
+    「下载/GEE/下影像」→ gee_download_plan（按地图 AOI 下载，计划展示后确认 confirm_gee_download；
+       下载完成后不会自动启动推理，如需推理请再发起推理任务）
     「调参/搜最优/AutoTune」→ adaptive_mode=true + run_autotune（confirmed=true）
     「5%/百分之五」→ prob_th=0.05；「频次2/两次」→ min_cnt=2
     「关M5/不要E1」→ m5_enabled/e1_enabled=false
@@ -392,6 +393,75 @@ def confirm_inference(plan_id: Optional[str] = None) -> str:
     )
 
 
+@tool
+def gee_download_plan(
+    task_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    bands: Optional[str] = None,
+    cloud_limit: Optional[int] = None,
+    export_to: Optional[str] = None,
+    run_now: bool = False,
+) -> str:
+    """
+    【GEE 遥感影像下载 · 生成执行计划】
+    用户要「下载/获取 GEE/哨兵/COPERNICUS 影像」「根据地图 AOI 取影像数据」时调用。
+    使用当前地图绘制的 AOI（无需传 geometry）；也可传 task_id / 起止日期 / 波段等参数。
+    - 波段 bands：逗号分隔字符串，如 "B4,B3,B2"（RGB 顺序，默认）；可含 index_bands 由系统追加。
+    - 先调用本工具生成计划（propose）；plan 展示后必须等用户确认，再调用 confirm_gee_download。
+    - run_now=true 表示用户已明确要求启动，直接进入计划→校验→确认→执行闭环；
+      否则只生成计划等待确认（下载完成后**不会自动启动推理**）。
+    """
+    import json as _json
+
+    action: dict = {"type": "propose_gee"}
+    if task_id and str(task_id).strip():
+        action["task"] = str(task_id).strip()
+    if start_date and str(start_date).strip():
+        action["start_date"] = str(start_date).strip()
+    if end_date and str(end_date).strip():
+        action["end_date"] = str(end_date).strip()
+    if bands and str(bands).strip():
+        action["bands"] = [b.strip() for b in str(bands).split(",") if b.strip()]
+    if cloud_limit is not None:
+        action["cloud_limit"] = int(cloud_limit)
+    if export_to and str(export_to).strip():
+        action["export_to"] = str(export_to).strip()
+    if run_now:
+        action["run_now"] = True
+    payload = {"pending_action": action}
+    if task_id and str(task_id).strip():
+        payload["sidebar_states"] = {"m4_roi_name": str(task_id).strip()}
+    return (
+        "[SYSTEM_COMMAND_JSON]\n"
+        + _json.dumps(payload, ensure_ascii=False)
+        + "\n[/SYSTEM_COMMAND_JSON]"
+    )
+
+
+@tool
+def confirm_gee_download(plan_id: Optional[str] = None) -> str:
+    """
+    【GEE 遥感影像下载 · 确认执行】
+    仅在用户已明确确认 GEE 下载计划后调用（如「确认」「开始下载」）。
+    同一 plan_id 只确认一次；将真实调用现有 m4_engine 下载（Drive 提交或本地下载）。
+    下载完成后**不会自动启动推理**（如需推理请另行发起推理任务）。
+    禁止在未确认时调用；禁止编造 plan_id（从计划中获取）。
+    """
+    import json as _json
+
+    action: dict = {"type": "confirm_gee", "confirmed": True}
+    if plan_id and str(plan_id).strip():
+        action["plan_id"] = str(plan_id).strip()
+    payload = {"pending_action": action}
+    return (
+        "[SYSTEM_COMMAND_JSON]\n"
+        + _json.dumps(payload, ensure_ascii=False)
+        + "\n[/SYSTEM_COMMAND_JSON]"
+    )
+
+
+
 # ==========================================
 # 2. 通义千问 API（阿里云百炼 DashScope · OpenAI 兼容模式）
 # ==========================================
@@ -428,6 +498,8 @@ tools = [
     dispatch_system_command,
     local_tidal_flat_inference,
     confirm_inference,
+    gee_download_plan,
+    confirm_gee_download,
     prepare_m5_change_detection,
     confirm_and_run_m5,
     prepare_e1_consistency_check,

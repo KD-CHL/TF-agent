@@ -94,6 +94,7 @@ HEAVY_ACTION_LABELS = {
     "": "推理任务（深度学习/指数法推理）",
     "run_inference": "本地潮滩推理（可信执行闭环）",
     "run_m4": "GEE 影像下载",
+    "run_gee_download": "GEE 影像下载（可信执行闭环）",
     "run_autotune": "AutoTune 阈值搜索",
 }
 
@@ -113,6 +114,8 @@ class ApplyResult:
     e1_plan_text: str = ""
     inference_plan: Optional[Dict[str, Any]] = None
     inference_plan_text: str = ""
+    gee_plan: Optional[Dict[str, Any]] = None
+    gee_plan_text: str = ""
 
 
 PENDING_AGENT_COMMANDS_KEY = "_pending_agent_commands"
@@ -708,6 +711,131 @@ def is_inference_plan_confirmed(state: Dict[str, Any], plan_id: Optional[str]) -
     return inference_agent_loop.is_plan_confirmed(state, plan_id)
 
 
+def propose_gee_plan(state: Dict[str, Any], action: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], List[str]]:
+    """根据侧栏 GEE 配置与当前 AOI 生成 GEE 下载执行计划，写入 state['_gee_pending_plan']。
+
+    - AOI：优先 action.aoi / action.aoi_id / state['_active_aoi']（地图 AOI）；
+      否则用侧栏 ui_m4_roi_path + ui_m4_roi_name 仅做轻量 bbox 提取（无真实面）。
+    - bands 默认 ["B4","B3","B2"]（B3 铁律），来自 action.bands 或侧栏。
+    - 任何参数修改 → 重新 build → 新 plan_id（旧确认集同步重置）。
+    """
+    import gee_agent_loop
+    from aoi_context import aoi_from_bbox, validate_aoi, compact_summary
+
+    action = action or {}
+    init_ui_session_defaults(state)
+    task = (action.get("task") or action.get("roi_name")
+            or state.get("ui_m4_roi_name") or state.get("ui_selected_task")
+            or "").strip() or None
+    if task:
+        state["ui_m4_roi_name"] = task
+
+    # ---- AOI 解析 ----
+    aoi_dict: Dict[str, Any] = {}
+    aoi_warnings: List[str] = []
+    aoi_src = action.get("aoi")
+    if isinstance(aoi_src, dict) and aoi_src.get("type") == "Polygon":
+        try:
+            ctx = validate_aoi(aoi_src, source=action.get("aoi_source") or "map_polygon",
+                               label=task or None)
+            aoi_dict = ctx.to_dict()
+            aoi_warnings = list(ctx.warnings or [])
+        except Exception as e:  # noqa: BLE001
+            aoi_warnings.append(f"AOI 解析失败: {e}")
+    elif action.get("aoi_id"):
+        aoi_dict = {"aoi_id": str(action["aoi_id"]), "valid": True}
+    elif state.get("_active_aoi"):
+        aoi_dict = dict(state["_active_aoi"])
+    elif state.get("ui_m4_roi_path"):
+        # 矢量文件：仅提取 bbox（轻量，不加载全量几何进 LLM）
+        try:
+            import geopandas as gpd
+            gdf = gpd.read_file(state["ui_m4_roi_path"])
+            if not gdf.empty:
+                b = gdf.total_bounds
+                ctx = aoi_from_bbox(float(b[0]), float(b[1]), float(b[2]), float(b[3]),
+                                    source="shapefile_bbox", label=task or None)
+                aoi_dict = ctx.to_dict()
+                aoi_warnings.append("AOI 来自矢量文件外接矩形（bbox），非精确面。")
+        except Exception as e:  # noqa: BLE001
+            aoi_warnings.append(f"读取 AOI 矢量失败: {e}")
+    if not aoi_dict or not aoi_dict.get("valid"):
+        aoi_warnings.append("未解析到有效 AOI（请先在三维地图绘制 AOI 或配置 ROI 矢量）。")
+
+    # B3：默认波段 B4/B3/B2（RGB 顺序，匹配 pre_engine）。
+    # 侧栏 ui_m4_bands 沿用旧 M4 工作流的 5 波段默认值，视为“未显式选择”，
+    # 仅当 action 显式传 bands 或侧栏值确实非默认时才覆盖。
+    _LEGACY_M4_BANDS = ["B8", "B4", "B3", "B2", "B11"]
+    _sidebar_bands = state.get("ui_m4_bands")
+    if action.get("bands"):
+        bands = list(action["bands"])
+    elif isinstance(_sidebar_bands, list) and _sidebar_bands and \
+            [str(b) for b in _sidebar_bands] != _LEGACY_M4_BANDS:
+        bands = [str(b) for b in _sidebar_bands]
+    else:
+        bands = list(gee_agent_loop.DEFAULT_BANDS)
+    index_bands = action.get("index_bands") or gee_agent_loop.DEFAULT_INDEX_BANDS
+    try:
+        cloud = int(action.get("cloud_limit") if action.get("cloud_limit") is not None
+                    else state.get("ui_m4_cloud_limit", 60))
+    except (TypeError, ValueError):
+        cloud = 60
+    try:
+        scale = int(action.get("scale") if action.get("scale") is not None
+                    else state.get("ui_m4_scale", 10))
+    except (TypeError, ValueError):
+        scale = 10
+    export_to = str(action.get("export_to") or state.get("ui_m4_export_to") or "local").lower()
+    local_dir = str(action.get("local_out_dir")
+                    or state.get("ui_m4_local_dir")
+                    or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "gee_downloads"))
+    drive_folder = str(action.get("drive_folder")
+                       or state.get("ui_m4_drive_folder") or "GEE_Downloads")
+
+    plan = gee_agent_loop.build_gee_download_plan(
+        task_id=str(task or ""),
+        aoi=aoi_dict,
+        start_date=str(action.get("start_date") or state.get("ui_m4_start_date") or ""),
+        end_date=str(action.get("end_date") or state.get("ui_m4_end_date") or ""),
+        collection=str(action.get("collection") or "COPERNICUS/S2_SR_HARMONIZED"),
+        bands=bands,
+        index_bands=index_bands,
+        cloud_limit=cloud,
+        min_land_pct=float(action.get("min_land_pct") if action.get("min_land_pct") is not None
+                           else state.get("ui_m4_min_land", 5.0)),
+        max_land_pct=float(action.get("max_land_pct") if action.get("max_land_pct") is not None
+                           else state.get("ui_m4_max_land", 95.0)),
+        min_pixel_count=int(action.get("min_pixel_count") if action.get("min_pixel_count") is not None
+                            else state.get("ui_m4_min_pixel_count", 1000)),
+        scale=scale,
+        export_to=export_to,
+        drive_folder=drive_folder,
+        local_out_dir=local_dir,
+        gee_proxy_url=str(action.get("gee_proxy_url") or state.get("ui_m4_gee_proxy") or ""),
+        gee_project_id=str(action.get("gee_project_id") or state.get("ui_m4_gee_project") or ""),
+    )
+    for w in aoi_warnings:
+        if w not in plan["warnings"]:
+            plan["warnings"].append(w)
+    state["_gee_pending_plan"] = plan
+    state["_gee_plan_confirmed"] = set()
+    errors = list(plan.get("blockers") or []) if not plan.get("ready") else []
+    return plan, errors
+
+
+def confirm_gee_plan(state: Dict[str, Any], plan_id: str) -> Tuple[bool, Optional[str]]:
+    """与 UI 确认按钮共用的 GEE 下载计划确认门闩（委托 gee_agent_loop）。"""
+    import gee_agent_loop
+
+    return gee_agent_loop.confirm_gee_download_plan(state, plan_id)
+
+
+def is_gee_plan_confirmed(state: Dict[str, Any], plan_id: Optional[str]) -> bool:
+    import gee_agent_loop
+
+    return gee_agent_loop.is_gee_plan_confirmed(state, plan_id)
+
+
 def build_pending_task(state: Dict[str, Any], action: Dict[str, Any]) -> Tuple[Optional[Dict], Optional[Dict], List[str]]:
     """
     返回 (pending_task, pending_autotune, errors)
@@ -892,6 +1020,36 @@ def build_pending_task(state: Dict[str, Any], action: Dict[str, Any]) -> Tuple[O
             "force_rerun": False,
         }, None, errors
 
+    if atype == "run_gee_download":
+        pid = action.get("plan_id") or (state.get("_gee_pending_plan") or {}).get("plan_id")
+        confirmed = bool(action.get("confirmed")) or is_gee_plan_confirmed(state, pid)
+        if not confirmed:
+            errors.append("GEE 影像下载需用户确认后才能执行（confirmed=true 或侧栏确认）。")
+            return None, None, errors
+        plan = state.get("_gee_pending_plan")
+        if not isinstance(plan, dict) or not plan.get("ready"):
+            plan, plan_errs = propose_gee_plan(state, action)
+            errors.extend(plan_errs)
+        if not isinstance(plan, dict) or not plan.get("ready"):
+            errors.append("GEE 下载执行条件未满足，无法启动。")
+            return None, None, errors
+        if pid and str(pid) != str(plan.get("plan_id")):
+            errors.append(f"确认的 plan_id 与当前计划不一致（{pid} != {plan.get('plan_id')}）。")
+            return None, None, errors
+        # 与 UI 确认按钮同一逻辑（confirm_gee_plan），确保幂等集已写入
+        if not is_gee_plan_confirmed(state, str(plan.get("plan_id"))):
+            ok, cerr = confirm_gee_plan(state, str(plan.get("plan_id")))
+            if not ok:
+                errors.append(cerr or "GEE 下载计划确认失败。")
+                return None, None, errors
+        return {
+            "task": plan["task_id"],
+            "mode": "gee",
+            "plan_id": plan["plan_id"],
+            "gee_plan": plan,
+            "export_to": plan.get("export_to"),
+        }, None, errors
+
     if atype in ("run_pipeline", "run", ""):
         confirmed = bool(action.get("confirmed")) or bool(state.get("_pipeline_plan_confirmed"))
         if not confirmed:
@@ -1046,12 +1204,46 @@ def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> Appl
             }
             result.action_type = "run_inference"
 
+        # GEE 下载闭环：propose → confirm → run_gee_download
+        if atype in ("propose_gee", "propose_gee_plan", "plan_gee"):
+            import gee_agent_loop
+
+            plan, errs = propose_gee_plan(state, action)
+            result.gee_plan = plan
+            result.gee_plan_text = gee_agent_loop.format_gee_plan_for_user(plan)
+            result.errors.extend(errs)
+            return result
+
+        if atype == "confirm_gee":
+            pid = action.get("plan_id") or (
+                state.get("_gee_pending_plan") or {}
+            ).get("plan_id")
+            if pid:
+                ok, cerr = confirm_gee_plan(state, str(pid))
+                if not ok:
+                    result.errors.append(cerr or "GEE 下载计划确认失败。")
+                    return result
+            action = {
+                "type": "run_gee_download",
+                "confirmed": True,
+                "task": action.get("task"),
+                "plan_id": action.get("plan_id"),
+                "roi_name": action.get("roi_name"),
+                "start_date": action.get("start_date"),
+                "end_date": action.get("end_date"),
+                "cloud_limit": action.get("cloud_limit"),
+                "bands": action.get("bands"),
+                "export_to": action.get("export_to"),
+            }
+            result.action_type = "run_gee_download"
+
         pt, at, errs = build_pending_task(state, action)
         result.errors.extend(errs)
-        # 重型工具确认门闩：run_pipeline/run_inference/run_m4/run_autotune 未确认时，
-        # 仅记录待确认请求（供 UI 弹出确认），绝不写入 pending_task/pending_autotune。
+        # 重型工具确认门闩：run_pipeline/run_inference/run_m4/run_gee_download/run_autotune
+        # 未确认时，仅记录待确认请求（供 UI 弹出确认），绝不写入 pending_task/pending_autotune。
         # 手动侧栏按钮直接写 session_state 的路径不受影响。
-        is_heavy = atype in ("run_pipeline", "run", "", "run_inference", "run_m4", "run_autotune")
+        is_heavy = atype in ("run_pipeline", "run", "", "run_inference", "run_m4",
+                             "run_gee_download", "run_autotune")
         if is_heavy and not bool(action.get("confirmed")):
             if errs and any("确认" in e for e in errs):
                 state["_pending_heavy_confirm"] = {
@@ -1075,6 +1267,8 @@ def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> Appl
                 state.pop("_e1_pending_plan", None)
             if pt.get("inference_plan"):
                 state.pop("_inference_pending_plan", None)
+            if pt.get("mode") == "gee":
+                state.pop("_gee_pending_plan", None)
         elif at and not errs:
             state["pending_autotune"] = at
             state["is_running"] = True

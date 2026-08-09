@@ -192,10 +192,13 @@ def run_m4_download(
     push_log=print,
     push_progress=None,
     stop_callback=None,
+    on_task_started=None,
 ):
     """
     执行 M4 流水线。export_to: 'drive' | 'local'。
     返回 dict: image_count, export_to, local_out_dir, drive_folder, id_list
+    on_task_started: 可选回调，drive 模式每个任务 task.start() 后调用 task_obj
+    （供可信执行闭环记录 GEE 任务 id / 状态）。
     """
     if bands is None:
         bands = ["B8", "B4", "B3", "B2", "B11"]
@@ -352,6 +355,11 @@ def run_m4_download(
                     fileFormat="GeoTIFF",
                 )
                 task.start()
+                if on_task_started:
+                    try:
+                        on_task_started(task)
+                    except Exception as e:  # noqa: BLE001
+                        push_log(f"  |-- 记录任务失败: {e}")
                 if (i + 1) % 5 == 0 or i == n - 1:
                     push_log(f"  |-- 已提交 {i + 1}/{n}")
                 _prog(25 + int(75 * (i + 1) / max(n, 1)))
