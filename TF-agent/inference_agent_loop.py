@@ -212,6 +212,24 @@ def build_inference_plan(
     if not (CNT_MIN <= cnt <= CNT_MAX):
         blockers.append(f"最少出现次数 {cnt!r} 超出范围 [{CNT_MIN}, {CNT_MAX}]。")
 
+    # B10：input_asset_id 指向已登记 GEE 数据集时，读取 scene_count 用于 A1 阻断
+    asset_scene_count: Optional[int] = None
+    if input_asset_id and cnt >= 2:
+        try:
+            import dataset_assets
+            entry = dataset_assets.get_dataset(str(input_asset_id))
+            if entry and isinstance(entry.get("scene_count"), (int, float)):
+                sc = int(entry["scene_count"])
+                asset_scene_count = sc
+                if sc < cnt:
+                    blockers.append(
+                        f"输入数据集（{input_asset_id}）仅有 {sc} 景有效影像，"
+                        f"但频次阈值为 {cnt}。双约束后处理无法得到有效结果，"
+                        f"请增加同一区域影像或降低频次阈值。"
+                    )
+        except Exception:  # noqa: BLE001
+            pass
+
     if device_policy not in ("auto", "cuda_required"):
         warnings.append(f"未知设备策略 {device_policy!r}，按 auto 处理。")
         device_policy = "auto"
@@ -274,6 +292,7 @@ def build_inference_plan(
         "task_id": task_id,
         "tool": TOOL_NAME,
         "input_asset_id": input_asset_id or "ui_selected",
+        "input_asset_scene_count": asset_scene_count,
         "input_path": input_path,
         "input_type": "local_raster",
         "bands": [1, 2, 3],
@@ -304,18 +323,27 @@ def build_inference_plan(
 #  2. 执行前验证（§2.3 / 用户规格 §四）
 # =======================================================
 def _list_raw_tifs(input_dir: str) -> List[str]:
-    """输入目录下可参与推理的 *.tif（排除 _mask / Final 前缀）。"""
+    """输入目录下可参与推理的 *.tif（排除 _mask / Final 前缀，去重）。
+
+    Windows 文件系统大小写不敏感：*.tif/*.TIF/*.tiff/*.TIFF 可能匹配同一文件，
+    必须按规范化路径去重，否则同一景会被重复计数（影响 A1 单景阻断判定）。
+    """
     if not input_dir or not os.path.isdir(input_dir):
         return []
     all_tifs = glob.glob(os.path.join(input_dir, "*.tif")) + \
         glob.glob(os.path.join(input_dir, "*.TIF")) + \
         glob.glob(os.path.join(input_dir, "*.tiff")) + \
         glob.glob(os.path.join(input_dir, "*.TIFF"))
+    seen = set()
     out = []
     for f in all_tifs:
         name = os.path.basename(f)
         if "_mask" in name or "Final" in name:
             continue
+        key = os.path.normcase(os.path.normpath(f))
+        if key in seen:
+            continue
+        seen.add(key)
         out.append(f)
     return sorted(out)
 
@@ -330,6 +358,8 @@ def validate_inference_plan(
 
     输入检查：路径存在 / 目录非空 / 含受支持 tif / rasterio 可开首个 tif /
               CRS 可读 / 尺寸合法 / 波段数 ≥ 3 / 输出目录可写。
+    A1 单景阻断：有效景数 < count_threshold 时提前阻断（双约束后处理无法得到
+              有效结果），不启动 GPU / 不加载模型 / 不创建正式输出。
     权重检查：路径存在 / 非 URL / weights_only=True 安全加载 / strict 匹配 CDNet。
     设备检查：torch.cuda.is_available；auto → cuda/cpu 回退并记录真实设备；
               cuda_required 且无 CUDA → blocker；绝不虚报 GPU。
@@ -349,6 +379,16 @@ def validate_inference_plan(
         if not tifs:
             blockers.append(f"输入目录没有可处理的 *.tif 影像: {rel_path(input_dir)}")
         else:
+            # A1：单景输入提前阻断（双约束后处理 E>=min_absolute_count 无法满足）
+            _cnt = int(plan.get("count_threshold") or 0)
+            if _cnt >= 2 and len(tifs) < _cnt:
+                blockers.append(
+                    f"当前任务只有 {len(tifs)} 景有效影像，但频次阈值为 {_cnt}。"
+                    f"双约束后处理无法得到有效结果，请增加同一区域影像或降低频次阈值。"
+                )
+                # A1 铁律：提前返回，不加载模型、不探测设备、不创建任何输出
+                plan["device"] = ""
+                return False, blockers, ""
             first = tifs[0]
             try:
                 import rasterio

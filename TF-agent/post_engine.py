@@ -1,5 +1,7 @@
 import os
 import glob
+import json
+import hashlib
 import rasterio
 from rasterio.features import shapes
 from rasterio.windows import Window, from_bounds, transform as window_transform
@@ -8,6 +10,12 @@ import numpy as np
 from tqdm import tqdm
 import geopandas as gpd
 from shapely.geometry import shape
+
+# 累加缓存（_NUMERATOR/_DENOMINATOR）复用安全门闩：
+# 仅当 manifest 存在且 fingerprint 完全一致才允许复用；否则视为不可信旧缓存，
+# 删除同 stem 的 NUMERATOR/DENOMINATOR 并重新计算（不删除其他任务缓存）。
+CACHE_MANIFEST_SCHEMA_VERSION = 1
+CACHE_MANIFEST_FILENAME = "_cache_manifest.json"
 
 
 # =======================================================
@@ -24,6 +32,134 @@ def output_stem(output_path: str) -> str:
     if ext.lower() in (".tif", ".tiff", ".shp"):
         return root
     return output_path
+
+
+def _cache_manifest_path(stem: str) -> str:
+    """缓存 manifest 路径（与 NUMERATOR/DENOMINATOR 同目录，按 stem 隔离）。"""
+    return f"{stem}{CACHE_MANIFEST_FILENAME}"
+
+
+def _resolve_mask_source_pairs(mask_folder: str, source_folder: str):
+    """解析 mask→源影像 配对（与阶段 1 一致：缺失源则跳过）。"""
+    mask_files = glob.glob(os.path.join(mask_folder, "**", "*_mask.tif"), recursive=True)
+    pairs = []
+    for tif in mask_files:
+        try:
+            filename = os.path.basename(tif).replace("_mask.tif", ".tif")
+            src_path = os.path.join(source_folder, filename)
+            if not os.path.exists(src_path):
+                found = glob.glob(os.path.join(source_folder, "**", filename), recursive=True)
+                if found:
+                    src_path = found[0]
+                else:
+                    continue
+            pairs.append((tif, src_path))
+        except Exception:
+            continue
+    return pairs
+
+
+def _compute_cache_fingerprint(source_folder, mask_folder, prob_threshold,
+                               min_absolute_count, output_path,
+                               identity=None) -> str:
+    """
+    缓存 fingerprint：对实际参与累加的输入（mask + 源影像 path/size/mtime）与
+    概率阈值 / 次数阈值 / 输出 stem / schema_version / 任务身份 求 sha256。
+    输入或参数任何变化 → fingerprint 变化 → 旧缓存不可复用。
+    """
+    pairs = _resolve_mask_source_pairs(mask_folder, source_folder)
+    inputs = []
+    for mask_f, src_f in pairs:
+        for p in (mask_f, src_f):
+            try:
+                st = os.stat(p)
+                inputs.append([os.path.normpath(p), st.st_size, int(st.st_mtime)])
+            except OSError:
+                inputs.append([os.path.normpath(p), 0, 0])
+    payload = {
+        "schema_version": CACHE_MANIFEST_SCHEMA_VERSION,
+        "inputs": sorted(inputs),
+        "prob_threshold": float(prob_threshold),
+        "count_threshold": int(min_absolute_count),
+        "stem": output_stem(output_path),
+        "identity": dict(identity or {}),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _cache_fingerprint_matches(manifest_path, source_folder, mask_folder,
+                               prob_threshold, min_absolute_count, output_path,
+                               identity=None) -> bool:
+    """manifest 存在 且 fingerprint 完全一致 → 可复用。"""
+    if not os.path.isfile(manifest_path):
+        return False
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if manifest.get("schema_version") != CACHE_MANIFEST_SCHEMA_VERSION:
+        return False
+    cur = _compute_cache_fingerprint(
+        source_folder, mask_folder, prob_threshold, min_absolute_count,
+        output_path, identity=identity,
+    )
+    return str(manifest.get("fingerprint") or "") == cur
+
+
+def _write_cache_manifest(stem, source_folder, mask_folder, prob_threshold,
+                          min_absolute_count, output_path, identity=None) -> None:
+    """累加完成后写入 manifest（原子写）。"""
+    manifest = {
+        "schema_version": CACHE_MANIFEST_SCHEMA_VERSION,
+        "fingerprint": _compute_cache_fingerprint(
+            source_folder, mask_folder, prob_threshold, min_absolute_count,
+            output_path, identity=identity,
+        ),
+        "inputs": _manifest_inputs(mask_folder, source_folder),
+        "model_id": (identity or {}).get("model_id"),
+        "weight_id": (identity or {}).get("weight_id"),
+        "prob_threshold": float(prob_threshold),
+        "count_threshold": int(min_absolute_count),
+        "task_id": (identity or {}).get("task_id"),
+        "plan_id": (identity or {}).get("plan_id"),
+        "created_at": _now_str_post(),
+    }
+    manifest_path = _cache_manifest_path(stem)
+    tmp = f"{manifest_path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, manifest_path)
+
+
+def _manifest_inputs(mask_folder, source_folder):
+    out = []
+    for mask_f, src_f in _resolve_mask_source_pairs(mask_folder, source_folder):
+        for p in (mask_f, src_f):
+            try:
+                st = os.stat(p)
+                out.append({"path": os.path.normpath(p), "size": st.st_size,
+                            "mtime": int(st.st_mtime)})
+            except OSError:
+                out.append({"path": os.path.normpath(p), "size": 0, "mtime": 0})
+    return out
+
+
+def _now_str_post() -> str:
+    from datetime import datetime
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _drop_stale_cache(stem, numerator_path, denominator_path, logger):
+    """manifest 缺失或 fingerprint 不一致 → 删除同 stem 旧缓存（不动其他任务）。"""
+    for _p in (numerator_path, denominator_path, _cache_manifest_path(stem)):
+        if os.path.isfile(_p):
+            try:
+                os.remove(_p)
+                logger(f"   🗑️ 已清理不可信旧缓存: {os.path.basename(_p)}")
+            except OSError:
+                pass
 
 
 def raster_tidal_flat_to_shp(
@@ -72,12 +208,16 @@ def raster_tidal_flat_to_shp(
 # =======================================================
 def generate_double_constraint_complete(source_folder, mask_folder, output_path, shp_path,
                                         prob_threshold=0.05, min_absolute_count=2, logger=print,
-                                        stop_callback=None, keep_final_tif=False):
+                                        stop_callback=None, keep_final_tif=False,
+                                        cache_identity=None):
     """
     logger: 传入 st.write 或自定义函数，用于在网页上显示日志
 
     keep_final_tif: True 时把合成的 work 栅格保留为 Final TIF（output_path 若为 .tif），
                     默认 False 保持历史行为（仅生成 Final SHP，删除中间 work 栅格）。
+
+    cache_identity: 可选 dict（如 {"task_id","plan_id","model_id","weight_id"}），
+                    参与缓存 fingerprint 与 manifest 记录；任务身份变化 → 旧缓存不可复用。
     """
     logger(f"\n📊 [Post-Process] 启动双重约束合成")
     logger(f"   🎯 策略: 概率 > {prob_threshold:.1%}  且  绝对次数 >= {min_absolute_count}")
@@ -90,6 +230,7 @@ def generate_double_constraint_complete(source_folder, mask_folder, output_path,
     work_tif_path = f"{stem}_work.tif"
     numerator_path = f"{stem}_NUMERATOR.tif"
     denominator_path = f"{stem}_DENOMINATOR.tif"
+    manifest_path = _cache_manifest_path(stem)
 
     # --- 阶段 1: 扫描文件 ---
     mask_files = glob.glob(os.path.join(mask_folder, "**", "*_mask.tif"), recursive=True)
@@ -99,11 +240,20 @@ def generate_double_constraint_complete(source_folder, mask_folder, output_path,
 
     logger(f"📦 找到 {len(mask_files)} 个 Mask 文件，准备计算...")
 
-    # --- 阶段 2: 生成累加缓存 ---
-    if os.path.exists(numerator_path) and os.path.exists(denominator_path):
-        logger("⚡ 发现现有缓存 (_NUMERATOR/_DENOMINATOR)，跳过累加，直接筛选...")
+    # --- 阶段 2: 生成累加缓存（manifest 门控复用，防跨任务/跨输入错误复用） ---
+    cache_files_ok = os.path.exists(numerator_path) and os.path.exists(denominator_path)
+    manifest_ok = _cache_fingerprint_matches(
+        manifest_path, source_folder, mask_folder,
+        prob_threshold, min_absolute_count, output_path, identity=cache_identity,
+    )
+    if cache_files_ok and manifest_ok:
+        logger("⚡ 缓存 fingerprint 一致，复用 _NUMERATOR/_DENOMINATOR，跳过累加...")
     else:
-        logger("🐢 缓存未找到，正在从头生成累加数据 (这需要几分钟)...")
+        if cache_files_ok:
+            logger("⚠️ 缓存存在但 manifest 缺失或 fingerprint 不一致，视为不可信旧缓存，重新计算...")
+            _drop_stale_cache(stem, numerator_path, denominator_path, logger)
+        else:
+            logger("🐢 缓存未找到，正在从头生成累加数据 (这需要几分钟)...")
 
         # 2.1 计算范围（统一到首张 CRS）
         min_x, min_y, max_x, max_y = float('inf'), float('inf'), float('-inf'), float('-inf')
@@ -225,14 +375,17 @@ def generate_double_constraint_complete(source_folder, mask_folder, output_path,
             _interrupted = True
 
         if _interrupted:
-            for _p in (numerator_path, denominator_path):
-                if os.path.isfile(_p):
-                    try:
-                        os.remove(_p)
-                        logger(f"   🗑️ 已删除未完成缓存: {os.path.basename(_p)}")
-                    except OSError:
-                        pass
+            _drop_stale_cache(stem, numerator_path, denominator_path, logger)
+            logger("❌ 累加未完成，已清理缓存，任务终止。")
             return False
+
+        # 累加成功 → 写缓存 manifest（记录本次输入的 fingerprint，供下次复用门闩）
+        try:
+            _write_cache_manifest(stem, source_folder, mask_folder,
+                                  prob_threshold, min_absolute_count,
+                                  output_path, identity=cache_identity)
+        except OSError as e:
+            logger(f"   ⚠️ 缓存 manifest 写入失败（不影响本次成果）: {e}")
 
     # --- 阶段 3: 双重筛选与保存（分块处理，避免超大栅格 OOM） ---
     if stop_callback and stop_callback():

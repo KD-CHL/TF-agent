@@ -106,7 +106,7 @@ def _make_fake_weight(path) -> Path:
     return path
 
 
-def _make_task_dir(root: Path, task: str, tifs=("a.tif",)) -> Path:
+def _make_task_dir(root: Path, task: str, tifs=("a.tif", "b.tif")) -> Path:
     d = root / task
     d.mkdir(parents=True, exist_ok=True)
     for t in tifs:
@@ -339,6 +339,7 @@ class TestValidate(unittest.TestCase):
             weight = _make_fake_weight(tmp / "w.pth")
             d = root / "task_a"
             d.mkdir(parents=True, exist_ok=True)
+            _make_tif(d / "a.tif")
             (d / "0bad.tif").write_bytes(b"not a tiff at all")
             final.mkdir(); mask.mkdir()
             plan = ial.build_inference_plan(
@@ -357,6 +358,7 @@ class TestValidate(unittest.TestCase):
             weight = _make_fake_weight(tmp / "w.pth")
             d = root / "task_a"
             d.mkdir(parents=True, exist_ok=True)
+            _make_tif(d / "a.tif")
             _make_tif(d / "0single.tif", bands=1)
             final.mkdir(); mask.mkdir()
             plan = ial.build_inference_plan(
@@ -387,6 +389,47 @@ class TestValidate(unittest.TestCase):
             self.assertTrue(ok, blockers)
             self.assertEqual(device, "cpu")
             self.assertEqual(plan["device"], "cpu")
+
+    def test_a1_single_scene_blocks_before_gpu(self):
+        """A1：有效景数 < 频次阈值 → 提前阻断，不加载模型/不设 GPU 设备。"""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            root = tmp / "root"; final = tmp / "final"; mask = tmp / "mask"
+            weight = _make_fake_weight(tmp / "w.pth")
+            d = root / "task_single"
+            d.mkdir(parents=True, exist_ok=True)
+            _make_tif(d / "only.tif")  # 只有 1 景
+            final.mkdir(); mask.mkdir()
+            plan = ial.build_inference_plan(
+                task_id="task_single", root_dir=str(root), final_root=str(final),
+                mask_root=str(mask), model_path=str(weight),
+                prob_threshold=0.05, count_threshold=2,
+            )
+            ok, blockers, device = ial.validate_inference_plan(plan, check_weight_load=False)
+            self.assertFalse(ok)
+            self.assertTrue(any("频次阈值为 2" in b and "只有 1 景" in b for b in blockers))
+            # 阻断时设备未启动（不虚报 GPU/CPU）
+            self.assertEqual(device, "")
+            self.assertEqual(plan["device"], "")
+
+    def test_a1_single_scene_ok_when_cnt_1(self):
+        """A1：cnt=1 时单景不阻断（阈值语义允许）。"""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            root = tmp / "root"; final = tmp / "final"; mask = tmp / "mask"
+            weight = _make_fake_weight(tmp / "w.pth")
+            d = root / "task_single"
+            d.mkdir(parents=True, exist_ok=True)
+            _make_tif(d / "only.tif")
+            final.mkdir(); mask.mkdir()
+            plan = ial.build_inference_plan(
+                task_id="task_single", root_dir=str(root), final_root=str(final),
+                mask_root=str(mask), model_path=str(weight),
+                prob_threshold=0.05, count_threshold=1,
+            )
+            ok, blockers, _ = ial.validate_inference_plan(plan, check_weight_load=False)
+            self.assertTrue(ok, blockers)
+            self.assertFalse(any("频次阈值" in b for b in blockers))
 
 
 # ===============================================================
