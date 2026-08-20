@@ -804,12 +804,21 @@ def _run_gee_step(step, workflow, *, exec_ctx, push_log, stop_event) -> Dict[str
     local_out_dir = os.path.join(
         str(ctx.get("root_dir") or ""), str(workflow.get("task_id") or "aoi")
     )
+    # aoi 可能来自 session_state 的 AOIContext 对象（旧路径）或 dict（新路径），
+    # 统一归一化为带几何的 dict；无几何时给出明确、可操作的失败原因。
     aoi_dict = (exec_ctx or {}).get("aoi")
+    if hasattr(aoi_dict, "to_dict"):
+        try:
+            aoi_dict = aoi_dict.to_dict()
+        except Exception:  # noqa: BLE001
+            aoi_dict = None
     if not isinstance(aoi_dict, dict) or not aoi_dict.get("geometry"):
-        # 回退：context 中只有 aoi_id/label 时，从 context 重建（无几何 → 计划将阻塞）
-        aoi_dict = {
-            "aoi_id": ctx.get("aoi_id"), "label": ctx.get("aoi_summary"),
-            "source": "map_polygon",
+        # 无几何必然被 build_gee_download_plan 阻塞；直接给出可操作提示，避免
+        # 晦涩的「AOI 无效（必须是合法 GeoJSON Polygon）」。
+        return {
+            "success": False, "status": STEP_FAILED, "outputs": {},
+            "assets": [], "metrics": {}, "warnings": [],
+            "error": "缺少有效 AOI 几何（请先在三维地图绘制/选择研究区域 AOI 后再执行一键潮滩分析）。",
         }
     plan = gal.build_gee_download_plan(
         task_id=str(workflow.get("task_id") or ""),

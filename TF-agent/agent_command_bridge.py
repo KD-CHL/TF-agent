@@ -124,20 +124,39 @@ class ApplyResult:
 PENDING_AGENT_COMMANDS_KEY = "_pending_agent_commands"
 
 
+def _default_ui_path(path: str) -> str:
+    """路径类默认值：本机存在才返回，否则返回空串。
+
+    让仓库在其它机器（同门环境）克隆后可直接启动，由用户在侧栏选择真实路径；
+    开发机本身上述路径存在时保持原默认值，体验不变。
+    """
+    try:
+        return path if path and os.path.exists(path) else ""
+    except Exception:
+        return ""
+
+
 def init_ui_session_defaults(state: Dict[str, Any]) -> None:
     """初始化侧栏 UI 绑定键（仅缺省时写入，不覆盖用户/Agent 已有值）。"""
+    _repo_root = os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    )
     defaults = {
         "ui_workflow": "潮滩推理",
         "ui_run_mode": "dl",
-        "ui_root_dir": r"I:\GEE_data\20",
-        "ui_mask_root": r"E:\Data\843mask",
-        "ui_final_root": r"E:\Data\843output",
-        "ui_model_path": r"E:\Code\GEE\best_train_loss_model_resnet50.pth",
-        "ui_shp_path": r"E:\Code\GEE\jb\water-line\max_water_extent23.shp",
-        "ui_points_shp": os.path.normpath(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "jb", "point", "points_export.shp")
+        "ui_root_dir": _default_ui_path(r"I:\GEE_data\20"),
+        "ui_mask_root": _default_ui_path(r"E:\Data\843mask"),
+        "ui_final_root": _default_ui_path(r"E:\Data\843output"),
+        "ui_model_path": _default_ui_path(
+            r"E:\Code\GEE\best_train_loss_model_resnet50.pth"
         ),
-        "ui_task_aoi_shp": r"E:\Data\CHINA_tf_city\china_costal.shp",
+        "ui_shp_path": _default_ui_path(
+            r"E:\Code\GEE\jb\water-line\max_water_extent23.shp"
+        ),
+        "ui_points_shp": _default_ui_path(
+            os.path.join(_repo_root, "jb", "point", "points_export.shp")
+        ),
+        "ui_task_aoi_shp": _default_ui_path(r"E:\Data\CHINA_tf_city\china_costal.shp"),
         "ui_inference_mode": "深度学习",
         "ui_adaptive_mode": False,
         "ui_prob_th": 0.05,
@@ -146,12 +165,12 @@ def init_ui_session_defaults(state: Dict[str, Any]) -> None:
         "ui_m5_enabled": True,
         "ui_m5_baseline_shp": "",
         "ui_e1_enabled": False,
-        "ui_e1_data_root": r"E:\潮滩数据集",
+        "ui_e1_data_root": _default_ui_path(r"E:\潮滩数据集"),
         "ui_e1_reference": "师姐_2020",
         "ui_e1_compare_sources": [],
         "ui_e1_export_maps": True,
         "ui_e1_export_heatmap": True,
-        "ui_m4_roi_path": r"E:\Data\CHINA_tf_city\china_costal.shp",
+        "ui_m4_roi_path": _default_ui_path(r"E:\Data\CHINA_tf_city\china_costal.shp"),
         "ui_m4_roi_name": "",
         "ui_m4_start_date": "2020-01-01",
         "ui_m4_end_date": "2020-01-31",
@@ -170,6 +189,28 @@ def init_ui_session_defaults(state: Dict[str, Any]) -> None:
     for k, v in defaults.items():
         if k not in state:
             state[k] = v
+
+
+def _aoi_state_to_dict(state: Dict[str, Any]) -> Dict[str, Any]:
+    """把 session_state 的 _active_aoi 统一转成 dict。
+
+    _active_aoi 由 aoi_map_bridge.process_aoi_selected 存为 AOIContext 实例
+    （dataclass），直接 dict(obj) 会抛 TypeError；这里用 to_dict() 序列化。
+    无有效 AOI 时返回 {}（调用方据此判定「未解析到有效 AOI」）。
+    """
+    aoi = state.get("_active_aoi")
+    if aoi is None:
+        return {}
+    if isinstance(aoi, dict):
+        return dict(aoi)
+    to_dict = getattr(aoi, "to_dict", None)
+    if callable(to_dict):
+        try:
+            d = to_dict()
+            return d if isinstance(d, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+    return {}
 
 
 def parse_system_command(text: str) -> Optional[Dict[str, Any]]:
@@ -748,7 +789,7 @@ def propose_gee_plan(state: Dict[str, Any], action: Optional[Dict[str, Any]] = N
     elif action.get("aoi_id"):
         aoi_dict = {"aoi_id": str(action["aoi_id"]), "valid": True}
     elif state.get("_active_aoi"):
-        aoi_dict = dict(state["_active_aoi"])
+        aoi_dict = _aoi_state_to_dict(state)
     elif state.get("ui_m4_roi_path"):
         # 矢量文件：仅提取 bbox（轻量，不加载全量几何进 LLM）
         try:
@@ -914,7 +955,7 @@ def propose_workflow_plan(state: Dict[str, Any], action: Optional[Dict[str, Any]
     elif action.get("aoi_id"):
         aoi_dict = {"aoi_id": str(action["aoi_id"]), "valid": True}
     elif state.get("_active_aoi"):
-        aoi_dict = dict(state["_active_aoi"])
+        aoi_dict = _aoi_state_to_dict(state)
     elif state.get("ui_m4_roi_path"):
         try:
             import geopandas as gpd
@@ -1533,7 +1574,18 @@ def flush_pending_agent_commands(state: Dict[str, Any]) -> ApplyResult:
     for cmd in pending:
         if not isinstance(cmd, dict):
             continue
-        one = apply_system_command(state, cmd)
+        try:
+            one = apply_system_command(state, cmd)
+        except Exception as e:  # noqa: BLE001
+            # 单条指令异常绝不能拖垮整个 Streamlit 脚本（否则前端出现
+            # 「未找到错误 / removeChild」级联报错）
+            import traceback
+
+            merged.errors.append(
+                f"Agent 指令处理异常（{str(cmd.get('type') or cmd.get('pending_action') or 'unknown')[:60]}）: {e}"
+            )
+            print(f"[agent_command_bridge] flush 指令异常: {e}\n{traceback.format_exc()}")
+            continue
         merged.map_updated = merged.map_updated or one.map_updated
         merged.sidebar_keys_updated.extend(one.sidebar_keys_updated)
         merged.errors.extend(one.errors)

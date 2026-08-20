@@ -1797,6 +1797,7 @@ from agent_command_bridge import (
     build_agent_sidebar_context,
     flush_pending_agent_commands,
     queue_agent_command,
+    _aoi_state_to_dict,
 )
 
 import map_protocol as _map_proto
@@ -4762,7 +4763,8 @@ def maybe_start_pipeline_thread():
             "e1_reference": e1_reference,
             "task": task_info.get("task"),
             "workflow_plan": task_info.get("workflow_plan"),
-            "aoi": st.session_state.get("_active_aoi"),
+            # _active_aoi 可能是 AOIContext 对象，先序列化为 dict 再交给编排器
+            "aoi": _aoi_state_to_dict(st.session_state),
             "registry": None,
             "registry_path": os.path.join(
                 os.path.dirname(os.path.abspath(__file__)), "assets_registry.json"),

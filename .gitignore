@@ -61,3 +61,13 @@ Thumbs.db
 .DS_Store
 analysis_out.txt
 scan_out.txt
+
+# Local ad-hoc analysis scripts (not part of the deliverable)
+Untitled
+analyze_shp_minimal.py
+analyze_tidal_datasets.py
+scan_tidal_data.py
+
+# Acceptance test outputs (regenerated locally)
+tests/acceptance/_out/
+

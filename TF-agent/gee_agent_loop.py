@@ -266,7 +266,7 @@ def build_gee_download_plan(
             aoi_ctx = AOIContext.from_dict(aoi)
         except Exception:  # noqa: BLE001
             warnings.append("AOI 上下文解析失败，按无效 AOI 处理。")
-    if aoi_ctx is None or not aoi_ctx.valid:
+    if aoi_ctx is None or not aoi_ctx.valid or not aoi_ctx.geometry:
         blockers.append("AOI 无效（必须是合法 GeoJSON Polygon）。")
     else:
         warnings.extend(list(aoi_ctx.warnings or []))
@@ -447,7 +447,7 @@ def validate_gee_download_plan(
 
     # AOI
     aoi = plan.get("aoi") or {}
-    if not aoi or not aoi.get("valid"):
+    if not aoi or not aoi.get("valid") or not aoi.get("geometry"):
         blockers.append("AOI 无效（必须为合法 GeoJSON Polygon）。")
     else:
         bbox = aoi.get("bbox") or (0, 0, 0, 0)
