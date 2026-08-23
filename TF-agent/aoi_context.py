@@ -16,6 +16,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from agent_context_policy import sanitize_external_text
+
 try:
     from pyproj import Geod
 
@@ -253,19 +255,26 @@ class AOIContext:
         return cls(**data)
 
 
-def compact_summary(aoi: AOIContext) -> str:
-    """紧凑注入文本（无完整 GeoJSON、无敏感值）。"""
+def compact_summary(aoi: AOIContext, *, include_spatial: bool = True) -> str:
+    """紧凑摘要；外部模型上下文可显式省略精确空间字段。"""
     parts = [
         f"id={aoi.aoi_id}",
         f"source={aoi.source}",
-        f"bbox=({aoi.bbox[0]},{aoi.bbox[1]},{aoi.bbox[2]},{aoi.bbox[3]})",
-        f"centroid=({aoi.centroid[0]:.4f},{aoi.centroid[1]:.4f})",
         f"area_km2={aoi.area_km2:.1f}",
     ]
+    if include_spatial:
+        parts.insert(2, f"bbox=({aoi.bbox[0]},{aoi.bbox[1]},{aoi.bbox[2]},{aoi.bbox[3]})")
+        parts.insert(3, f"centroid=({aoi.centroid[0]:.4f},{aoi.centroid[1]:.4f})")
+    else:
+        parts.append("spatial=redacted")
     if aoi.label:
-        parts.append(f"label={aoi.label}")
+        parts.append(f"label={sanitize_external_text(aoi.label)[:120]}")
     if not aoi.valid:
         parts.append("invalid")
         if aoi.warnings:
-            parts.append("reasons=" + ";".join(aoi.warnings[:3]))
+            if include_spatial:
+                _reasons = ";".join(sanitize_external_text(w)[:160] for w in aoi.warnings[:3])
+                parts.append("reasons=" + _reasons)
+            else:
+                parts.append("reasons=空间校验未通过（细节仅保留在本地）")
     return "[当前AOI] " + " ".join(parts)

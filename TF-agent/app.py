@@ -10,6 +10,7 @@ import re
 import glob
 import time
 import io
+import tempfile
 
 try:
     from dotenv import load_dotenv
@@ -39,7 +40,10 @@ import math
 import contextlib
 import threading
 import traceback
+import uuid
 import numpy as np
+from agent_context_policy import safe_error_summary, sanitize_external_text
+from preview_cache import cleanup_preview_cache, preview_cache_dir
 
 
 @contextlib.contextmanager
@@ -64,20 +68,25 @@ def _append_debug_log(message: str):
 
 
 def _format_agent_exception(exc: Exception) -> str:
-    parts = [f"{type(exc).__name__}: {exc}"]
+    # UI/debug output must not echo provider response bodies, local paths or credentials.
+    parts = [safe_error_summary(exc)]
     status = getattr(exc, "status_code", None)
     code = getattr(exc, "code", None)
     if status is not None:
         parts.append(f"status_code={status}")
     if code:
         parts.append(f"code={code}")
-    resp = getattr(exc, "response", None)
-    if resp is not None:
-        try:
-            parts.append(f"response={resp.text}")
-        except Exception:
-            pass
     return " | ".join(parts)
+
+
+def _record_worker_exception(shared, label: str, error: BaseException) -> None:
+    """Store only a bounded safe summary in UI worker state, never a traceback."""
+    safe = safe_error_summary(error)
+    with shared["lock"]:
+        lines = list(shared.get("log_lines") or [])
+        lines.append(f"[CRASH] {label}: {safe}")
+        shared["log_lines"] = lines[-30:]
+        shared["status"] = ("error", f"{label}：{safe}")
 
 
 def _chat_preview_uint8(rgb: np.ndarray) -> np.ndarray:
@@ -111,10 +120,9 @@ def _save_chat_image_preview(uploaded_file):
     name = os.path.basename(getattr(uploaded_file, "name", "") or "upload_image")
     ext = os.path.splitext(name)[1].lower()
     safe = "".join(c for c in name if c.isalnum() or c in "._-") or "upload_image"
-    yy_dir = os.path.dirname(os.path.abspath(__file__))
-    preview_dir = os.path.join(yy_dir, "_chat_upload_tmp", "_preview_cache")
+    preview_dir = preview_cache_dir(os.path.dirname(os.path.abspath(__file__)))
     os.makedirs(preview_dir, exist_ok=True)
-    preview_path = os.path.join(preview_dir, f"preview_{os.getpid()}_{int(time.time() * 1000)}_{safe}.png")
+    preview_path = os.path.join(preview_dir, f"preview_{uuid.uuid4().hex}_{safe}.png")
     raw = uploaded_file.getbuffer()
 
     try:
@@ -157,8 +165,34 @@ def _save_chat_image_preview(uploaded_file):
         preview.save(preview_path, format="PNG")
         return preview_path, name
     except Exception as e:
-        _append_debug_log(f"save_chat_preview_failed: {e}; file={name}")
+        _append_debug_log(f"save_chat_preview_failed: {safe_error_summary(e)}; file={name}")
         return None, name
+
+
+def _render_chat_attachment_previews(message):
+    """Render every live local preview attached to one chat message."""
+    preview_paths = message.get("image_preview_paths") or []
+    image_names = message.get("image_names") or []
+    if not isinstance(preview_paths, (list, tuple)):
+        preview_paths = [preview_paths]
+    if not isinstance(image_names, (list, tuple)):
+        image_names = [image_names]
+    if not preview_paths and message.get("image_preview_path"):
+        preview_paths = [message.get("image_preview_path")]
+        image_names = [message.get("image_name") or "uploaded image"]
+
+    live_paths = []
+    live_captions = []
+    for index, preview_path in enumerate(preview_paths):
+        if not preview_path or not os.path.exists(str(preview_path)):
+            continue
+        live_paths.append(str(preview_path))
+        if index < len(image_names) and image_names[index]:
+            live_captions.append(str(image_names[index]))
+        else:
+            live_captions.append(f"附件 {index + 1}")
+    if live_paths:
+        st.image(live_paths, caption=live_captions, width="stretch")
 
 
 def _nodata_safe_for_tile_api(value):
@@ -299,18 +333,18 @@ ASSET_REGISTRY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 
 
 def load_asset_registry():
-    if os.path.exists(ASSET_REGISTRY_PATH):
-        try:
-            with open(ASSET_REGISTRY_PATH, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+    # Keep one strict read path for both the UI and Workflow executors.  A
+    # corrupt registry is preserved and rejected instead of being treated as
+    # an empty registry that a later registration could overwrite.
+    from workflow_orchestrator import load_assets_registry
+
+    return load_assets_registry(ASSET_REGISTRY_PATH)
 
 
 def save_asset_registry(registry):
-    with open(ASSET_REGISTRY_PATH, 'w', encoding='utf-8') as f:
-        json.dump(registry, f, ensure_ascii=False, indent=2)
+    from workflow_orchestrator import save_assets_registry
+
+    save_assets_registry(registry, ASSET_REGISTRY_PATH)
 
 
 def register_asset(task, prob, cnt, file_path):
@@ -365,10 +399,21 @@ def register_index_asset(task, file_path):
     return asset_key
 
 
+def _nonempty_file(path):
+    """Postflight asset gate shared by independent report registries."""
+    try:
+        return bool(path) and os.path.isfile(str(path)) and os.path.getsize(str(path)) > 0
+    except OSError:
+        return False
+
+
 def register_m5_asset(task, report: dict):
     """将 M5 报告与差异面登记到资产账本。"""
     import m5_agent_loop
 
+    report_path = (report or {}).get("report_path")
+    if not _nonempty_file(report_path):
+        return None
     registry = load_asset_registry()
     asset_key = f"{task}_m5"
     map_path = m5_agent_loop.pick_m5_map_path(report)
@@ -380,7 +425,7 @@ def register_m5_asset(task, report: dict):
     if silt and str(silt) == "None":
         silt = None
     size_mb = 0.0
-    for p in (map_path, loss, silt, (report or {}).get("report_path")):
+    for p in (map_path, loss, silt, report_path):
         if not p or not os.path.isfile(str(p)):
             continue
         try:
@@ -391,7 +436,7 @@ def register_m5_asset(task, report: dict):
         "task": task,
         "method": "m5",
         "file_path": os.path.normpath(map_path) if map_path else "",
-        "report_path": (report or {}).get("report_path"),
+        "report_path": report_path,
         "loss_shp": loss if loss and os.path.isfile(str(loss)) else None,
         "siltation_shp": silt if silt and os.path.isfile(str(silt)) else None,
         "baseline_task": (report or {}).get("baseline_task"),
@@ -420,11 +465,14 @@ def register_e1_asset(task, report: dict):
     """将 E1 报告与可选热力/分歧图登记到资产账本。"""
     import e1_agent_loop
 
+    report_path = (report or {}).get("report_path")
+    if not _nonempty_file(report_path):
+        return None
     registry = load_asset_registry()
     asset_key = f"{task}_e1"
     map_path = e1_agent_loop.pick_e1_map_path(report)
     size_mb = 0.0
-    for p in (map_path, (report or {}).get("report_path"), (report or {}).get("report_md_path")):
+    for p in (map_path, report_path, (report or {}).get("report_md_path")):
         if not p or not os.path.isfile(str(p)):
             continue
         try:
@@ -435,7 +483,7 @@ def register_e1_asset(task, report: dict):
         "task": task,
         "method": "e1",
         "file_path": os.path.normpath(map_path) if map_path else "",
-        "report_path": (report or {}).get("report_path"),
+        "report_path": report_path,
         "report_md_path": (report or {}).get("report_md_path"),
         "reference": (report or {}).get("reference"),
         "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -681,7 +729,7 @@ def _add_result_raster_to_map(m, path: str, layer_name: str, opacity: float = 0.
                 if dt.startswith(("uint", "int")) or "float" in dt:
                     _nd_api = 0
     except Exception as e:
-        return False, f"无法读取栅格元数据: {e}"
+        return False, f"无法读取栅格元数据: {safe_error_summary(e)}"
 
     op = float(max(0.05, min(1.0, opacity)))
     kw = dict(
@@ -699,7 +747,7 @@ def _add_result_raster_to_map(m, path: str, layer_name: str, opacity: float = 0.
             m.add_raster(norm, **kw)
         return True, None
     except Exception as e:
-        return False, str(e)
+        return False, safe_error_summary(e)
 
 
 def _add_result_vector_to_map(m, path: str, layer_name: str, opacity: float = 0.5):
@@ -711,7 +759,7 @@ def _add_result_vector_to_map(m, path: str, layer_name: str, opacity: float = 0.
         import geopandas as gpd
         import folium
     except ImportError as e:
-        return False, f"缺少 geopandas/folium: {e}"
+        return False, f"缺少 geopandas/folium: {safe_error_summary(e)}"
 
     try:
         gdf = gpd.read_file(norm)
@@ -737,7 +785,7 @@ def _add_result_vector_to_map(m, path: str, layer_name: str, opacity: float = 0.
         ).add_to(m)
         return True, None
     except Exception as e:
-        return False, str(e)
+        return False, safe_error_summary(e)
 
 
 def _add_result_to_map(m, path: str, layer_name: str, opacity: float = 0.5):
@@ -757,6 +805,7 @@ def _run_m5_phase(ctx, shared, current_shp, actual_task, prob, cnt, push_log, ch
     push_log(">>> [Phase 3]  潮滩变化分析…")
     try:
         import m5_engine
+        import m5_agent_loop
 
         report = m5_engine.run_m5_after_synthesis(
             current_shp=current_shp,
@@ -770,15 +819,38 @@ def _run_m5_phase(ctx, shared, current_shp, actual_task, prob, cnt, push_log, ch
             logger=push_log,
         )
         if report:
+            verification = m5_agent_loop.verify_m5_outputs(
+                report, workspace_dir=ctx["final_root"]
+            )
+            asset_id = None
+            if verification.get("ok") is True:
+                try:
+                    asset_id = register_m5_asset(actual_task, report)
+                    if not asset_id:
+                        raise RuntimeError("资产登记返回空结果")
+                    push_log(f"[M5] 已登记资产 {asset_id}")
+                except Exception as reg_e:
+                    reg_error = safe_error_summary(reg_e)
+                    verification = dict(verification)
+                    verification["ok"] = False
+                    verification["checks"] = list(verification.get("checks") or []) + [{
+                        "name": "asset_registration", "passed": False, "detail": reg_error,
+                    }]
+                    push_log(f"[M5] 后置资产登记失败（不阻断主流程）: {reg_error}")
             with shared["lock"]:
                 shared["m5_report"] = report
+                shared["m5_verification"] = verification
+                shared["m5_asset_id"] = asset_id if verification.get("ok") is True else None
             lvl = report.get("alert_level", "GREEN")
-            push_log(f"[M5] 变化分析完成，告警级别: {lvl}")
+            if verification.get("ok") is True:
+                push_log(f"[M5] 变化分析完成，告警级别: {lvl}，输出已校验并登记")
+            else:
+                push_log(f"[M5] 变化分析完成但输出校验未完全通过，告警级别: {lvl}")
         else:
             push_log("[M5] 未生成变化告警（可能缺少往年同区域基线）。")
         return report
     except Exception as e:
-        push_log(f"[M5] 变化分析异常: {e}")
+        push_log(f"[M5] 变化分析异常: {safe_error_summary(e)}")
         return None
 
 
@@ -850,19 +922,32 @@ def run_m5_sync(ctx, shared, stop_event):
         report["baseline_task"] = report.get("baseline_task") or m5_cfg.get("baseline_task")
         verification = m5_agent_loop.verify_m5_outputs(report, workspace_dir=ctx["final_root"])
         map_path = verification.get("map_candidate") or m5_agent_loop.pick_m5_map_path(report)
-        try:
-            register_m5_asset(task, report)
-            push_log(f"[M5] 已登记资产 {task}_m5")
-        except Exception as reg_e:
-            push_log(f"[M5] 资产登记失败（不影响报告）: {reg_e}")
+        verified = verification.get("ok") is True
+        if verified:
+            try:
+                asset_id = register_m5_asset(task, report)
+                if not asset_id:
+                    raise RuntimeError("资产登记返回空结果")
+                push_log(f"[M5] 已登记资产 {asset_id}")
+            except Exception as reg_e:
+                reg_error = safe_error_summary(reg_e)
+                verified = False
+                verification = dict(verification)
+                verification["ok"] = False
+                verification["checks"] = list(verification.get("checks") or []) + [{
+                    "name": "asset_registration", "passed": False, "detail": reg_error,
+                }]
+                push_log(f"[M5] 资产登记失败，任务不提交成功: {reg_error}")
+        else:
+            push_log("[M5] 输出校验未通过，未登记或加载未验证成果。")
 
         with shared["lock"]:
             shared["m5_report"] = report
             shared["m5_verification"] = verification
-            shared["asset_path"] = map_path
+            shared["asset_path"] = map_path if verified and map_path and os.path.isfile(str(map_path)) else None
             shared["job_kind"] = "m5"
 
-        if verification.get("ok"):
+        if verified:
             push_status(
                 "success",
                 f"变化分析完成 · 告警 {report.get('alert_level', '—')}",
@@ -871,10 +956,11 @@ def run_m5_sync(ctx, shared, stop_event):
             push_status("warning", "变化分析已完成但输出校验未完全通过")
         push_progress(100)
         push_log(m5_agent_loop.summarize_m5_report_for_chat(report, verification).replace("\n", " | "))
-        return True
+        return verified
     except Exception as e:
-        push_log(f"[ERROR] {e}")
-        push_status("error", f"变化分析异常: {e}")
+        safe = safe_error_summary(e)
+        push_log(f"[ERROR] {safe}")
+        push_status("error", f"变化分析异常: {safe}")
         import traceback
 
         traceback.print_exc()
@@ -886,13 +972,7 @@ def _m5_worker_entry(ctx, shared, stop_event):
     try:
         ok = run_m5_sync(ctx, shared, stop_event)
     except Exception as e:
-        tb_lines = traceback.format_exc().split("\n")[:25]
-        with shared["lock"]:
-            lines = list(shared.get("log_lines") or [])
-            lines.append(f"[CRASH] {e}")
-            lines.extend(tb_lines)
-            shared["log_lines"] = lines[-40:]
-            shared["status"] = ("error", str(e))
+        _record_worker_exception(shared, "M5 线程异常", e)
     finally:
         with shared["lock"]:
             shared["success"] = ok
@@ -971,29 +1051,43 @@ def run_e1_sync(ctx, shared, stop_event):
             return False
         verification = e1_agent_loop.verify_e1_outputs(report)
         map_path = verification.get("map_candidate") or e1_agent_loop.pick_e1_map_path(report)
-        try:
-            register_e1_asset(task, report)
-            push_log(f"[E1] 已登记资产 {task}_e1")
-        except Exception as reg_e:
-            push_log(f"[E1] 资产登记失败（不影响报告）: {reg_e}")
+        verified = verification.get("ok") is True
+        if verified:
+            try:
+                asset_id = register_e1_asset(task, report)
+                if not asset_id:
+                    raise RuntimeError("资产登记返回空结果")
+                push_log(f"[E1] 已登记资产 {asset_id}")
+            except Exception as reg_e:
+                reg_error = safe_error_summary(reg_e)
+                verified = False
+                verification = dict(verification)
+                verification["ok"] = False
+                verification["checks"] = list(verification.get("checks") or []) + [{
+                    "name": "asset_registration", "passed": False, "detail": reg_error,
+                }]
+                push_log(f"[E1] 资产登记失败，任务不提交成功: {reg_error}")
+        else:
+            push_log("[E1] 输出校验未通过，未登记或加载未验证成果。")
 
         with shared["lock"]:
             shared["e1_report"] = report
             shared["e1_verification"] = verification
-            shared["asset_path"] = map_path
+            shared["asset_path"] = map_path if verified and map_path and os.path.isfile(str(map_path)) else None
             shared["job_kind"] = "e1"
 
         n = len(report.get("comparisons") or {})
-        if verification.get("ok"):
+        if verified:
             push_status("success", f"精度评价完成 · {n} 组对比")
         else:
             push_status("warning", "精度评价已完成但输出校验未完全通过")
         push_progress(100)
         push_log(e1_agent_loop.summarize_e1_report_for_chat(report, verification).replace("\n", " | "))
-        return True
+        return verified
     except Exception as e:
-        push_log(f"[ERROR] {e}")
-        push_status("error", f"精度评价异常: {e}")
+        safe = safe_error_summary(e)
+        push_log(f"[ERROR] {safe}")
+        push_status("error", f"精度评价异常: {safe}")
         import traceback as _tb
 
         _tb.print_exc()
@@ -1005,13 +1099,7 @@ def _e1_worker_entry(ctx, shared, stop_event):
     try:
         ok = run_e1_sync(ctx, shared, stop_event)
     except Exception as e:
-        tb_lines = traceback.format_exc().split("\n")[:25]
-        with shared["lock"]:
-            lines = list(shared.get("log_lines") or [])
-            lines.append(f"[CRASH] {e}")
-            lines.extend(tb_lines)
-            shared["log_lines"] = lines[-40:]
-            shared["status"] = ("error", str(e))
+        _record_worker_exception(shared, "E1 线程异常", e)
     finally:
         with shared["lock"]:
             shared["success"] = ok
@@ -1027,6 +1115,7 @@ def _run_e1_phase(ctx, shared, current_shp, actual_task, push_log, check_stop):
     push_log(">>> [Phase 4]  潮滩精度评价…")
     try:
         import e1_engine
+        import e1_agent_loop
 
         roi_path = e1_engine.resolve_task_roi_path(
             ctx.get("task_aoi_shp"),
@@ -1052,19 +1141,44 @@ def _run_e1_phase(ctx, shared, current_shp, actual_task, push_log, check_stop):
             logger=push_log,
         )
         if report:
+            verification = e1_agent_loop.verify_e1_outputs(report)
+            asset_id = None
+            if verification.get("ok") is True:
+                try:
+                    asset_id = register_e1_asset(actual_task, report)
+                    if not asset_id:
+                        raise RuntimeError("资产登记返回空结果")
+                    push_log(f"[E1] 已登记资产 {asset_id}")
+                except Exception as reg_e:
+                    reg_error = safe_error_summary(reg_e)
+                    verification = dict(verification)
+                    verification["ok"] = False
+                    verification["checks"] = list(verification.get("checks") or []) + [{
+                        "name": "asset_registration", "passed": False, "detail": reg_error,
+                    }]
+                    push_log(f"[E1] 后置资产登记失败（不阻断主流程）: {reg_error}")
             with shared["lock"]:
                 shared["e1_report"] = report
-            push_log(f"[E1] 精度评价完成，对比 {len(report.get('comparisons') or {})} 组产品。")
+                shared["e1_verification"] = verification
+                shared["e1_asset_id"] = asset_id if verification.get("ok") is True else None
+            if verification.get("ok") is True:
+                push_log(f"[E1] 精度评价完成，对比 {len(report.get('comparisons') or {})} 组产品，输出已校验并登记。")
+            else:
+                push_log(f"[E1] 精度评价完成但输出校验未完全通过，对比 {len(report.get('comparisons') or {})} 组产品。")
         else:
             push_log("[E1] 未生成精度评价结果。")
         return report
     except Exception as e:
-        push_log(f"[E1] 精度评价异常: {e}")
+        push_log(f"[E1] 精度评价异常: {safe_error_summary(e)}")
         return None
 
 
 def run_pipeline_sync(ctx, shared, stop_event):
-    """在后台线程中执行推理；只写 shared / 文件，不调用任何 Streamlit API。"""
+    """兼容旧入口的同步执行适配器。
+
+    新的深度学习 Agent 入口应使用 ``inference_agent_loop``；此函数暂时保留以
+    读取旧任务资产，不再作为新的 Agent/UI 请求构建器。
+    """
     logs_local = []
 
     def check_stop():
@@ -1155,7 +1269,7 @@ def run_pipeline_sync(ctx, shared, stop_event):
         model = pre_engine.load_model(model_path, device)
         push_progress(10)
     except Exception as e:
-        push_status("error", f"模型加载失败: {e}")
+        push_status("error", f"模型加载失败: {safe_error_summary(e)}")
         return False
 
     push_log(">>> [Phase 1] 开始深度学习推理...")
@@ -1192,7 +1306,7 @@ def run_pipeline_sync(ctx, shared, stop_event):
                     return False
                 success_count += 1
             except Exception as e:
-                push_log(f"  |-- [FAIL] {fname}: {e}")
+                push_log(f"  |-- [FAIL] {fname}: {safe_error_summary(e)}")
 
         push_progress(int(10 + (success_count / total) * 70))
 
@@ -1212,6 +1326,13 @@ def run_pipeline_sync(ctx, shared, stop_event):
             shp_path=shp_path, prob_threshold=prob, min_absolute_count=cnt,
             logger=bridge_logger, stop_callback=check_stop
         )
+        if success and (
+            not os.path.isfile(current_final_shp)
+            or os.path.getsize(current_final_shp) <= 0
+        ):
+            push_log("[SYSTEM] 合成引擎返回成功，但最终成果文件缺失或为空；不登记为成功。")
+            push_status("error", "合成结果校验失败：成果文件缺失或为空。")
+            return False
         if success:
             register_asset(actual_task, prob, cnt, current_final_shp)
             _run_m5_phase(ctx, shared, current_final_shp, actual_task, prob, cnt, push_log, check_stop)
@@ -1225,14 +1346,15 @@ def run_pipeline_sync(ctx, shared, stop_event):
         push_log("[SYSTEM] 🚨 合成阶段被强行终止。")
         return False
     except Exception as e:
-        push_log(f"[SYSTEM] 合成异常: {e}\n{traceback.format_exc()}")
-        push_status("error", f"合成算法崩溃: {e}")
+        safe = safe_error_summary(e)
+        push_log(f"[SYSTEM] 合成异常: {safe}")
+        push_status("error", f"合成算法崩溃: {safe}")
         return False
 
 
 def run_index_pipeline_sync(ctx, shared, stop_event):
-    """指数法潮滩提取（M1 mNDWI + M2 ACWI + 空间融合）。"""
-    import index_engine
+    """指数法潮滩提取（统一委托 index_agent_loop，保留旧 UI 收尾语义）。"""
+    import index_agent_loop
 
     logs_local = []
 
@@ -1254,28 +1376,17 @@ def run_index_pipeline_sync(ctx, shared, stop_event):
         with shared["lock"]:
             shared["status"] = (kind, text)
 
-    task = ctx["task"]
-    root_dir = ctx["root_dir"]
-    final_root = ctx["final_root"]
-    points_shp = ctx["points_shp"]
-    task_options = ctx["task_options"]
-
+    task = ctx.get("task")
     actual_task = task
-    for opt in task_options:
+    for opt in ctx.get("task_options") or []:
         if task in opt:
             actual_task = opt
             break
+    input_dir = os.path.join(ctx.get("root_dir") or "", actual_task or "")
+    final_out_dir = os.path.join(ctx.get("final_root") or "", actual_task or "")
+    points_shp = ctx.get("points_shp") or ""
 
-    if not actual_task or not root_dir:
-        push_status("error", "❌ 未选择有效目标任务，或原始影像目录未配置。请在侧栏选择任务后再运行指数法推理。")
-        return False
-
-    input_dir = os.path.join(root_dir, actual_task)
-    final_out_dir = os.path.join(final_root, actual_task)
-    output_tif = os.path.join(final_out_dir, f"{actual_task}_Index_Final.tif")
-    work_dir = os.path.join(final_out_dir, "index_work")
-
-    cached = find_index_asset(actual_task)
+    cached = find_index_asset(actual_task) if actual_task else None
     if cached and not ctx.get("force_rerun"):
         push_log(f"⚡ 指数法缓存命中: {os.path.basename(cached['file_path'])}")
         index_shp = os.path.join(final_out_dir, "Final_Intertidal_Flat.shp")
@@ -1288,52 +1399,29 @@ def run_index_pipeline_sync(ctx, shared, stop_event):
             shared["asset_path"] = cached["file_path"]
         return True
 
-    push_progress(0)
-    push_status("info", "启动指数法推理…")
-    push_log(f"INIT INDEX TASK: {actual_task}")
-
-    if not os.path.exists(input_dir):
-        push_status("error", f"❌ 找不到输入目录：{input_dir}")
-        return False
-    if not os.path.isfile(points_shp):
-        push_status("error", f"❌ 找不到海洋种子点 SHP：{points_shp}")
-        return False
-
-    os.makedirs(final_out_dir, exist_ok=True)
-
-    def on_status(msg):
-        push_status("info", msg)
-
-    try:
-        result = index_engine.run_index_pipeline(
-            input_dir=input_dir,
-            output_tif=output_tif,
-            points_shp=points_shp,
-            work_dir=work_dir,
-            push_log=push_log,
-            push_progress=push_progress,
-            stop_callback=check_stop,
+    plan = ctx.get("index_plan")
+    if not isinstance(plan, dict):
+        plan = index_agent_loop.build_index_plan(
+            task=actual_task or "", input_dir=input_dir,
+            output_dir=final_out_dir, points_shp=points_shp,
+            force_rerun=bool(ctx.get("force_rerun")),
         )
-        if check_stop():
-            push_status("warning", "任务已被手动中止。")
-            return False
-        if not result or not os.path.isfile(result):
-            push_status("error", "指数法未生成有效结果文件。")
-            return False
-        register_index_asset(actual_task, result)
-        index_shp = os.path.join(final_out_dir, "Final_Intertidal_Flat.shp")
-        if os.path.isfile(index_shp):
-            _run_m5_phase(ctx, shared, index_shp, actual_task, None, None, push_log, check_stop)
-            _run_e1_phase(ctx, shared, index_shp, actual_task, push_log, check_stop)
-        push_progress(100)
-        push_status("success", "🎉 指数法潮滩提取完成！")
-        with shared["lock"]:
-            shared["asset_path"] = result
-        return True
-    except Exception as e:
-        push_log(f"[SYSTEM] 指数法异常: {e}\n{traceback.format_exc()}")
-        push_status("error", f"指数法失败: {e}")
+    result = index_agent_loop.execute_index_plan(
+        plan, push_log=push_log, push_progress=push_progress,
+        stop_callback=check_stop,
+        register_asset=lambda path: register_index_asset(actual_task, path),
+    )
+    if result.get("success") is not True:
+        push_status("warning" if result.get("status") == "CANCELLED" else "error", index_agent_loop.summarize_index_result(result))
         return False
+    index_shp = os.path.join(final_out_dir, "Final_Intertidal_Flat.shp")
+    if os.path.isfile(index_shp):
+        _run_m5_phase(ctx, shared, index_shp, actual_task, None, None, push_log, check_stop)
+        _run_e1_phase(ctx, shared, index_shp, actual_task, push_log, check_stop)
+    push_status("success", index_agent_loop.summarize_index_result(result))
+    with shared["lock"]:
+        shared["asset_path"] = result.get("result_path")
+    return True
 
 
 def run_m4_download_sync(ctx, shared, stop_event):
@@ -1403,8 +1491,9 @@ def run_m4_download_sync(ctx, shared, stop_event):
         push_progress(100)
         return True
     except Exception as e:
-        push_log(f"[SYSTEM] M4 异常: {e}\n{traceback.format_exc()}")
-        push_status("error", f"影像获取失败: {e}")
+        safe = safe_error_summary(e)
+        push_log(f"[SYSTEM] M4 异常: {safe}")
+        push_status("error", f"影像获取失败: {safe}")
         return False
 
 
@@ -1413,19 +1502,43 @@ def _pipeline_worker_entry(ctx, shared, stop_event):
     try:
         mode = ctx.get("mode", "dl")
         if mode == "m4":
-            ok = run_m4_download_sync(ctx, shared, stop_event)
+            # Historical M4 payloads are normalized into the trusted GEE
+            # adapter.  Do not send them through the old synchronous path,
+            # which had no shared verify/register gate.
+            import gee_agent_loop as _gee_loop
+
+            legacy_plan = _gee_loop.build_legacy_m4_plan(
+                ctx.get("m4") or {}, task_id=str(ctx.get("task") or "")
+            )
+            if not legacy_plan.get("ready"):
+                reason = "；".join(legacy_plan.get("blockers") or ["旧 M4 参数无法转换为 GEE 计划"])
+                with shared["lock"]:
+                    shared["status"] = ("error", reason)
+                    shared["gee_result"] = {
+                        "success": False,
+                        "task_id": legacy_plan.get("task_id"),
+                        "plan_id": legacy_plan.get("plan_id"),
+                        "error": reason,
+                    }
+                ok = False
+            else:
+                _gee_worker_entry(
+                    {"task": legacy_plan.get("task_id"), "gee_plan": legacy_plan},
+                    shared,
+                    stop_event,
+                )
+                with shared["lock"]:
+                    ok = bool(shared.get("success"))
         elif mode == "index":
             ok = run_index_pipeline_sync(ctx, shared, stop_event)
-        else:
+        elif mode == "legacy_dl":
+            # 仅为明确标记的历史资产提供兼容入口；新请求不得静默回退。
             ok = run_pipeline_sync(ctx, shared, stop_event)
+        else:
+            with shared["lock"]:
+                shared["status"] = ("error", f"未知执行模式：{mode or '空'}，未启动旧兼容入口。")
     except Exception as e:
-        tb_lines = traceback.format_exc().split("\n")[:25]
-        with shared["lock"]:
-            lines = list(shared.get("log_lines") or [])
-            lines.append(f"[CRASH] {e}")
-            lines.extend(tb_lines)
-            shared["log_lines"] = lines[-30:]
-            shared["status"] = ("error", str(e))
+        _record_worker_exception(shared, "后台任务线程异常", e)
         ok = False
     finally:
         with shared["lock"]:
@@ -1471,6 +1584,7 @@ def _workflow_worker_entry(ctx, shared, stop_event):
         push_log(f"WORKFLOW: {wf.get('workflow_id')} | TASK: {wf.get('task_id')}")
 
         exec_ctx = {
+            "workflow_id": wf.get("workflow_id"),
             "aoi": ctx.get("aoi"),
             "root_dir": ctx.get("root_dir"),
             "final_root": ctx.get("final_root"),
@@ -1504,13 +1618,7 @@ def _workflow_worker_entry(ctx, shared, stop_event):
         push_progress(100)
         return
     except Exception as e:
-        tb_lines = traceback.format_exc().split("\n")[:25]
-        with shared["lock"]:
-            lines = list(shared.get("log_lines") or [])
-            lines.append(f"[CRASH] {e}")
-            lines.extend(tb_lines)
-            shared["log_lines"] = lines[-40:]
-            shared["status"] = ("error", str(e))
+        _record_worker_exception(shared, "Workflow 线程异常", e)
         ok = False
     finally:
         with shared["lock"]:
@@ -1563,21 +1671,43 @@ def _inference_worker_entry(ctx, shared, stop_event):
                  f"P={plan.get('prob_threshold')} C={plan.get('count_threshold')} | "
                  f"DEVICE={plan.get('device') or plan.get('device_policy')}")
 
-        result = ial.execute_local_inference(
-            plan,
-            stop_event=stop_event,
-            push_log=push_log,
-            push_progress=push_progress,
-        )
+        recovery = {"action": "INTERRUPTED_WAIT_CONFIRMATION"}
+        result = None
+        verification = None
+        if not plan.get("force_rerun"):
+            recovery = ial.classify_inference_recovery(plan)
+            if recovery.get("action") == "COMPLETE":
+                verification = recovery.get("verification") or {}
+                result = {
+                    "success": True,
+                    "task_id": task_id,
+                    "plan_id": plan.get("plan_id"),
+                    "status": "reused",
+                    "outputs": {
+                        "final_tif": verification.get("final_tif"),
+                        "final_shp": verification.get("final_shp"),
+                    },
+                    "metrics": {"reused_checkpoint": True},
+                    "warnings": ["复用已通过验证的 Final 成果，未重复执行推理。"],
+                    "error": None,
+                }
+                push_log("♻️ 检测到已验证 Final 成果，跳过重复推理。")
+        if result is None:
+            result = ial.execute_local_inference(
+                plan,
+                stop_event=stop_event,
+                push_log=push_log,
+                push_progress=push_progress,
+            )
         if not result or result.get("success") is not True:
-            err = (result or {}).get("error") or "提取失败"
+            err = sanitize_external_text((result or {}).get("error") or "提取失败")[:240]
             push_status("error", f"❌ {err}")
             with shared["lock"]:
                 shared["inference_result"] = result or {}
             return
 
         push_status("info", "提取完成，正在校验磁盘成果…")
-        verification = ial.verify_inference_outputs(plan, result, started_at=started)
+        verification = verification or ial.verify_inference_outputs(plan, result, started_at=started)
         if not verification or verification.get("ok") is not True:
             failed = [c.get("name") for c in (verification or {}).get("checks") or []
                       if not c.get("passed")]
@@ -1610,13 +1740,7 @@ def _inference_worker_entry(ctx, shared, stop_event):
             shared["progress"] = 100
         ok = True
     except Exception as e:
-        tb_lines = traceback.format_exc().split("\n")[:25]
-        with shared["lock"]:
-            lines = list(shared.get("log_lines") or [])
-            lines.append(f"[CRASH] {e}")
-            lines.extend(tb_lines)
-            shared["log_lines"] = lines[-30:]
-            shared["status"] = ("error", f"推理线程异常: {e}")
+        _record_worker_exception(shared, "推理线程异常", e)
         ok = False
     finally:
         with shared["lock"]:
@@ -1676,7 +1800,7 @@ def _gee_worker_entry(ctx, shared, stop_event):
             push_progress=push_progress,
         )
         if not result or result.get("success") is not True:
-            err = (result or {}).get("error") or "影像获取失败"
+            err = sanitize_external_text((result or {}).get("error") or "影像获取失败")[:240]
             push_status("error", f"❌ {err}")
             with shared["lock"]:
                 shared["gee_result"] = result or {}
@@ -1713,13 +1837,7 @@ def _gee_worker_entry(ctx, shared, stop_event):
             shared["progress"] = 100
         ok = True
     except Exception as e:
-        tb_lines = traceback.format_exc().split("\n")[:25]
-        with shared["lock"]:
-            lines = list(shared.get("log_lines") or [])
-            lines.append(f"[CRASH] {e}")
-            lines.extend(tb_lines)
-            shared["log_lines"] = lines[-30:]
-            shared["status"] = ("error", f"GEE 下载线程异常: {e}")
+        _record_worker_exception(shared, "GEE 下载线程异常", e)
         ok = False
     finally:
         with shared["lock"]:
@@ -1760,10 +1878,33 @@ if "pipeline_progress_value" not in st.session_state:
     st.session_state.pipeline_progress_value = 0
 if "pipeline_thread_started" not in st.session_state:
     st.session_state.pipeline_thread_started = False
+if "agent_chat_width_pct" not in st.session_state:
+    st.session_state.agent_chat_width_pct = 34
+if "agent_dock_view" not in st.session_state:
+    st.session_state.agent_dock_view = "对话"
+if "agent_status_panel_height" not in st.session_state:
+    st.session_state.agent_status_panel_height = 220
+if "agent_status_panel_collapsed" not in st.session_state:
+    st.session_state.agent_status_panel_collapsed = False
+# 拖拽尺寸通过 URL 参数跨越 Streamlit rerun 保留；参数只包含 UI 尺寸，不含业务数据。
+try:
+    _query_agent_width = st.query_params.get("cstf_agent_w")
+    if _query_agent_width is not None:
+        st.session_state.agent_chat_width_pct = int(float(_query_agent_width))
+except (TypeError, ValueError, AttributeError):
+    pass
+try:
+    _query_status_height = st.query_params.get("cstf_status_h")
+    if _query_status_height is not None:
+        st.session_state.agent_status_panel_height = int(float(_query_status_height))
+except (TypeError, ValueError, AttributeError):
+    pass
 
 # 🌟 初始化地图状态：控制视角飞跃
 if "map_center" not in st.session_state:
     st.session_state.map_center = [35.0, 105.0]
+if "_map_channel_id" not in st.session_state:
+    st.session_state._map_channel_id = f"map_{uuid.uuid4().hex}"
 if "map_zoom" not in st.session_state:
     st.session_state.map_zoom = 3
 if "_map_view_synced_for" not in st.session_state:
@@ -1868,7 +2009,10 @@ def _poll_aoi_messages():
         import globe_server as _gsrv
 
         _since = int(st.session_state.get("_aoi_poll_seq") or 0)
-        _res = _gsrv.take_aoi_pending(_since)
+        _res = _gsrv.take_aoi_pending(
+            _since,
+            channel_id=st.session_state.get("_map_channel_id"),
+        )
     except Exception:
         return
     if _res.get("last_seq") is not None:
@@ -1895,7 +2039,8 @@ def _poll_aoi_messages():
         elif isinstance(_echo, dict):
             _send_globe_message(_echo)
         if not _r.get("ok"):
-            st.warning("研究区域无效：" + "; ".join(_r.get("errors") or []))
+            _aoi_errors = [sanitize_external_text(e)[:240] for e in (_r.get("errors") or [])]
+            st.warning("研究区域无效：" + "; ".join(_aoi_errors))
 
 
 def _aoi_sidebar_context():
@@ -1914,7 +2059,11 @@ def _aoi_sidebar_context():
         if _cap is not None:
             _snap = _cap.snapshot_for_agent()
             _caps = {cid: v.get("status") for cid, v in _snap.items()}
-        return _aoi_bridge.aoi_recommendation_text(_aoi, _caps)
+        return _aoi_bridge.aoi_recommendation_text(
+            _aoi,
+            _caps,
+            include_spatial=bool(st.session_state.get("agent_spatial_consent", False)),
+        )
     except Exception:
         return ""
 
@@ -1925,9 +2074,7 @@ def _get_task_timeline():
     if tl is None:
         import task_timeline as _tt
 
-        _ledger = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "data", "timeline_ledger.json"
-        )
+        _ledger = _tt.timeline_ledger_path()
         tl = _tt.TimelineStore(ledger_path=_ledger)
         try:
             tl.load()
@@ -1971,8 +2118,89 @@ def _tl_update(event_id, *, status=None, progress=None, message=None, error=None
         return None
 
 
+# AGENT-011：后台线程仍保留，但任务元数据先写入跨 rerun/进程账本。
+def _get_job_store():
+    store = st.session_state.get("_job_store")
+    if store is None:
+        from job_store import JobStore
+
+        path = os.environ.get("CSTF_JOB_DB_PATH") or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "data", "jobs.sqlite3"
+        )
+        store = JobStore(path)
+        if not st.session_state.get("_job_store_reconciled"):
+            recovered = store.reconcile()
+            if recovered:
+                st.session_state["_job_recovery_records"] = recovered
+                st.session_state["_job_recovery_notice"] = (
+                    f"检测到 {len(recovered)} 个进程中断任务，已标记为 INTERRUPTED；请确认后重新执行。"
+                )
+            st.session_state["_job_store_reconciled"] = True
+        st.session_state._job_store = store
+    return store
+
+
+def _job_create_for_pending(pending, *, status="QUEUED"):
+    """为 UI/Agent 共用 execution_request 建立唯一 job_id。"""
+    try:
+        request = (pending or {}).get("execution_request") or {}
+        store = _get_job_store()
+        record = store.create(
+            job_id=request.get("request_id"),
+            task=(pending or {}).get("task") or "unknown",
+            kind=request.get("mode") or (pending or {}).get("mode") or "workflow",
+            plan_id=request.get("plan_id") or (pending or {}).get("plan_id"),
+            status=status,
+            metadata={
+                "confirmation_source": request.get("confirmation_source"),
+                "request_id": request.get("request_id"),
+                "request_schema": request.get("schema"),
+                "entrypoint": request.get("entrypoint"),
+            },
+        )
+        st.session_state["_active_job_id"] = record.job_id
+        return record
+    except Exception as exc:
+        _append_debug_log(f"job_create_failed: {safe_error_summary(exc)}")
+        return None
+
+
+def _job_transition(status, *, progress=None, artifacts=None, error=None, metadata=None):
+    try:
+        job_id = st.session_state.get("_active_job_id")
+        if not job_id:
+            return None
+        return _get_job_store().transition(
+            job_id, status, progress=progress, artifacts=artifacts,
+            error=error, metadata=metadata,
+        )
+    except Exception as exc:
+        _append_debug_log(f"job_transition_failed: {safe_error_summary(exc)}")
+        return None
+
+
+def _job_progress_update(progress, *, metadata=None, job_id=None):
+    """把内存 worker 的最新百分比镜像到 JobStore，供 rerun/重启后读取。"""
+    try:
+        jid = job_id or st.session_state.get("_active_job_id")
+        if not jid:
+            return None
+        return _get_job_store().update_progress(jid, progress, metadata=metadata)
+    except Exception as exc:
+        _append_debug_log(f"job_progress_update_failed: {safe_error_summary(exc)}")
+        return None
+
+
 init_ui_session_defaults(st.session_state)
+try:
+    _get_job_store()
+    if st.session_state.get("_job_recovery_notice"):
+        st.warning(st.session_state.pop("_job_recovery_notice"))
+except Exception as _job_init_err:
+    _append_debug_log(f"job_store_init_failed: {safe_error_summary(_job_init_err)}")
 _agent_flush = flush_pending_agent_commands(st.session_state)
+if st.session_state.get("_job_recovery_replan_notice"):
+    st.info(st.session_state.pop("_job_recovery_replan_notice"))
 if _agent_flush.applied and _agent_flush.errors:
     for _afe in _agent_flush.errors:
         st.warning(_afe)
@@ -2064,11 +2292,49 @@ st.markdown("""
         border: 1px solid #4ea56a;
     }
     [data-testid="stChatMessage"] {
+        display: flex !important;
+        flex: 0 0 auto !important;
+        width: fit-content !important;
+        min-width: 7rem !important;
+        max-width: 86% !important;
         background: linear-gradient(180deg, #141a25 0%, #10151f 100%);
         border: 1px solid #2c3649;
         border-radius: 12px;
         padding: 0.45rem 0.65rem;
         margin-bottom: 0.45rem;
+        box-sizing: border-box;
+    }
+    /* 对话采用双侧气泡：助手在左，用户在右。 */
+    [data-testid="stChatMessage"]:has(.msg-role-assistant) {
+        margin-left: 0 !important;
+        margin-right: auto !important;
+        border-left: 3px solid #4ea56a;
+    }
+    [data-testid="stChatMessage"]:has(.msg-role-user) {
+        flex-direction: row-reverse !important;
+        margin-left: auto !important;
+        margin-right: 0 !important;
+        background: linear-gradient(180deg, #182b4a 0%, #13223a 100%);
+        border-right: 3px solid #5d82e8;
+        border-left: 1px solid #2c4678;
+    }
+    [data-testid="stChatMessage"]:has(.msg-role-user) [data-testid="stChatMessageAvatar"] {
+        margin-left: 0.55rem !important;
+        margin-right: 0 !important;
+    }
+    [data-testid="stChatMessage"]:has(.msg-role-assistant) [data-testid="stChatMessageAvatar"] {
+        margin-right: 0.55rem !important;
+    }
+    [data-testid="stChatMessage"] [data-testid="stChatMessageContent"] {
+        width: fit-content !important;
+        max-width: 100% !important;
+        min-width: 0 !important;
+        overflow-wrap: anywhere;
+    }
+    [data-testid="stChatMessage"] pre,
+    [data-testid="stChatMessage"] img,
+    [data-testid="stChatMessage"] table {
+        max-width: 100% !important;
     }
     [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] p {
         color: #e6ecf6 !important;
@@ -2111,7 +2377,11 @@ st.markdown("""
     div[data-testid="stColumn"]:has(.cockpit-map-col) > div[data-testid="stVerticalBlock"] {
         height: 100% !important;
         max-height: var(--workbench-h) !important;
-        overflow: hidden !important;
+        overflow: visible !important;
+        /* The map, zero-height bridge, and status drawer share one column.
+           Streamlit's default 1rem child gap otherwise creates an empty row
+           above the drawer and moves the edge control away from the boundary. */
+        gap: 0 !important;
     }
     .cockpit-map-col,
     .cockpit-chat-anchor,
@@ -2142,20 +2412,278 @@ st.markdown("""
         max-width: 100% !important;
     }
     div[data-testid="stColumn"]:has(.cockpit-map-col) iframe.yy-globe-frame,
-    div[data-testid="stColumn"]:has(.cockpit-map-col) [data-testid="stIFrame"] > iframe {
+    div[data-testid="stColumn"]:has(.cockpit-map-col) iframe[src*="/globe"],
+    div[data-testid="stColumn"]:has(.cockpit-map-col) iframe[title*="streamlit_folium"] {
         border: none !important;
         width: 100% !important;
         max-width: 100% !important;
-        height: var(--workbench-h) !important;
-        min-height: var(--workbench-h) !important;
-        max-height: var(--workbench-h) !important;
+        height: calc(var(--workbench-h) - var(--cstf-status-panel-reserve, 0px)) !important;
+        min-height: 280px !important;
+        max-height: calc(var(--workbench-h) - var(--cstf-status-panel-reserve, 0px)) !important;
         display: block !important;
         background: #0a1628;
     }
-    div[data-testid="stColumn"]:has(.cockpit-map-col) [data-testid="stIFrame"] {
-        height: var(--workbench-h) !important;
-        min-height: var(--workbench-h) !important;
-        max-height: var(--workbench-h) !important;
+    div[data-testid="stColumn"]:has(.cockpit-map-col) [data-testid="stIFrame"]:has(iframe[src*="/globe"]),
+    div[data-testid="stColumn"]:has(.cockpit-map-col) [data-testid="stCustomComponentV1"]:has(iframe[title*="streamlit_folium"]) {
+        height: calc(var(--workbench-h) - var(--cstf-status-panel-reserve, 0px)) !important;
+        min-height: 280px !important;
+        max-height: calc(var(--workbench-h) - var(--cstf-status-panel-reserve, 0px)) !important;
+    }
+    div[data-testid="stColumn"]:has(.cockpit-map-col) > div[data-testid="stVerticalBlock"] > [data-testid="stElementContainer"]:has(iframe[src*="/globe"]),
+    div[data-testid="stColumn"]:has(.cockpit-map-col) > div[data-testid="stVerticalBlock"] > [data-testid="stElementContainer"]:has(iframe[title*="streamlit_folium"]) {
+        flex: 0 0 auto !important;
+        height: calc(var(--workbench-h) - var(--cstf-status-panel-reserve, 0px)) !important;
+        min-height: 280px !important;
+        max-height: calc(var(--workbench-h) - var(--cstf-status-panel-reserve, 0px)) !important;
+        overflow: hidden !important;
+    }
+    /* 地图下方状态抽屉：高度由顶部拖拽边缘控制，内容过多时只在抽屉内滚动。 */
+    div[data-testid="stColumn"]:has(.cstf-map-status-zone) > div[data-testid="stVerticalBlock"] {
+        overflow: visible !important;
+    }
+    .cstf-map-status-zone {
+        height: 0 !important;
+        min-height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        overflow: hidden !important;
+    }
+    .cstf-layout-defaults {
+        display: none !important;
+        width: 0 !important;
+        height: 0 !important;
+    }
+    /* 通知脱离主布局流，避免错误/警告把地图与 Agent 挤出视口；每条通知可独立关闭。 */
+    [data-testid="stAlert"].cstf-dismissible-alert {
+        position: fixed !important;
+        right: 1rem !important;
+        top: var(--cstf-alert-top, 1rem) !important;
+        z-index: 1400 !important;
+        width: min(30rem, calc(100vw - 2rem)) !important;
+        max-height: 8rem !important;
+        overflow: auto !important;
+        margin: 0 !important;
+        padding-right: 2.4rem !important;
+        border: 1px solid rgba(131, 151, 190, 0.35) !important;
+        box-shadow: 0 12px 32px rgba(0, 0, 0, 0.36) !important;
+        backdrop-filter: blur(8px);
+    }
+    [data-testid="stAlert"].cstf-dismissible-alert .cstf-alert-close {
+        position: absolute;
+        top: 0.45rem;
+        right: 0.45rem;
+        width: 1.65rem;
+        height: 1.65rem;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border: 1px solid rgba(180, 193, 221, 0.38);
+        border-radius: 999px;
+        background: rgba(15, 22, 35, 0.68);
+        color: #e8edf7;
+        cursor: pointer;
+        font-size: 1rem;
+        line-height: 1;
+    }
+    [data-testid="stAlert"].cstf-dismissible-alert .cstf-alert-close:hover,
+    [data-testid="stAlert"].cstf-dismissible-alert .cstf-alert-close:focus-visible {
+        background: #334a82;
+        border-color: #6e8ee1;
+        outline: none;
+    }
+    .cstf-status-toolbar-spacer {
+        /* Streamlit button bridge is kept in the DOM for state sync, but must
+           never reserve a visible row between the map and the drawer. */
+        min-height: 0 !important;
+        width: 100%;
+        height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+    /* 原生按钮仅作为 Streamlit 状态桥接，实际控制显示在地图底边。 */
+    div[data-testid="stHorizontalBlock"]:has(> div[data-testid="stColumn"] > div[data-testid="stVerticalBlock"] > [data-testid="stElementContainer"] .cstf-status-toolbar-spacer) {
+        /* Keep the Streamlit widget mounted so a second bridge click still
+           reaches its event handler, while removing the row from layout. */
+        display: flex !important;
+        position: absolute !important;
+        left: 0 !important;
+        top: 0 !important;
+        width: 0 !important;
+        height: 0 !important;
+        min-height: 0 !important;
+        max-height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        overflow: visible !important;
+        pointer-events: none !important;
+    }
+    /* The bridge remains a real, event-capable Streamlit button.  Keep it
+       visually inert and out of the layout while allowing the edge triangle
+       to trigger its click handler after a collapse rerun. */
+    div.st-key-agent_status_panel_toggle button {
+        position: absolute !important;
+        left: 0 !important;
+        top: 0 !important;
+        width: 1px !important;
+        height: 1px !important;
+        min-width: 1px !important;
+        min-height: 1px !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        opacity: 0 !important;
+        pointer-events: auto !important;
+    }
+    .cstf-status-toggle-state,
+    .cstf-status-toggle-host {
+        display: none !important;
+    }
+    .cstf-status-edge-toggle {
+        position: fixed;
+        z-index: 1400;
+        width: 2.25rem;
+        height: 1.6rem;
+        /* 水平居中；按钮自身的底边由脚本贴到地图/状态区分界线。 */
+        transform: translateX(-50%);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border: 1px solid #536891;
+        border-radius: 0.45rem;
+        background: #101a2d;
+        color: #cddaff;
+        cursor: pointer;
+        font-size: 1rem;
+        line-height: 1;
+        opacity: 0.82;
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.32);
+        transition: opacity 160ms ease, background 160ms ease, border-color 160ms ease;
+    }
+    .cstf-status-edge-toggle:hover,
+    .cstf-status-edge-toggle:focus-visible {
+        opacity: 1;
+        background: #243967;
+        border-color: #89a7f0;
+        outline: none;
+    }
+    /* 状态区顶部边缘：默认只保留命中区域，鼠标靠近时显示分隔提示。 */
+    .cstf-status-edge-handle {
+        position: fixed;
+        z-index: 1350;
+        height: 14px;
+        transform: translateY(-50%);
+        cursor: row-resize;
+        touch-action: none;
+        user-select: none;
+        border-radius: 999px;
+        opacity: 0.28;
+        transition: opacity 160ms ease;
+    }
+    .cstf-status-edge-handle,
+    .cstf-status-edge-handle:focus-visible,
+    .cstf-dock-resize-handle,
+    .cstf-dock-resize-handle:focus-visible {
+        outline: none !important;
+        border: 0 !important;
+        box-shadow: none !important;
+    }
+    .cstf-status-edge-handle::after {
+        content: "";
+        position: absolute;
+        left: 35%;
+        top: 5px;
+        width: 30%;
+        min-width: 96px;
+        height: 4px;
+        border-radius: 999px;
+        background: #5e72a1;
+        transition: background 160ms ease, transform 160ms ease;
+    }
+    .cstf-status-edge-handle::before {
+        content: "↕";
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        color: #9bb2ff;
+        font-size: 0.72rem;
+        line-height: 1;
+        opacity: 0;
+        transition: opacity 160ms ease;
+    }
+    .cstf-status-edge-handle:hover,
+    .cstf-status-edge-handle:focus-visible,
+    body.cstf-resizing-status .cstf-status-edge-handle {
+        opacity: 1;
+    }
+    .cstf-status-edge-handle:hover::after,
+    .cstf-status-edge-handle:focus-visible::after,
+    body.cstf-resizing-status .cstf-status-edge-handle::after {
+        background: #9bb2ff;
+        transform: scaleX(1.08);
+    }
+    .cstf-status-edge-handle:hover::before,
+    .cstf-status-edge-handle:focus-visible::before,
+    body.cstf-resizing-status .cstf-status-edge-handle::before {
+        opacity: 1;
+    }
+    /* 地图与 Agent 之间的边缘分隔条，命中区比可视线略宽，避免精确点按。 */
+    .cstf-dock-resize-handle {
+        position: fixed;
+        z-index: 1600;
+        width: 16px;
+        transform: translateX(-50%);
+        cursor: col-resize;
+        touch-action: none;
+        user-select: none;
+        border-radius: 999px;
+        opacity: 0.34;
+        transition: opacity 160ms ease;
+    }
+    .cstf-dock-resize-handle::after {
+        content: "";
+        position: absolute;
+        left: 5px;
+        top: 35%;
+        width: 4px;
+        height: 30%;
+        min-height: 48px;
+        border-radius: 999px;
+        background: #3d4c67;
+        transition: background 160ms ease, transform 160ms ease;
+    }
+    .cstf-dock-resize-handle::before {
+        content: "◀ ▶";
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        color: #9bb2ff;
+        font-size: 0.68rem;
+        line-height: 1;
+        letter-spacing: 0.05rem;
+        white-space: nowrap;
+        opacity: 0;
+        transition: opacity 160ms ease;
+    }
+    .cstf-dock-resize-handle:hover,
+    .cstf-dock-resize-handle:focus-visible,
+    body.cstf-resizing-agent .cstf-dock-resize-handle {
+        opacity: 1;
+    }
+    .cstf-dock-resize-handle:hover::after,
+    .cstf-dock-resize-handle:focus-visible::after,
+    body.cstf-resizing-agent .cstf-dock-resize-handle::after {
+        background: #6d8fe8;
+        transform: scaleX(1.25);
+    }
+    .cstf-dock-resize-handle:hover::before,
+    .cstf-dock-resize-handle:focus-visible::before,
+    body.cstf-resizing-agent .cstf-dock-resize-handle::before {
+        opacity: 1;
+    }
+    div[data-testid="stColumn"]:has(.cstf-map-status-zone) [data-testid="stVerticalBlockBorderWrapper"] {
+        border-color: #2a3548 !important;
+        background: #0d131d !important;
     }
     .command-deck {
         border-top: 1px solid #333;
@@ -2168,7 +2696,7 @@ st.markdown("""
         margin-left: 2px;
         height: 100%;
     }
-    /* 右侧：上状态日志 / 中对话 / 底输入框（Streamlit 1.3x 使用 stLayoutWrapper） */
+    /* 右侧仅保留 Agent 对话 Dock（Streamlit 1.3x 使用 stLayoutWrapper）。 */
     div[data-testid="stColumn"]:has(.command-deck-side) > div[data-testid="stVerticalBlock"] {
         display: flex !important;
         flex-direction: column !important;
@@ -2222,6 +2750,19 @@ st.markdown("""
         border-radius: 8px;
         padding: 8px 6px 8px 4px !important;
     }
+    /* 收起 Agent Dock 时，右侧只保留展开入口，地图占据主区域。 */
+    div[data-testid="stColumn"]:has(.cstf-dock-collapsed-marker) {
+        background: #0b1018 !important;
+        padding: 8px 2px !important;
+    }
+    div[data-testid="stColumn"]:has(.cstf-dock-collapsed-marker) > div[data-testid="stVerticalBlock"] > *:not(:has(.cstf-dock-collapsed-marker)) {
+        display: none !important;
+    }
+    div[data-testid="stColumn"]:has(.cstf-dock-collapse-control) button {
+        white-space: nowrap !important;
+        font-size: 0.72rem !important;
+        padding: 0.28rem 0.35rem !important;
+    }
     div[data-testid="stColumn"]:has(.cockpit-map-col) {
         padding-right: 4px !important;
     }
@@ -2239,13 +2780,49 @@ st.markdown("""
     div[data-testid="stForm"]:has(input[aria-label="chat_input"]) {
         border: 1px solid #2e384c !important;
         border-radius: 18px !important;
-        padding: 10px 12px 8px !important;
+        padding: 8px 10px 6px !important;
         background: linear-gradient(180deg, #151b28 0%, #121720 100%) !important;
         margin-top: 4px !important;
     }
     div[data-testid="stForm"]:has(input[aria-label="chat_input"]) [data-testid="stHorizontalBlock"] {
         align-items: center !important;
         gap: 0.35rem !important;
+    }
+    div[data-testid="stForm"]:has(input[aria-label="chat_input"]) [data-testid="stHorizontalBlock"]:has(.cstf-attach-bar) {
+        display: flex !important;
+        flex-direction: row !important;
+        flex-wrap: nowrap !important;
+        align-items: center !important;
+        width: 100% !important;
+        min-width: 0 !important;
+        max-width: none !important;
+        overflow: visible !important;
+    }
+    div[data-testid="stForm"]:has(input[aria-label="chat_input"]) [data-testid="stHorizontalBlock"]:has(.cstf-attach-bar) > [data-testid="stColumn"] {
+        min-width: 0 !important;
+        min-height: 0 !important;
+        margin: 0 !important;
+        padding-top: 0 !important;
+        padding-bottom: 0 !important;
+    }
+    div[data-testid="stForm"]:has(input[aria-label="chat_input"]) [data-testid="stHorizontalBlock"]:has(.cstf-attach-bar) > .cstf-attach-bar {
+        flex: 0 0 2.65rem !important;
+        width: 2.65rem !important;
+        max-width: 2.65rem !important;
+        order: 0 !important;
+    }
+    div[data-testid="stForm"]:has(input[aria-label="chat_input"]) [data-testid="stHorizontalBlock"]:has(.cstf-attach-bar) > [data-testid="stColumn"]:has(input[aria-label="chat_input"]) {
+        flex: 1 1 auto !important;
+        width: auto !important;
+        max-width: none !important;
+        order: 1 !important;
+    }
+    div[data-testid="stForm"]:has(input[aria-label="chat_input"]) [data-testid="stHorizontalBlock"]:has(.cstf-attach-bar) > [data-testid="stColumn"]:has([data-testid="stFormSubmitButton"]) {
+        flex: 0 0 2.65rem !important;
+        width: 2.65rem !important;
+        min-width: 2.65rem !important;
+        max-width: 2.65rem !important;
+        order: 2 !important;
     }
     div[data-testid="stForm"]:has(input[aria-label="chat_input"]) input[aria-label="chat_input"] {
         border-radius: 14px !important;
@@ -2279,9 +2856,13 @@ st.markdown("""
         border-color: #5a7fd4 !important;
     }
     div[data-testid="stForm"]:has(input[aria-label="chat_input"]) [data-testid="stFileUploader"] {
-        margin: 0 !important;
+        position: absolute !important;
+        width: 1px !important;
+        height: 1px !important;
+        margin: -1px !important;
         padding: 0 !important;
-        min-height: 0 !important;
+        overflow: hidden !important;
+        clip: rect(0 0 0 0) !important;
     }
     div[data-testid="stForm"]:has(input[aria-label="chat_input"]) [data-testid="stFileUploaderDropzone"],
     div[data-testid="stForm"]:has(input[aria-label="chat_input"]) [data-testid="stFileUploader"] > label,
@@ -2301,11 +2882,17 @@ st.markdown("""
         display: flex;
         align-items: center;
         gap: 8px;
-        margin-top: 8px;
-        padding-left: 2px;
-        min-height: 32px;
+        flex: 0 0 2.65rem;
+        width: 2.65rem;
+        height: 2.65rem;
+        margin: 0;
+        padding: 0;
+        min-height: 0;
+        justify-content: center;
+        order: -1;
     }
     div[data-testid="stForm"]:has(input[aria-label="chat_input"]) .cstf-plus-btn {
+        position: relative;
         width: 32px;
         height: 32px;
         border-radius: 50%;
@@ -2323,22 +2910,220 @@ st.markdown("""
         flex-shrink: 0;
         transition: background 0.15s, border-color 0.15s;
     }
+    /* 限制说明固定显示在加号上方，不依赖浏览器原生 title 气泡。 */
+    div[data-testid="stForm"]:has(input[aria-label="chat_input"]) .cstf-plus-btn::after {
+        content: attr(data-tooltip);
+        position: absolute;
+        /* 加号位于 Agent Dock 左缘，向右展开避免提示被地图/面板边界裁掉。 */
+        left: 0;
+        bottom: calc(100% + 8px);
+        transform: translate(0, 4px);
+        width: max-content;
+        max-width: min(19rem, calc(100vw - 2rem));
+        padding: 6px 9px;
+        border: 1px solid #4a5b7b;
+        border-radius: 7px;
+        background: #111a2a;
+        color: #edf2ff;
+        box-shadow: 0 8px 20px rgba(0, 0, 0, 0.38);
+        font-size: 0.72rem;
+        font-weight: 400;
+        line-height: 1.35;
+        text-align: left;
+        white-space: normal;
+        opacity: 0;
+        pointer-events: none;
+        z-index: 1500;
+        transition: opacity 120ms ease, transform 120ms ease;
+    }
+    div[data-testid="stForm"]:has(input[aria-label="chat_input"]) .cstf-plus-btn:hover::after,
+    div[data-testid="stForm"]:has(input[aria-label="chat_input"]) .cstf-plus-btn:focus-visible::after {
+        opacity: 1;
+        transform: translate(0, 0);
+    }
     div[data-testid="stForm"]:has(input[aria-label="chat_input"]) .cstf-plus-btn:hover {
         background: #1e2838;
         border-color: #5a6d92;
         color: #ffffff;
     }
-    div[data-testid="stForm"]:has(input[aria-label="chat_input"]) .cstf-attach-name {
-        font-size: 0.78rem;
-        color: #8fa3c4;
-        max-width: 220px;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
+    div[data-testid="stForm"]:has(input[aria-label="chat_input"]) [data-testid="stCaptionContainer"] {
+        margin-top: 2px !important;
+        margin-bottom: 0 !important;
+        line-height: 1.25 !important;
+        font-size: 0.68rem !important;
     }
-    div[data-testid="stForm"]:has(input[aria-label="chat_input"]) .cstf-attach-hint {
+    /* Streamlit 会按浏览器语言翻译 widget label；以 JS 标记的真实聊天表单
+       作为最终布局锚点，避免 “chat_input” 被翻译后恢复成默认上传器布局。 */
+    div[data-testid="stForm"].cstf-chat-compose {
+        position: relative !important;
+        overflow: visible !important;
+        border: 1px solid #2e384c !important;
+        border-radius: 18px !important;
+        padding: 8px 10px 6px !important;
+        background: linear-gradient(180deg, #151b28 0%, #121720 100%) !important;
+        margin-top: 4px !important;
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-chat-input-row {
+        display: flex !important;
+        flex-direction: row !important;
+        flex-wrap: nowrap !important;
+        align-items: center !important;
+        gap: 0.35rem !important;
+        width: 100% !important;
+        min-width: 0 !important;
+        overflow: visible !important;
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-chat-input-row > .cstf-attach-bar {
+        display: flex !important;
+        flex: 0 0 2.65rem !important;
+        order: 0 !important;
+        width: 2.65rem !important;
+        height: 2.65rem !important;
+        align-items: center !important;
+        justify-content: center !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-chat-input-column {
+        flex: 1 1 auto !important;
+        order: 1 !important;
+        width: auto !important;
+        min-width: 0 !important;
+        max-width: none !important;
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-chat-send-column {
+        flex: 0 0 2.65rem !important;
+        order: 2 !important;
+        width: 2.65rem !important;
+        min-width: 2.65rem !important;
+        max-width: 2.65rem !important;
+    }
+    div[data-testid="stForm"].cstf-chat-compose input[data-testid="stTextInputField"] {
+        min-height: 2.65rem !important;
+        width: 100% !important;
+    }
+    div[data-testid="stForm"].cstf-chat-compose [data-testid="stFormSubmitButton"] button {
+        width: 2.65rem !important;
+        min-width: 2.65rem !important;
+        height: 2.65rem !important;
+        padding: 0 !important;
+        border-radius: 50% !important;
+    }
+    /* 原生上传器不参与表单流：只保留供 + 按钮触发的隐藏 file input。 */
+    div[data-testid="stForm"].cstf-chat-compose [data-testid="stFileUploader"] {
+        position: absolute !important;
+        width: 1px !important;
+        height: 1px !important;
+        margin: -1px !important;
+        padding: 0 !important;
+        overflow: hidden !important;
+        clip: rect(0 0 0 0) !important;
+    }
+    div[data-testid="stForm"].cstf-chat-compose [data-testid="stFileUploader"] > label,
+    div[data-testid="stForm"].cstf-chat-compose [data-testid="stFileUploaderDropzone"],
+    div[data-testid="stForm"].cstf-chat-compose [data-testid="stFileUploader"] section,
+    div[data-testid="stForm"].cstf-chat-compose [data-testid="stFileUploader"] small {
+        display: none !important;
+    }
+    /* The actual consent value is submitted with the Streamlit form, while
+       the + menu below provides the visible one-shot choice without adding a
+       fourth item or a second row to the composer. */
+    div[data-testid="stForm"].cstf-chat-compose div[data-testid="stElementContainer"]:has(
+        [data-testid="stCheckbox"] input[aria-label*="附件外发授权"]
+    ),
+    div[data-testid="stForm"].cstf-chat-compose div[data-testid="stElementContainer"]:has(
+        .cstf-attachment-epoch-marker
+    ) {
+        display: none !important;
+        height: 0 !important;
+        min-height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-bar {
+        position: relative !important;
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-plus-btn {
+        position: relative !important;
+        width: 32px !important;
+        height: 32px !important;
+        flex: 0 0 32px !important;
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-plus-btn::after {
+        content: attr(data-tooltip);
+        position: absolute;
+        left: 0;
+        bottom: calc(100% + 8px);
+        transform: translate(0, 4px);
+        width: max-content;
+        max-width: min(19rem, calc(100vw - 2rem));
+        padding: 6px 9px;
+        border: 1px solid #4a5b7b;
+        border-radius: 7px;
+        background: #111a2a;
+        color: #edf2ff;
+        box-shadow: 0 8px 20px rgba(0, 0, 0, 0.38);
         font-size: 0.72rem;
-        color: #5c6b82;
+        font-weight: 400;
+        line-height: 1.35;
+        white-space: normal;
+        opacity: 0;
+        pointer-events: none;
+        z-index: 1500;
+        transition: opacity 120ms ease, transform 120ms ease;
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-plus-btn:hover::after,
+    div[data-testid="stForm"].cstf-chat-compose .cstf-plus-btn:focus-visible::after {
+        opacity: 1;
+        transform: translate(0, 0);
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-bar.is-open .cstf-plus-btn::after {
+        display: none !important;
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-choice {
+        display: none;
+        position: absolute;
+        left: 0;
+        bottom: calc(100% + 9px);
+        z-index: 1600;
+        width: min(18rem, 72vw);
+        padding: 10px;
+        border: 1px solid #41506c;
+        border-radius: 12px;
+        background: #111827;
+        box-shadow: 0 12px 30px rgba(0, 0, 0, 0.42);
+        color: #e6edf8;
+        text-align: left;
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-bar.is-open .cstf-attach-choice {
+        display: block;
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-choice-title {
+        margin: 0 0 8px;
+        color: #aebbd0;
+        font-size: 0.76rem;
+        line-height: 1.45;
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-choice-actions {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 7px;
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-choice button {
+        min-height: 2rem;
+        padding: 5px 8px;
+        border: 1px solid #41506c;
+        border-radius: 8px;
+        background: #182131;
+        color: #e6edf8;
+        font-size: 0.74rem;
+        cursor: pointer;
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-choice button:hover,
+    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-choice button:focus-visible {
+        border-color: #6f8fd7;
+        background: #23314a;
+        outline: none;
     }
     .deck-section-title {
         font-size: 0.95rem !important;
@@ -2347,6 +3132,42 @@ st.markdown("""
         margin-bottom: 6px !important;
         border-left: 3px solid #3A62D7;
         padding-left: 8px;
+    }
+    /* 历史页切换为会话导航；选中会话后才进入对话流。 */
+    div[data-testid="stColumn"]:has(.cstf-agent-view-history) > div[data-testid="stVerticalBlock"] > [data-testid="stElementContainer"]:has([data-testid="stVerticalBlockBorderWrapper"] [data-testid="stChatMessage"]) {
+        flex: 0 1 auto !important;
+        min-height: 120px !important;
+        max-height: 250px !important;
+        overflow: hidden !important;
+    }
+    div[data-testid="stColumn"]:has(.cstf-agent-view-history) [data-testid="stVerticalBlockBorderWrapper"]:has([data-testid="stChatMessage"]) {
+        flex: 0 1 auto !important;
+        min-height: 0 !important;
+        max-height: 250px !important;
+        overflow-y: auto !important;
+        overflow-x: hidden !important;
+    }
+    div[data-testid="stColumn"]:has(.cstf-agent-view-history) [data-testid="stForm"] input[aria-label="chat_input"] {
+        min-height: 2.4rem !important;
+    }
+    /* 历史页是纯会话导航：只展示记录，进入具体会话后再显示聊天流。 */
+    /* 直接按 stForm 隐藏，避免 aria-label 随浏览器语言被翻译后漏出发送框。 */
+    div[data-testid="stColumn"]:has(.cstf-agent-view-history) [data-testid="stForm"],
+    div[data-testid="stColumn"]:has(.cstf-agent-view-history) [data-testid="stForm"]:has(input[aria-label="chat_input"]),
+    div[data-testid="stColumn"]:has(.cstf-agent-view-history) > div[data-testid="stVerticalBlock"] > [data-testid="stLayoutWrapper"]:has([data-testid="stChatMessage"]),
+    /* 空历史时也彻底移除聊天流的外层布局包装，避免留下空白行。 */
+    div[data-testid="stColumn"]:has(.cstf-agent-view-history) [data-testid="stLayoutWrapper"]:has(.cstf-chat-stream-marker),
+    div[data-testid="stColumn"]:has(.cstf-agent-view-history) [data-testid="stChatMessage"],
+    div[data-testid="stColumn"]:has(.cstf-agent-view-history) [data-testid="stElementContainer"]:has([data-testid="stVerticalBlockBorderWrapper"] [data-testid="stChatMessage"]),
+    div[data-testid="stColumn"]:has(.cstf-agent-view-history) [data-testid="stVerticalBlockBorderWrapper"]:has([data-testid="stChatMessage"]),
+    /* 空会话时，聊天容器没有 stChatMessage；用专属标记仍将其移除。 */
+    div[data-testid="stColumn"]:has(.cstf-agent-view-history) [data-testid="stVerticalBlockBorderWrapper"]:has(.cstf-chat-stream-marker) {
+        display: none !important;
+        height: 0 !important;
+        min-height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        overflow: hidden !important;
     }
     .header-badge {
         display: inline-block;
@@ -2963,6 +3784,53 @@ with st.sidebar:
                     st.session_state.pop("_inference_plan_notice", None)
                     st.rerun()
 
+    # 指数法执行计划（与深度学习共用先计划后确认的 UI 语义）
+    _index_plan = st.session_state.get("_index_pending_plan")
+    if isinstance(_index_plan, dict) and not st.session_state.is_running:
+        sbui.section("指数法潮滩提取计划")
+        with st.container(border=True):
+            if _index_plan.get("ready"):
+                st.success("条件已满足，确认后将调用指数法执行适配器")
+            else:
+                st.warning("指数法计划暂不可执行")
+                for _b in _index_plan.get("blockers") or []:
+                    st.caption(f"· {_b}")
+            st.caption(
+                f"任务 `{_index_plan.get('task') or '—'}` · "
+                f"输入影像目录已校验 · 海洋种子点已校验"
+            )
+            _ixc1, _ixc2 = st.columns(2)
+            with _ixc1:
+                if st.button(
+                    "确认执行指数法",
+                    key="confirm_index_plan_btn",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not bool(_index_plan.get("ready")),
+                ):
+                    _tl_add(
+                        _index_plan.get("task") or "unknown",
+                        "QUEUED",
+                        "指数法计划已确认并入队",
+                        status="QUEUED",
+                        tool="index_agent_loop",
+                    )
+                    st.session_state.pending_task = {
+                        "task": _index_plan.get("task"),
+                        "mode": "index",
+                        "points_shp": _index_plan.get("points_shp"),
+                        "force_rerun": bool(_index_plan.get("force_rerun")),
+                        "index_plan": dict(_index_plan),
+                    }
+                    st.session_state.is_running = True
+                    st.session_state.stop_requested = False
+                    st.session_state.pop("_index_pending_plan", None)
+                    st.rerun()
+            with _ixc2:
+                if st.button("取消指数法计划", key="cancel_index_plan_btn", use_container_width=True):
+                    st.session_state.pop("_index_pending_plan", None)
+                    st.rerun()
+
     # 获取卫星影像执行计划（可信执行闭环：先计划后确认）
     _gee_plan = st.session_state.get("_gee_pending_plan")
     if isinstance(_gee_plan, dict) and not st.session_state.is_running:
@@ -3069,6 +3937,72 @@ with st.sidebar:
                     st.session_state.pop("_workflow_pending_plan", None)
                     st.session_state.pop("_workflow_plan_confirmed", None)
                     st.session_state.pop("_workflow_notice", None)
+                    st.rerun()
+
+    # 侧栏 AutoTune 计划确认：不能因按钮来自本地 UI 就绕过重型操作门闩。
+    _autotune_plan = st.session_state.get("_autotune_pending_plan")
+    if isinstance(_autotune_plan, dict) and not st.session_state.is_running:
+        sbui.section("参数自动优化计划")
+        with st.container(border=True):
+            _at_plan_valid = (
+                bool(adaptive_mode)
+                and str(_autotune_plan.get("task") or "") == str(selected_task or "")
+                and str(_autotune_plan.get("reference_id") or "") == str(_ref_id or "")
+            )
+            st.info(
+                f"任务 `{_autotune_plan.get('task') or '—'}` · "
+                f"参考真值 `{_autotune_plan.get('reference_id') or '—'}` · "
+                f"目标 `{_autotune_plan.get('objective') or '—'}`"
+            )
+            if not _at_plan_valid:
+                st.warning("当前侧栏参数已变化，请取消旧计划后重新生成。")
+            st.caption("确认后才会搜索参数组合，并可能执行后置 M5/E1 评价。")
+            _atc1, _atc2 = st.columns(2)
+            with _atc1:
+                if st.button(
+                    "确认执行参数优化",
+                    key="confirm_autotune_plan_btn",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not _at_plan_valid,
+                ):
+                    from execution_request import attach_execution_request
+
+                    _at_pending = attach_execution_request(
+                        dict(_autotune_plan), confirmation_source="ui"
+                    )
+                    st.session_state.pending_autotune = _at_pending
+                    st.session_state.is_running = True
+                    st.session_state.stop_requested = False
+                    _tl_add(
+                        str(_autotune_plan.get("task") or "unknown"),
+                        "CONFIRM",
+                        "参数优化计划已确认",
+                        status="SUCCEEDED",
+                        plan_id=_autotune_plan.get("plan_id"),
+                        tool="run_autotune",
+                    )
+                    _tl_add(
+                        str(_autotune_plan.get("task") or "unknown"),
+                        "QUEUED",
+                        "参数优化任务已入队",
+                        status="QUEUED",
+                        plan_id=_autotune_plan.get("plan_id"),
+                        tool="run_autotune",
+                    )
+                    st.session_state.pop("_autotune_pending_plan", None)
+                    st.rerun()
+            with _atc2:
+                if st.button("取消参数优化计划", key="cancel_autotune_plan_btn", use_container_width=True):
+                    _tl_add(
+                        str(_autotune_plan.get("task") or "unknown"),
+                        "REPORT",
+                        "参数优化计划已取消",
+                        status="CANCELLED",
+                        plan_id=_autotune_plan.get("plan_id"),
+                        tool="run_autotune",
+                    )
+                    st.session_state.pop("_autotune_pending_plan", None)
                     st.rerun()
 
     # 重型工具确认门闩：Agent 请求 run_pipeline/run_m4/run_gee_download/run_autotune 未确认时在此待命
@@ -3232,7 +4166,11 @@ with st.sidebar:
             "开始参数优化",
             type="primary",
             use_container_width=True,
-            disabled=st.session_state.is_running or not _autotune_ready,
+            disabled=(
+                st.session_state.is_running
+                or not _autotune_ready
+                or isinstance(st.session_state.get("_autotune_pending_plan"), dict)
+            ),
         )
     elif cache_hit and not force_rerun:
         run_btn = st.button(
@@ -3270,16 +4208,23 @@ with st.sidebar:
     if tune_btn and _autotune_ready and _ref_id:
         _aoi_path = (task_aoi_shp or "").strip()
         _aoi_use = _aoi_path if _aoi_path and os.path.isfile(_aoi_path) else None
-        _tl_add(selected_task or "unknown", "QUEUED", "参数优化任务已入队",
-                status="QUEUED", tool="run_autotune")
-        st.session_state.pending_autotune = {
+        _at_plan_id = f"autotune_{uuid.uuid4().hex}"
+        st.session_state["_autotune_pending_plan"] = {
             "task": selected_task,
+            "mode": "autotune",
             "reference_id": _ref_id,
             "objective": _tune_objective,
             "task_aoi_shp": _aoi_use,
+            "plan_id": _at_plan_id,
         }
-        st.session_state.is_running = True
-        st.session_state.stop_requested = False
+        _tl_add(
+            selected_task or "unknown",
+            "PLAN",
+            "参数优化计划已生成，等待确认",
+            status="WAITING_CONFIRMATION",
+            plan_id=_at_plan_id,
+            tool="run_autotune",
+        )
         st.rerun()
 
     if m4_run_btn:
@@ -3290,31 +4235,37 @@ with st.sidebar:
         elif not os.path.isfile(m4_roi_path):
             st.error(f"研究区域矢量不存在: {m4_roi_path}")
         else:
-            _tl_add(selected_task or "unknown", "QUEUED", "影像获取任务已入队",
-                    status="QUEUED", tool="run_m4")
-            st.session_state.pending_task = {
-                "task": selected_task,
-                "mode": "m4",
-                "m4": {
-                    "roi_path": m4_roi_path.strip(),
-                    "roi_name": str(m4_roi_name).strip(),
-                    "start_date": m4_start_date.isoformat(),
-                    "end_date": m4_end_date.isoformat(),
-                    "export_to": m4_export_to,
-                    "local_out_dir": os.path.normpath(m4_local_dir.strip()),
-                    "drive_folder": m4_drive_folder.strip(),
-                    "bands": list(m4_bands),
-                    "cloud_limit": int(m4_cloud),
-                    "min_land_pct": float(m4_min_land),
-                    "max_land_pct": float(m4_max_land),
-                    "min_pixel_count": int(m4_min_pix),
-                    "scale": int(m4_scale),
-                    "gee_proxy_url": (m4_gee_proxy or "").strip(),
-                    "gee_project_id": (m4_gee_project or "").strip(),
-                },
-            }
-            st.session_state.is_running = True
-            st.session_state.stop_requested = False
+            try:
+                from agent_command_bridge import propose_gee_plan as _propose_manual_gee
+
+                _manual_gee_plan, _manual_gee_errors = _propose_manual_gee(
+                    st.session_state,
+                    {
+                        "task": selected_task or m4_roi_name,
+                        "roi_name": m4_roi_name,
+                        "start_date": m4_start_date.isoformat(),
+                        "end_date": m4_end_date.isoformat(),
+                        "bands": list(m4_bands),
+                        "cloud_limit": int(m4_cloud),
+                        "min_land_pct": float(m4_min_land),
+                        "max_land_pct": float(m4_max_land),
+                        "min_pixel_count": int(m4_min_pix),
+                        "scale": int(m4_scale),
+                        "export_to": m4_export_to,
+                        "local_out_dir": os.path.normpath(m4_local_dir.strip()),
+                        "drive_folder": m4_drive_folder.strip(),
+                        "gee_proxy_url": (m4_gee_proxy or "").strip(),
+                        "gee_project_id": (m4_gee_project or "").strip(),
+                    },
+                )
+                if _manual_gee_plan.get("ready"):
+                    st.info("已生成影像获取计划，请在下方确认后执行。")
+                else:
+                    st.warning("影像获取计划暂不可执行，请先修复以下条件：")
+                for _plan_error in _manual_gee_errors or _manual_gee_plan.get("blockers") or []:
+                    st.caption(f"· {_plan_error}")
+            except Exception as _manual_gee_exc:
+                st.error(f"影像获取计划生成失败：{type(_manual_gee_exc).__name__}")
             st.rerun()
 
     if run_btn:
@@ -3329,6 +4280,50 @@ with st.sidebar:
                     artifacts=[os.path.basename(str(cache_hit["file_path"]))])
             st.rerun()
         else:
+            if use_index_mode:
+                # 指数法也先生成可审阅计划，确认按钮才会入队执行。
+                try:
+                    import index_agent_loop as _index_loop
+
+                    _index_plan = _index_loop.build_index_plan(
+                        task=selected_task or "",
+                        input_dir=os.path.join(root_dir or "", selected_task or ""),
+                        output_dir=os.path.join(final_root or "", selected_task or ""),
+                        points_shp=(points_shp or "").strip(),
+                        force_rerun=bool(force_rerun),
+                    )
+                    _index_ok, _index_blockers = _index_loop.validate_index_plan(_index_plan)
+                    _index_plan["ready"] = _index_ok
+                    _index_plan["blockers"] = _index_blockers
+                    _index_plan["status"] = "waiting_confirmation" if _index_ok else "blocked"
+                    st.session_state["_index_pending_plan"] = _index_plan
+                except Exception as _index_plan_exc:
+                    st.error(f"指数法计划生成失败：{type(_index_plan_exc).__name__}")
+                st.rerun()
+            # 深度学习手动入口与 Agent 共用同一份“计划 → 确认 → 执行”闭环；
+            # 不再让侧栏按钮直接落入旧 run_pipeline_sync 兼容路径。
+            if not use_index_mode:
+                try:
+                    from agent_command_bridge import propose_inference_plan as _propose_manual_inference
+
+                    _manual_plan, _manual_plan_errors = _propose_manual_inference(
+                        st.session_state,
+                        {
+                            "task": selected_task,
+                            "prob_th": prob_th,
+                            "min_cnt": min_cnt,
+                            "force_rerun": bool(force_rerun),
+                        },
+                    )
+                    if _manual_plan.get("ready"):
+                        st.info("已生成潮滩智能提取计划，请在下方确认后执行。")
+                    else:
+                        st.warning("提取计划暂不可执行，请先修复以下条件：")
+                    for _plan_error in _manual_plan_errors or _manual_plan.get("blockers") or []:
+                        st.caption(f"· {_plan_error}")
+                except Exception as _manual_plan_exc:
+                    st.error(f"提取计划生成失败：{type(_manual_plan_exc).__name__}")
+                st.rerun()
             _tl_add(selected_task or "unknown", "QUEUED", "提取任务已入队",
                     status="QUEUED", tool="run_pipeline")
             st.session_state.pending_task = {
@@ -3351,14 +4346,11 @@ with st.sidebar:
             _cap = None
         if _cap is not None:
             _app_dir = os.path.dirname(os.path.abspath(__file__))
-            _cap_ctx = {
-                "model_path": st.session_state.get("ui_model_path") or "",
-                "autotune_script": os.path.join(_app_dir, "auto_tune.py"),
-                "knowledge_db_dir": os.path.normpath(
-                    os.path.join(_app_dir, "..", "rs_knowledge_db")
-                ),
-                "task": selected_task or "",
-            }
+            _cap_ctx = _cap.build_context(
+                app_dir=_app_dir,
+                model_path=st.session_state.get("ui_model_path") or "",
+                task=selected_task or "",
+            )
             _cap_sig = hashlib.md5(
                 (f"{_cap_ctx['model_path']}|{_cap_ctx['task']}").encode("utf-8", errors="replace")
             ).hexdigest()[:12]
@@ -3390,15 +4382,43 @@ with st.sidebar:
 
     st.session_state["map_display_path"] = map_display_path
 
-# ---- 主舱布局：中央地球 + 右侧指挥台（上：状态/日志，下：Copilot）----
+# ---- 主舱布局：左侧地图 + 地图下方状态/日志，右侧纯 Agent Dock ----
 # Cesium 内部画布高度；可视 iframe 高度由 CSS --workbench-h 控制
 GLOBE_HEIGHT = 1000
 LOG_PANEL_HEIGHT = 88
 
-col_map, col_side = st.columns([70, 30], gap="small")
+try:
+    _status_panel_height = int(st.session_state.get("agent_status_panel_height", 220))
+except (TypeError, ValueError):
+    _status_panel_height = 220
+_status_panel_height = max(140, min(340, _status_panel_height))
+st.session_state.agent_status_panel_height = _status_panel_height
+_status_panel_collapsed = bool(st.session_state.get("agent_status_panel_collapsed", False))
+# 地图下方预留状态工具栏 + 可调状态区；收起时只保留工具栏。
+# 状态区不再单独占用工具栏行；仅保留 8px 边界间距，收起时地图几乎填满工作区。
+_status_panel_reserve = 8 if _status_panel_collapsed else _status_panel_height + 8
+st.markdown(
+    f'<style>:root{{--cstf-status-panel-reserve:{_status_panel_reserve}px !important;}}</style>',
+    unsafe_allow_html=True,
+)
+
+try:
+    _chat_width_pct = int(st.session_state.get("agent_chat_width_pct", 34))
+except (TypeError, ValueError):
+    _chat_width_pct = 34
+_chat_width_pct = max(24, min(48, _chat_width_pct))
+st.session_state.agent_chat_width_pct = _chat_width_pct
+_map_width_pct = 100 - _chat_width_pct
+_side_width_pct = _chat_width_pct
+st.markdown(
+    f'<div class="cstf-layout-defaults" data-status-reserve="{_status_panel_reserve}" '
+    f'data-agent-width="{_chat_width_pct}"></div>',
+    unsafe_allow_html=True,
+)
+col_map, col_side = st.columns([_map_width_pct, _side_width_pct], gap="small")
 
 _log_panel_slot = None
-uploaded_img = None
+uploaded_images = []
 prompt = ""
 send_btn = False
 raster_load_error = None
@@ -3535,6 +4555,7 @@ with col_map:
                         globe_port=_globe_port,
                         prefer_center=_prefer_center,
                         force_local=_force_local_globe,
+                        channel_id=st.session_state.get("_map_channel_id"),
                     )
 
                 if map_display_path and os.path.exists(map_display_path):
@@ -3697,12 +4718,13 @@ with col_map:
             else:
                 raster_load_error = raster_load_error or "未能生成三维地球 URL"
         except Exception as _globe_err:
-            raster_load_error = str(_globe_err)
-            st.error(f"三维地球加载失败：{_globe_err}")
+            _safe_globe_err = safe_error_summary(_globe_err)
+            raster_load_error = _safe_globe_err
+            st.error(f"三维地球加载失败：{_safe_globe_err}")
             st.caption(
                 "本机请用 http://localhost:8501 打开；远程演示需同时启动 ngrok 并设置 CSTF_GLOBE_PUBLIC_URL。"
             )
-            st.toast(f"三维地球加载失败，已切换 2D 地图: {_globe_err}", icon="⚠️")
+            st.toast(f"三维地球加载失败，已切换 2D 地图: {_safe_globe_err}", icon="⚠️")
             _use_2d = True
 
     if _use_2d:
@@ -3779,11 +4801,29 @@ with col_map:
                 st.session_state.use_2d_map_fallback = True
                 st.rerun()
 
+    # 任务状态和终端日志位于地图下方，不再占用右侧 Agent Dock。
+    st.markdown('<div class="cstf-map-status-zone"></div>', unsafe_allow_html=True)
+    _status_toolbar_c1, _status_toolbar_c2 = st.columns([6, 1], gap="small")
+    with _status_toolbar_c1:
+        st.markdown('<div class="cstf-status-toolbar-spacer" aria-hidden="true"></div>', unsafe_allow_html=True)
+    with _status_toolbar_c2:
+        st.markdown(
+            f'<div class="cstf-status-toggle-host"><div class="cstf-status-toggle-state" '
+            f'data-collapsed="{1 if _status_panel_collapsed else 0}"></div></div>',
+            unsafe_allow_html=True,
+        )
+        if st.button(
+            "展开" if _status_panel_collapsed else "收起",
+            key="agent_status_panel_toggle",
+            use_container_width=True,
+        ):
+            st.session_state.agent_status_panel_collapsed = not _status_panel_collapsed
+            st.rerun()
+    if not _status_panel_collapsed:
+        _log_panel_slot = st.container(height="stretch", border=True)
+
 with col_side:
     st.markdown('<div class="command-deck-side">', unsafe_allow_html=True)
-    _log_panel_slot = st.container()
-    st.markdown('<div class="cstf-log-panel-host-marker"></div>', unsafe_allow_html=True)
-
     st.markdown('<div class="cstf-copilot-dock">', unsafe_allow_html=True)
     st.markdown('<div class="cockpit-copilot-zone-start"></div>', unsafe_allow_html=True)
     st.markdown(
@@ -3791,14 +4831,158 @@ with col_side:
         unsafe_allow_html=True,
     )
 
+    if "_conversation_store" not in st.session_state:
+        # Chat previews are disposable UI artefacts, not conversation data.
+        # Bound their lifetime on each new Streamlit session so abandoned
+        # uploads cannot accumulate indefinitely in the checkout.
+        try:
+            cleanup_preview_cache()
+        except Exception:
+            # Cleanup is best-effort and must never prevent the workbench from
+            # starting; the helper itself returns only aggregate counters.
+            pass
+        try:
+            from conversation_store import ConversationStore
+
+            _conversation_db = os.environ.get(
+                "CSTF_CONVERSATION_DB_PATH",
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "conversations.sqlite3"),
+            )
+            st.session_state._conversation_store = ConversationStore(_conversation_db)
+            # Do not materialize an empty session on page load.  A thread is
+            # created lazily when the first message is actually submitted.
+            st.session_state._conversation_thread_id = st.session_state.get(
+                "_conversation_thread_id"
+            ) or None
+            st.session_state._conversation_store.cleanup()
+        except Exception:
+            st.session_state._conversation_store = None
     if "messages" not in st.session_state:
-        st.session_state.messages = [
+        _restored_messages = []
+        if st.session_state.get("_conversation_store") is not None:
+            try:
+                _current_thread = st.session_state.get("_conversation_thread_id")
+                if _current_thread:
+                    _restored_messages = st.session_state._conversation_store.load_messages(
+                        _current_thread
+                    )
+            except Exception:
+                _restored_messages = []
+        st.session_state.messages = _restored_messages or [
             {"role": "assistant", "content": "您好！我是智能分析助手。请告诉我您想分析的区域和年份，或上传截图让我识别。"}
         ]
+
+    _default_chat_message = {
+        "role": "assistant",
+        "content": "您好！我是智能分析助手。请告诉我您想分析的区域和年份，或上传截图让我识别。",
+    }
+    # Attachment consent is one-shot and only appears after a file is chosen;
+    # it never occupies the compact compose row or silently persists across
+    # reruns/conversations.
+    st.session_state.setdefault("agent_external_media_consent", False)
+    st.session_state.setdefault("agent_spatial_consent", False)
+    # Session buttons are rendered below the radio widget. Defer the widget
+    # value change to the next rerun so Streamlit does not reject a post-
+    # instantiation session-state mutation.
+    if st.session_state.pop("_conversation_open_dialog", False):
+        st.session_state.agent_dock_view = "对话"
+    _agent_dock_view = st.radio(
+        "Agent 面板",
+        ["对话", "历史"],
+        horizontal=True,
+        key="agent_dock_view",
+        label_visibility="collapsed",
+    )
+    _dock_view_class = "history" if _agent_dock_view == "历史" else "chat"
+    st.markdown(
+        f'<div class="cstf-agent-view-marker cstf-agent-view-{_dock_view_class}"></div>',
+        unsafe_allow_html=True,
+    )
+    if _agent_dock_view == "历史" and st.session_state.get("_conversation_store") is not None:
+        try:
+            _conversation_threads = st.session_state._conversation_store.list_threads(
+                limit=8,
+                include_empty=False,
+            )
+        except Exception:
+            _conversation_threads = []
+        st.markdown('<div class="cstf-session-list-heading">会话列表</div>', unsafe_allow_html=True)
+        # 历史列表填充 Agent Dock 的剩余高度，内容过多时仅在列表内部滚动。
+        with st.container(height="stretch", border=True):
+            if not _conversation_threads:
+                st.caption("暂无历史会话")
+            else:
+                for _thread in _conversation_threads:
+                    _tid = str(_thread.get("thread_id") or "")
+                    if not _tid:
+                        continue
+                    try:
+                        _stamp = datetime.datetime.fromtimestamp(
+                            float(_thread.get("last_seen") or 0)
+                        ).strftime("%m-%d %H:%M")
+                    except (TypeError, ValueError, OSError):
+                        _stamp = "—"
+                    _preview = re.sub(r"\s+", " ", str(_thread.get("preview") or "")).strip()
+                    _preview = _preview[:34] if _preview else "空会话"
+                    _is_current = _tid == str(st.session_state.get("_conversation_thread_id") or "")
+                    _label = f"{'当前 · ' if _is_current else ''}{_stamp} · {_preview}"
+                    if st.button(
+                        _label,
+                        key=f"conversation_switch_{_tid}",
+                        use_container_width=True,
+                        disabled=_is_current,
+                    ):
+                        st.session_state._conversation_thread_id = _tid
+                        st.session_state.messages = (
+                            st.session_state._conversation_store.load_messages(_tid)
+                            or [_default_chat_message.copy()]
+                        )
+                        st.session_state._conversation_open_dialog = True
+                        st.rerun()
+        # 历史页底部的两个操作均分可用宽度，避免右侧留下无意义空白。
+        _conv_c1, _conv_c2 = st.columns(2)
+        with _conv_c1:
+            if st.button("新会话", key="conversation_new", use_container_width=True):
+                st.session_state._conversation_thread_id = st.session_state._conversation_store.create_thread()
+                st.session_state.messages = [_default_chat_message.copy()]
+                st.session_state._conversation_open_dialog = True
+                st.rerun()
+        with _conv_c2:
+            if st.button(
+                "清空会话",
+                key="conversation_clear",
+                help="删除当前会话，并在历史列表中选中下一条会话",
+                use_container_width=True,
+                disabled=not bool(st.session_state.get("_conversation_thread_id")),
+            ):
+                _deleted_thread_id = str(st.session_state.get("_conversation_thread_id") or "")
+                from conversation_store import next_thread_id_after_delete
+
+                _next_thread_id = next_thread_id_after_delete(
+                    _conversation_threads,
+                    _deleted_thread_id,
+                )
+                st.session_state._conversation_store.delete_thread(_deleted_thread_id)
+                if _next_thread_id:
+                    # Keep the history view active: the selection changes,
+                    # but the user is not pushed into the chat view.
+                    st.session_state._conversation_thread_id = _next_thread_id
+                    st.session_state.messages = (
+                        st.session_state._conversation_store.load_messages(_next_thread_id)
+                        or [_default_chat_message.copy()]
+                    )
+                else:
+                    st.session_state._conversation_thread_id = None
+                    st.session_state.messages = []
+                st.rerun()
     st.markdown('<div class="cockpit-chat-anchor"></div>', unsafe_allow_html=True)
-    chat_box = st.container(border=True)
+    # 历史页不需要聊天容器边框；避免无会话时在底部留下空白行。
+    chat_box = st.container(border=_agent_dock_view == "对话")
 
     with chat_box:
+        # Keep a dedicated hook even when there are no messages.  The history
+        # view uses it to remove this otherwise empty bordered chat container.
+        st.markdown('<div class="cstf-chat-stream-marker" aria-hidden="true"></div>', unsafe_allow_html=True)
         for msg in st.session_state.messages:
             avatar = "🧑‍💻" if msg["role"] == "user" else "🤖"
             with st.chat_message(msg["role"], avatar=avatar):
@@ -3807,13 +4991,10 @@ with col_side:
                 else:
                     st.markdown('<div class="msg-role msg-role-assistant">智能体</div>', unsafe_allow_html=True)
                 st.markdown(msg["content"])
-                _preview_path = msg.get("image_preview_path")
-                if _preview_path and os.path.exists(_preview_path):
-                    st.image(
-                        _preview_path,
-                        caption=msg.get("image_name") or "uploaded image",
-                        use_container_width=True,
-                    )
+                _render_chat_attachment_previews(msg)
+
+    if st.session_state.pop("_attachment_consent_reset_pending", False):
+        st.session_state["agent_external_media_consent"] = False
 
     st.markdown('<div class="cstf-chat-compose-host">', unsafe_allow_html=True)
     with st.form(key="chat_form", clear_on_submit=True):
@@ -3827,12 +5008,41 @@ with col_side:
         with _input_cols[1]:
             send_btn = st.form_submit_button("➤", use_container_width=True)
 
-        uploaded_img = st.file_uploader(
+        try:
+            _attachment_uploader_epoch = int(
+                st.session_state.get("_attachment_uploader_epoch", 0)
+            )
+        except (TypeError, ValueError):
+            _attachment_uploader_epoch = 0
+        uploaded_images = st.file_uploader(
             "chat_attach",
             type=["png", "jpg", "jpeg", "webp", "tif", "tiff"],
+            accept_multiple_files=True,
             label_visibility="collapsed",
-            key="chat_attach_uploader",
+            key=f"chat_attach_uploader_{_attachment_uploader_epoch}",
         )
+        uploaded_images = list(uploaded_images or [])
+        # The real checkbox stays inside the form so the compact attachment
+        # menu can set a one-shot choice before the same form is submitted.
+        # CSS hides the native row; the + button exposes the accessible choice
+        # between local-only preview and external model analysis.
+        st.checkbox(
+            "附件外发授权（仅本轮）",
+            key="agent_external_media_consent",
+            help="允许后，本轮附件的受限 PNG 预览才会发送给已配置模型。",
+        )
+        st.markdown(
+            f'<span class="cstf-attachment-epoch-marker" data-epoch="{_attachment_uploader_epoch}" '
+            'aria-hidden="true"></span>',
+            unsafe_allow_html=True,
+        )
+        if os.environ.get("CSTF_ALLOW_RAW_SYSTEM_COMMAND", "").strip().lower() in {"1", "true", "yes", "on"}:
+            st.checkbox(
+                "开发模式：允许本轮直接执行聊天框系统命令",
+                value=False,
+                key="agent_raw_system_command_consent",
+                help="仅用于本地验收；需同时配置 CSTF_ALLOW_RAW_SYSTEM_COMMAND=1，且仍受重型任务确认门闩约束。",
+            )
 
     components.html(
         """
@@ -3840,69 +5050,271 @@ with col_side:
         (() => {
           const win = window.parent || window;
           const doc = win.document;
+          const bindingToken = `attach-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+          // Only the newest Streamlit component execution may install or poll
+          // the parent-page attachment bridge. Older iframe timers stop as
+          // soon as a newer generation is announced.
+          win.__cstfAttachmentInstallerGeneration = bindingToken;
           if (!doc || doc.body?.dataset?.cstfChatComposeBound === "1") {
             /* allow re-bind on streamlit rerun via observer */
           }
 
           const bindChatCompose = () => {
+            if (win.__cstfAttachmentInstallerGeneration !== bindingToken) return false;
+            const chatInputSelector =
+              'input[aria-label="chat_input"], input[aria-label="聊天输入"], input[placeholder*="智能分析助手"]';
             const forms = doc.querySelectorAll('[data-testid="stForm"]');
             let chatForm = null;
             forms.forEach((f) => {
-              if (f.querySelector('input[aria-label="chat_input"]')) chatForm = f;
+              if (f.querySelector(chatInputSelector)) chatForm = f;
             });
             if (!chatForm) return false;
+            chatForm.classList.add('cstf-chat-compose');
             const fileWrap = chatForm.querySelector('[data-testid="stFileUploader"]');
             const fileInput = chatForm.querySelector('input[type="file"]');
+            const consentInput = chatForm.querySelector(
+              'input[type="checkbox"][aria-label*="附件外发授权"]'
+            );
+            const epochMarker = chatForm.querySelector('.cstf-attachment-epoch-marker');
+            const uploaderEpoch = epochMarker?.dataset?.epoch || 'unknown';
             if (!fileWrap || !fileInput) return false;
 
-            let bar = chatForm.querySelector('.cstf-attach-bar');
-            if (!bar) {
-              bar = doc.createElement('div');
-              bar.className = 'cstf-attach-bar';
-              bar.innerHTML =
-                '<button type="button" class="cstf-plus-btn" title="上传图片或影像">+</button>' +
-                '<span class="cstf-attach-name"></span>' +
-                '<span class="cstf-attach-hint">PNG / JPG / WebP / TIFF</span>';
-              fileWrap.appendChild(bar);
+            // Streamlit can retain the same native file input node while the
+            // server rotates its uploader key. Treat that epoch boundary as a
+            // hard compose reset before reading `files`; otherwise a browser
+            // can re-advertise the previous round's filename after rerun.
+            const existingController = win.__cstfAttachmentController;
+            const previousEpoch = existingController?.uploaderEpoch
+              ?? win.__cstfAttachmentLastEpoch;
+            const attachmentEpochChanged = (
+              previousEpoch != null
+              && previousEpoch !== 'unknown'
+              && previousEpoch !== uploaderEpoch
+            );
+            if (attachmentEpochChanged) {
+              try {
+                fileInput.value = '';
+              } catch (_) {
+                /* The server-side uploader key remains the final fallback. */
+              }
+              delete win.__cstfAttachmentPendingEpoch;
             }
+            win.__cstfAttachmentLastEpoch = uploaderEpoch;
+
+            const inputRow = [...chatForm.querySelectorAll('[data-testid="stHorizontalBlock"]')]
+              .find((row) => row.querySelector(chatInputSelector));
+            if (!inputRow) return false;
+            inputRow.classList.add('cstf-chat-input-row');
+            const chatInput = inputRow.querySelector(chatInputSelector);
+            const inputColumn = chatInput?.closest('[data-testid="stColumn"]');
+            const sendButton = inputRow.querySelector(
+              '[data-testid="stFormSubmitButton"] button'
+            );
+            const sendColumn = sendButton?.closest('[data-testid="stColumn"]');
+            inputColumn?.classList.add('cstf-chat-input-column');
+            sendColumn?.classList.add('cstf-chat-send-column');
+
+            if (
+              existingController?.version === '2026-08-23-attachment-v3'
+              && existingController?.fileInput === fileInput
+              && existingController?.fileInput?.isConnected
+              && existingController?.sendButton === sendButton
+              && existingController?.chatForm === chatForm
+              && existingController?.uploaderEpoch === uploaderEpoch
+              && existingController?.bar?.isConnected
+              && typeof existingController.sync === 'function'
+            ) {
+              existingController.sync();
+              return true;
+            }
+            if (existingController && typeof existingController.destroy === 'function') {
+              existingController.destroy();
+            }
+            chatForm.querySelectorAll('.cstf-attach-bar').forEach((node) => node.remove());
+
+            const bar = doc.createElement('div');
+            bar.className = 'cstf-attach-bar';
+            bar.dataset.bindingToken = bindingToken;
+            bar.dataset.uploaderEpoch = uploaderEpoch;
+            bar.innerHTML =
+                '<button type="button" class="cstf-plus-btn" ' +
+                'data-tooltip="每个文件≤200MB · PNG / JPG / WebP / TIFF" ' +
+                'aria-haspopup="dialog" aria-expanded="false" ' +
+                'aria-label="选择附件上传方式（每个文件≤200MB；PNG、JPG、WebP、TIFF）">+</button>' +
+                '<div class="cstf-attach-choice" role="dialog" aria-label="附件上传方式" aria-hidden="true">' +
+                  '<p class="cstf-attach-choice-title">选择本轮附件用途。仅“发送给模型”会把受限预览交给已配置模型。</p>' +
+                  '<div class="cstf-attach-choice-actions">' +
+                    '<button type="button" data-media-mode="local">仅本地预览</button>' +
+                    '<button type="button" data-media-mode="external">发送给模型</button>' +
+                  '</div>' +
+                '</div>';
+            // 将附件入口放到消息输入行最左侧；文件选择器本身仍隐藏在表单内。
+            if (bar.parentElement !== inputRow) inputRow.insertBefore(bar, inputRow.firstChild);
 
             const plusBtn = bar.querySelector('.cstf-plus-btn');
-            const nameEl = bar.querySelector('.cstf-attach-name');
-            const hintEl = bar.querySelector('.cstf-attach-hint');
+            const choicePanel = bar.querySelector('.cstf-attach-choice');
+            const modeButtons = bar.querySelectorAll('[data-media-mode]');
+
+            const defaultTooltip = '每个文件≤200MB · PNG / JPG / WebP / TIFF';
+            let active = true;
+
+            const setChoiceOpen = (open) => {
+              bar.classList.toggle('is-open', Boolean(open));
+              plusBtn?.setAttribute('aria-expanded', open ? 'true' : 'false');
+              choicePanel?.setAttribute('aria-hidden', open ? 'false' : 'true');
+            };
+
+            const setMediaConsent = (allowExternal) => {
+              if (consentInput && consentInput.checked !== allowExternal) {
+                consentInput.click();
+              }
+            };
 
             if (plusBtn && plusBtn.dataset.bound !== '1') {
               plusBtn.dataset.bound = '1';
               plusBtn.addEventListener('click', (e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                fileInput.click();
+                if (!consentInput) {
+                  fileInput.click();
+                  return;
+                }
+                setChoiceOpen(!bar.classList.contains('is-open'));
               });
             }
 
+            modeButtons.forEach((button) => {
+              if (button.dataset.bound === '1') return;
+              button.dataset.bound = '1';
+              button.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setMediaConsent(button.dataset.mediaMode === 'external');
+                setChoiceOpen(false);
+                fileInput.click();
+              });
+            });
+
             const syncAttach = () => {
-              const f = fileInput.files && fileInput.files[0];
-              if (f) {
-                nameEl.textContent = f.name;
-                if (hintEl) hintEl.style.display = 'none';
+              if (!active) return;
+              // A submit can remount the same-epoch Streamlit widget while the
+              // model is still running. Keep that transient remount clear;
+              // the final server rerun advances the epoch and releases this
+              // guard for the next user selection.
+              if (win.__cstfAttachmentPendingEpoch === uploaderEpoch) {
+                try {
+                  fileInput.value = '';
+                } catch (_) {
+                  /* The server-side epoch remains the final fallback. */
+                }
+              } else if (
+                win.__cstfAttachmentPendingEpoch != null
+                && win.__cstfAttachmentPendingEpoch !== uploaderEpoch
+              ) {
+                delete win.__cstfAttachmentPendingEpoch;
+              }
+              const files = Array.from(fileInput.files || []);
+              plusBtn.removeAttribute('title');
+              if (files.length) {
+                const names = files.slice(0, 3).map((file) => file.name).join('、');
+                const suffix = files.length > 3 ? ` 等 ${files.length} 个附件` : '';
+                const selected = files.length === 1
+                  ? `已选择：${names} · 每个文件≤200MB`
+                  : `已选择 ${files.length} 个附件：${names}${suffix} · 每个文件≤200MB`;
+                const mode = consentInput?.checked ? '发送给模型' : '仅本地预览';
+                const described = `${selected} · ${mode}`;
+                plusBtn.dataset.tooltip = described;
+                plusBtn.setAttribute('aria-label', described);
               } else {
-                nameEl.textContent = '';
-                if (hintEl) hintEl.style.display = '';
+                plusBtn.dataset.tooltip = defaultTooltip;
+                plusBtn.setAttribute('aria-label', `选择附件上传方式（${defaultTooltip}）`);
               }
             };
 
-            if (fileInput.dataset.cstfBound !== '1') {
-              fileInput.dataset.cstfBound = '1';
+            if (fileInput.dataset.cstfBound !== bindingToken) {
+              fileInput.dataset.cstfBound = bindingToken;
               fileInput.addEventListener('change', () => {
+                // A genuine chooser action starts a new compose cycle even if
+                // Streamlit has not yet mounted the next server-side epoch.
+                // The submit guard is one-shot and must never clear this new
+                // user selection.
+                delete win.__cstfAttachmentPendingEpoch;
                 syncAttach();
                 setTimeout(() => {
                   const chatInput =
-                    doc.querySelector('input[aria-label="chat_input"]') ||
-                    doc.querySelector('input[placeholder*="智能分析助手"]');
+                    doc.querySelector(chatInputSelector);
                   if (chatInput) chatInput.focus();
                 }, 60);
               });
             }
             syncAttach();
+
+            const resetAttachmentChrome = () => {
+              if (!active) return;
+              setChoiceOpen(false);
+              plusBtn?.removeAttribute('title');
+              if (plusBtn) {
+                plusBtn.dataset.tooltip = defaultTooltip;
+                plusBtn.setAttribute('aria-label', `选择附件上传方式（${defaultTooltip}）`);
+              }
+            };
+
+            const clearSelectedFileUi = () => {
+              if (!active) return;
+              try {
+                fileInput.value = '';
+              } catch (_) {
+                /* The epoch key will still clear it after the rerun. */
+              }
+              resetAttachmentChrome();
+              syncAttach();
+            };
+
+            const handleSendClick = (event) => {
+              const clicked = event.target?.closest?.(
+                '[data-testid="stFormSubmitButton"] button'
+              );
+              if (!clicked || !chatForm.contains(clicked)) return;
+              // Listen on the parent document in capture phase: Streamlit may
+              // replace the submit button during the same click, so a handler
+              // attached only to that ephemeral button is not reliable across
+              // consecutive attachment messages.
+              win.__cstfAttachmentPendingEpoch = uploaderEpoch;
+              resetAttachmentChrome();
+              // Delay the native picker clear so React first snapshots the
+              // attachment list for this request.
+              win.setTimeout(clearSelectedFileUi, 60);
+            };
+            doc.addEventListener('click', handleSendClick, true);
+
+            if (chatForm.dataset.cstfAttachSubmitToken !== bindingToken) {
+              chatForm.dataset.cstfAttachSubmitToken = bindingToken;
+              chatForm.addEventListener('submit', () => {
+                // Streamlit has already captured the submitted form values at
+                // this point. Clear the native picker on the next browser task
+                // so the compact + control resets immediately while the model
+                // response is still running; the epoch key remains the server-
+                // side source of truth on the following rerun.
+                win.setTimeout(clearSelectedFileUi, 0);
+              });
+            }
+
+            const destroy = () => {
+              active = false;
+              doc.removeEventListener('click', handleSendClick, true);
+              if (bar.isConnected) bar.remove();
+            };
+            win.__cstfAttachmentController = {
+              version: '2026-08-23-attachment-v3',
+              token: bindingToken,
+              uploaderEpoch,
+              fileInput,
+              sendButton,
+              chatForm,
+              bar,
+              sync: syncAttach,
+              destroy,
+            };
             return true;
           };
 
@@ -3913,13 +5325,53 @@ with col_side:
           };
           tick();
 
-          if (!doc.body.dataset.cstfChatComposeObs) {
+          const bindChatComposeObserver = () => {
+            if (!doc || !doc.documentElement || doc.documentElement.nodeType !== 1) {
+              win.setTimeout(bindChatComposeObserver, 120);
+              return;
+            }
+            if (doc.body.dataset.cstfChatComposeObs === '1') return;
             doc.body.dataset.cstfChatComposeObs = '1';
-            const obs = new MutationObserver(() => {
-              win.setTimeout(bindChatCompose, 80);
-            });
-            obs.observe(doc.body, { childList: true, subtree: true });
+            // Do not observe a parent-document node from the component
+            // iframe: Chromium rejects that cross-realm target.  The bounded
+            // polling loop is enough because Streamlit reruns replace the
+            // compose form and re-execute this bridge.
+            let n = 0;
+            const poll = () => {
+              if (win.__cstfAttachmentInstallerGeneration !== bindingToken) return;
+              bindChatCompose();
+              if (n++ < 20) win.setTimeout(poll, 180);
+            };
+            poll();
+          };
+          bindChatComposeObserver();
+
+          // The component iframe may survive only for the current Streamlit
+          // render. Keep one parent-page reconciler alive so a later rerun can
+          // replace the native file input without leaving a stale + bar or
+          // listeners attached to the disconnected input.
+          const reconcileAttachment = () => {
+            if (win.__cstfAttachmentInstallerGeneration !== bindingToken) {
+              const current = win.__cstfAttachmentReconciler;
+              if (current?.token === bindingToken && typeof current.stop === 'function') {
+                current.stop();
+              }
+              return;
+            }
+            bindChatCompose();
+          };
+          const previousReconciler = win.__cstfAttachmentReconciler;
+          if (previousReconciler && previousReconciler.token !== bindingToken
+              && typeof previousReconciler.stop === 'function') {
+            previousReconciler.stop();
           }
+          const reconcileTimer = win.setInterval(reconcileAttachment, 260);
+          win.__cstfAttachmentReconciler = {
+            token: bindingToken,
+            timer: reconcileTimer,
+            stop: () => win.clearInterval(reconcileTimer),
+          };
+          reconcileAttachment();
         })();
         </script>
         """,
@@ -3929,10 +5381,37 @@ with col_side:
     st.markdown("</div>", unsafe_allow_html=True)
 
 _has_text = bool(prompt and prompt.strip())
-_has_image = uploaded_img is not None
+_has_image = bool(uploaded_images)
 _user_submitted = send_btn and (_has_text or _has_image)
 
 if _user_submitted:
+    if len(uploaded_images) > 6:
+        st.warning("单轮最多支持 6 张图片附件；本轮仅处理前 6 张。")
+        uploaded_images = uploaded_images[:6]
+
+    preview_items = []
+    preview_failures = []
+    for uploaded_image in uploaded_images:
+        preview_path, image_name = _save_chat_image_preview(uploaded_image)
+        if preview_path:
+            preview_items.append((preview_path, image_name))
+        else:
+            preview_failures.append(image_name or "未知附件")
+    if preview_failures:
+        st.warning(
+            "以下附件无法生成本地预览，已跳过："
+            + "、".join(preview_failures[:3])
+            + ("…" if len(preview_failures) > 3 else "")
+        )
+
+    media_authorized = bool(
+        uploaded_images
+        and st.session_state.get("agent_external_media_consent", False)
+    )
+    if uploaded_images and not media_authorized:
+        st.warning("附件已保留在本地消息预览中；本轮未向外部模型发送附件内容。")
+    external_preview_paths = [path for path, _name in preview_items] if media_authorized else []
+
     used_default_prompt = False
     if _has_text:
         prompt = prompt.strip()
@@ -3944,29 +5423,42 @@ if _user_submitted:
     drawn_context = ""
     if isinstance(map_state, dict) and map_state.get("last_active_drawing"):
         geo_info = map_state["last_active_drawing"]["geometry"]
-        drawn_context = f"\n\n[系统隐秘信息：用户当前在地图上框选的区域几何信息为 {geo_info}]"
+        drawn_context = "\n\n[系统空间上下文：用户已在地图上选择区域；完整几何仅保留在本地执行层，不发送给外部模型]"
 
     full_prompt_for_agent = prompt + drawn_context
-    user_preview_path = None
-    user_image_name = None
-    if uploaded_img is not None:
-        user_preview_path, user_image_name = _save_chat_image_preview(uploaded_img)
-
     display_prompt = prompt
     if used_default_prompt:
         display_prompt = prompt + "\n\n`（未输入文本，系统已自动填充默认解译指令）`"
+
+    user_msg = {"role": "user", "content": display_prompt}
+    if preview_items:
+        user_msg["image_preview_paths"] = [path for path, _name in preview_items]
+        user_msg["image_names"] = [name for _path, name in preview_items]
+        # Preserve the existing single-attachment fields for old sessions and
+        # the current SQLite projection, which stores only a safe label.
+        user_msg["image_preview_path"] = preview_items[0][0]
+        user_msg["image_name"] = preview_items[0][1]
 
     with chat_box:
         with st.chat_message("user", avatar="🧑‍💻"):
             st.markdown('<div class="msg-role msg-role-user">用户</div>', unsafe_allow_html=True)
             st.markdown(display_prompt)
-            if user_preview_path and os.path.exists(user_preview_path):
-                st.image(user_preview_path, caption=user_image_name or "uploaded image", use_container_width=True)
-    user_msg = {"role": "user", "content": display_prompt}
-    if user_preview_path:
-        user_msg["image_preview_path"] = user_preview_path
-        user_msg["image_name"] = user_image_name
+            _render_chat_attachment_previews(user_msg)
+    if st.session_state.get("_conversation_store") is not None:
+        from conversation_store import ensure_thread_id
+
+        st.session_state._conversation_thread_id = ensure_thread_id(
+            st.session_state._conversation_store,
+            st.session_state.get("_conversation_thread_id"),
+            create=True,
+        )
     st.session_state.messages.append(user_msg)
+    # Consent applies to this submission only; a later file selection must
+    # require a fresh affirmative action.
+    st.session_state["_attachment_consent_reset_pending"] = True
+    # File uploaders cannot be cleared by assigning their instantiated widget
+    # state. Rotate the key so the post-submit rerun mounts a fresh input.
+    st.session_state["_attachment_uploader_epoch"] = _attachment_uploader_epoch + 1
 
     with chat_box:
         with st.chat_message("assistant", avatar="🤖"):
@@ -4052,6 +5544,17 @@ if _user_submitted:
 
                     # 验收/高级：用户消息中直接粘贴 SYSTEM_COMMAND_JSON 时入队（不经 LLM）
                     if "[SYSTEM_COMMAND_JSON]" in (prompt or ""):
+                        from agent_context_policy import raw_system_command_consent
+
+                        if not raw_system_command_consent(st.session_state):
+                            _msg = (
+                                "为避免聊天文本绕过智能体边界，直接系统命令默认关闭。"
+                                "本地验收请配置 CSTF_ALLOW_RAW_SYSTEM_COMMAND=1，"
+                                "并勾选当前会话的开发授权后重试。"
+                            )
+                            st.warning(_msg)
+                            st.session_state.messages.append({"role": "assistant", "content": _msg})
+                            st.rerun()
                         cmd_result, clean_reply = process_agent_reply(st.session_state, prompt)
                         for _ce in cmd_result.errors:
                             st.warning(_ce)
@@ -4063,19 +5566,6 @@ if _user_submitted:
                             {"role": "assistant", "content": _msg}
                         )
                         st.rerun()
-
-                    temp_img_path = None
-                    if uploaded_img is not None:
-                        _yy_dir = os.path.dirname(os.path.abspath(__file__))
-                        _up_dir = os.path.join(_yy_dir, "_chat_upload_tmp")
-                        os.makedirs(_up_dir, exist_ok=True)
-                        _base = os.path.basename(uploaded_img.name) or "image"
-                        _safe = "".join(c for c in _base if c.isalnum() or c in "._-")
-                        if not _safe:
-                            _safe = "upload.png"
-                        temp_img_path = os.path.join(_up_dir, f"_{os.getpid()}_{_safe}")
-                        with open(temp_img_path, "wb") as f:
-                            f.write(uploaded_img.getbuffer())
 
                     try:
                         from dataset_assets import build_dataset_catalog_for_agent
@@ -4094,7 +5584,13 @@ if _user_submitted:
                         import capability_registry as _cap
                         _cap_reg = st.session_state.get("_capability_reg")
                         if _cap_reg is None:
-                            _cap_reg = _cap.CapabilityRegistry(context={})
+                            _cap_reg = _cap.CapabilityRegistry(
+                                context=_cap.build_context(
+                                    app_dir=os.path.dirname(os.path.abspath(__file__)),
+                                    model_path=st.session_state.get("ui_model_path") or "",
+                                    task=st.session_state.get("ui_selected_task") or "",
+                                )
+                            )
                             st.session_state._capability_reg = _cap_reg
                         if not st.session_state.get("_cap_snapshot_injected"):
                             _snap = _cap_reg.snapshot_for_agent()
@@ -4111,18 +5607,26 @@ if _user_submitted:
                             st.session_state._cap_snapshot_injected = True
                     except Exception:
                         _cap_snap_text = None
+                    from context_budget import bound_messages
+
                     reply = agent.chat_with_vlm(
                         full_prompt_for_agent,
-                        st.session_state.messages,
-                        temp_img_path,
+                        bound_messages(
+                            st.session_state.messages,
+                            allow_spatial_metadata=bool(
+                                st.session_state.get("agent_spatial_consent", False)
+                            ),
+                        ),
                         available_tasks=task_options,
                         dataset_catalog_text=_ds_cat or None,
                         sidebar_context=_sidebar_ctx,
                         capability_summary=_cap_snap_text,
+                        allow_spatial_metadata=bool(
+                            st.session_state.get("agent_spatial_consent", False)
+                        ),
+                        allow_external_media=media_authorized,
+                        image_paths=external_preview_paths,
                     )
-
-                    if temp_img_path and os.path.exists(temp_img_path):
-                        os.remove(temp_img_path)
 
                     cmd_result, clean_reply = process_agent_reply(st.session_state, reply)
                     if cmd_result.applied:
@@ -4190,7 +5694,16 @@ if _user_submitted:
 
                 except Exception as e:
                     _append_debug_log(f"agent_chat_failed: {_format_agent_exception(e)}")
-                    st.error(f"连接智能体出错: {_format_agent_exception(e)}")
+                    _error_reply = f"连接智能体出错：{_format_agent_exception(e)}"
+                    st.error(_error_reply)
+                    # Keep the failure in the bounded conversation stream so
+                    # a send from History still has an observable assistant
+                    # reply after the next rerun.
+                    st.session_state.messages.append({"role": "assistant", "content": _error_reply})
+
+    # Normal replies do not otherwise trigger a rerun. Re-render once so the
+    # rotated uploader key clears every selected attachment from the composer.
+    st.rerun()
 
 # =======================================================
 #  4. 后台流水线：启动 + 收尾 + 监控区（须放在 root_dir 等侧栏变量之后）
@@ -4199,20 +5712,31 @@ def finalize_background_pipeline():
     shared = st.session_state.get("pipeline_shared")
     if not shared or not shared.get("done") or not st.session_state.is_running:
         return False
+    _job_was_stopped = bool(st.session_state.get("stop_requested"))
     with shared["lock"]:
-        success = bool(shared.get("success", False))
+        # A stop request can race with a worker's final success signal.  The
+        # user intent is authoritative: do not register/load artifacts or emit
+        # success timeline events after an explicit interruption.
+        from job_store import worker_success_is_committable
+
+        success = worker_success_is_committable(
+            shared.get("success", False), _job_was_stopped
+        )
         asset_path = shared.get("asset_path")
         lines = list(shared.get("log_lines") or [])
         prog = int(shared.get("progress", 0))
         at_result = shared.get("autotune_result")
         m5_report = shared.get("m5_report")
         m5_verification = shared.get("m5_verification")
+        m5_asset_id = shared.get("m5_asset_id")
         e1_report = shared.get("e1_report")
         e1_verification = shared.get("e1_verification")
+        e1_asset_id = shared.get("e1_asset_id")
         job_kind = shared.get("job_kind")
         inference_result = shared.get("inference_result")
         inference_verification = shared.get("inference_verification")
         inference_asset_id = shared.get("asset_id")
+    _failure_timeline_status = "CANCELLED" if _job_was_stopped else "FAILED"
     _tl_task = st.session_state.get("_tl_current_task") or "unknown"
     st.session_state.pipeline_log_snapshot = lines
     st.session_state.pipeline_progress_value = prog
@@ -4273,14 +5797,21 @@ def finalize_background_pipeline():
                 import capability_registry as _cap
                 _cap_reg = st.session_state.get("_capability_reg")
                 if _cap_reg is not None:
-                    _cap_reg.invalidate()
+                    _cap_reg.mark_runtime_verified("deep_learning_inference")
+                    _cap_reg.bump()
                 st.session_state._cap_snapshot_injected = False
             except Exception:
                 pass
         else:
             _err = (inference_result or {}).get("error") or "提取失败（详见终端日志）"
-            _tl_add(_tl_task, "INFERENCE", f"提取未完成：{_err[:60]}",
-                    status="FAILED", error=_err, tool="run_inference")
+            _tl_add(
+                _tl_task,
+                "INFERENCE",
+                "提取已取消" if _job_was_stopped else f"提取未完成：{_err[:60]}",
+                status=_failure_timeline_status,
+                error=None if _job_was_stopped else _err,
+                tool="run_inference",
+            )
     # ---- GEE 影像下载可信执行闭环收尾 ----
     gee_result = shared.get("gee_result") if shared else None
     gee_verification = shared.get("gee_verification") if shared else None
@@ -4314,17 +5845,25 @@ def finalize_background_pipeline():
                 import capability_registry as _cap
                 _cap_reg = st.session_state.get("_capability_reg")
                 if _cap_reg is not None:
-                    _cap_reg.invalidate()
+                    _cap_reg.mark_runtime_verified("gee_download")
+                    _cap_reg.bump()
                 st.session_state._cap_snapshot_injected = False
             except Exception:
                 pass
         else:
             _err = (gee_result or {}).get("error") or "影像获取失败（详见终端日志）"
-            _tl_add(_tl_task, "GEE_EXPORT", f"获取未完成：{_err[:60]}",
-                    status="FAILED", error=_err, tool="run_gee_download")
+            _tl_add(
+                _tl_task,
+                "GEE_EXPORT",
+                "影像获取已取消" if _job_was_stopped else f"获取未完成：{_err[:60]}",
+                status=_failure_timeline_status,
+                error=None if _job_was_stopped else _err,
+                tool="run_gee_download",
+            )
     if m5_report:
         st.session_state.m5_report = m5_report
         _lvl = m5_report.get("alert_level", "GREEN")
+        _m5_verified = bool(m5_verification and m5_verification.get("ok") is True)
         if _lvl in ("RED", "YELLOW"):
             try:
                 st.toast(
@@ -4334,7 +5873,7 @@ def finalize_background_pipeline():
             except Exception:
                 pass
         # 独立 M5 闭环：把真实结果写回 Copilot，并加载地图
-        if job_kind == "m5" or (success and m5_verification is not None):
+        if not _job_was_stopped and (job_kind == "m5" or (success and m5_verification is not None)):
             try:
                 import m5_agent_loop
 
@@ -4348,6 +5887,15 @@ def finalize_background_pipeline():
                 st.session_state._m5_last_summary = summary
             except Exception:
                 pass
+            if m5_verification is not None:
+                _tl_add(
+                    _tl_task,
+                    "VERIFY",
+                    "变化分析输出校验通过" if _m5_verified else "变化分析输出校验未通过",
+                    status="SUCCEEDED" if _m5_verified else _failure_timeline_status,
+                    error=None if _m5_verified else "输出校验未完全通过；未登记成果。",
+                    tool="verify_m5",
+                )
             map_path = asset_path
             if not map_path:
                 try:
@@ -4356,7 +5904,7 @@ def finalize_background_pipeline():
                     map_path = m5_agent_loop.pick_m5_map_path(m5_report)
                 except Exception:
                     map_path = None
-            if map_path and os.path.isfile(str(map_path)):
+            if _m5_verified and map_path and os.path.isfile(str(map_path)):
                 st.session_state.asset_override = map_path
                 st.session_state._asset_pinned = True
                 st.session_state.asset_just_loaded = True
@@ -4365,12 +5913,14 @@ def finalize_background_pipeline():
                 st.session_state._globe_rev = int(st.session_state.get("_globe_rev", 0)) + 1
     if e1_report:
         st.session_state.e1_report = e1_report
-        try:
-            st.toast("精度评价已完成", icon="📊")
-        except Exception:
-            pass
+        _e1_verified = bool(e1_verification and e1_verification.get("ok") is True)
+        if not _job_was_stopped:
+            try:
+                st.toast("精度评价已完成", icon="📊")
+            except Exception:
+                pass
         # 独立 E1 闭环：真实指标写回 Copilot，并优先加载分歧热力图
-        if job_kind == "e1" or (success and e1_verification is not None):
+        if not _job_was_stopped and (job_kind == "e1" or (success and e1_verification is not None)):
             try:
                 import e1_agent_loop
 
@@ -4384,6 +5934,15 @@ def finalize_background_pipeline():
                 st.session_state._e1_last_summary = summary
             except Exception:
                 pass
+            if e1_verification is not None:
+                _tl_add(
+                    _tl_task,
+                    "VERIFY",
+                    "精度评价输出校验通过" if _e1_verified else "精度评价输出校验未通过",
+                    status="SUCCEEDED" if _e1_verified else _failure_timeline_status,
+                    error=None if _e1_verified else "输出校验未完全通过；未登记成果。",
+                    tool="verify_e1",
+                )
             map_path = asset_path
             if not map_path:
                 try:
@@ -4392,7 +5951,7 @@ def finalize_background_pipeline():
                     map_path = e1_agent_loop.pick_e1_map_path(e1_report)
                 except Exception:
                     map_path = None
-            if map_path and os.path.isfile(str(map_path)):
+            if _e1_verified and map_path and os.path.isfile(str(map_path)):
                 st.session_state.asset_override = map_path
                 st.session_state._asset_pinned = True
                 st.session_state.asset_just_loaded = True
@@ -4407,6 +5966,15 @@ def finalize_background_pipeline():
     if workflow_result:
         st.session_state.workflow_last_result = workflow_result
         wf_status = workflow_result.get("status")
+        try:
+            import workflow_orchestrator as _workflow_orchestrator
+
+            _wf_timeline_status = _workflow_orchestrator.workflow_result_timeline_status(wf_status)
+        except Exception:
+            _wf_timeline_status = (
+                "WARNING" if wf_status == "COMPLETED_WITH_WARNINGS"
+                else ("SUCCEEDED" if success else "FAILED")
+            )
         try:
             summary = workflow_result.get("summary") or ""
             st.session_state.messages = list(st.session_state.get("messages") or [])
@@ -4423,47 +5991,128 @@ def finalize_background_pipeline():
         if success:
             _tl_add(_tl_task, "WORKFLOW",
                     f"一键潮滩分析完成（{uil.get_status_label(wf_status)}）",
-                    status="SUCCEEDED", progress=100,
+                    status=_wf_timeline_status, progress=100,
                     tool="run_workflow",
                     artifacts=[str(workflow_result.get("workflow_id") or "")])
             _tl_add(_tl_task, "WORKFLOW", f"步骤: {step_line}",
-                    status="SUCCEEDED", tool="run_workflow")
+                    status=_wf_timeline_status, tool="run_workflow")
             try:
                 st.balloons()
             except Exception:
                 pass
         else:
             _tl_add(_tl_task, "WORKFLOW", f"一键潮滩分析未完成（{uil.get_status_label(wf_status)}）",
-                    status="FAILED", error=step_line, tool="run_workflow")
+                    status=_failure_timeline_status,
+                    error=None if _job_was_stopped else step_line,
+                    tool="run_workflow")
     # 推理闭环已在上面自行登记 EXECUTE/REGISTER/VERIFY/MAP/REPORT，这里避免重复
     _inference_handled = inference_result is not None or inference_asset_id is not None
     _gee_handled = gee_result is not None or gee_dataset_id is not None
     _workflow_handled = workflow_result is not None
+    _m5_independent_handled = job_kind == "m5" and m5_report is not None
+    _e1_independent_handled = job_kind == "e1" and e1_report is not None
+    _optional_postflight_warning = bool(
+        success
+        and job_kind not in ("m5", "e1")
+        and (
+            (m5_report is not None and not (m5_verification and m5_verification.get("ok") is True))
+            or (e1_report is not None and not (e1_verification and e1_verification.get("ok") is True))
+        )
+    )
     if success and asset_path and job_kind not in ("m5", "e1") and not _inference_handled and not _gee_handled and not _workflow_handled:
         st.session_state.asset_override = asset_path
     if success and not _inference_handled and not _gee_handled and not _workflow_handled:
-        _tl_add(_tl_task, "EXECUTE", f"任务执行完成（{job_kind or 'pipeline'}）",
-                status="SUCCEEDED", progress=100, tool=job_kind or "run_pipeline")
+        _tl_add(
+            _tl_task,
+            "EXECUTE",
+            (f"任务执行完成（{job_kind or 'pipeline'}，含可选后置警告）"
+             if _optional_postflight_warning
+             else f"任务执行完成（{job_kind or 'pipeline'}）"),
+            status="WARNING" if _optional_postflight_warning else "SUCCEEDED",
+            progress=100,
+            tool=job_kind or "run_pipeline",
+        )
         if asset_path:
             _tl_add(_tl_task, "REGISTER", "成果已登记",
                     status="SUCCEEDED", tool="register_asset",
                     artifacts=[os.path.basename(str(asset_path))])
         if m5_report:
-            _tl_add(_tl_task, "VERIFY", "变化分析校验通过",
-                    status="SUCCEEDED", tool="verify_m5")
+            _m5_ok = bool(m5_verification and m5_verification.get("ok") is True)
+            _tl_add(
+                _tl_task,
+                "VERIFY",
+                "变化分析校验通过" if _m5_ok else "变化分析输出校验未完全通过",
+                status="SUCCEEDED" if _m5_ok else "WARNING",
+                error=None if _m5_ok else "输出校验未完全通过；未登记成果。",
+                tool="verify_m5",
+            )
+            if _m5_ok and m5_asset_id:
+                _tl_add(_tl_task, "REGISTER", "变化分析成果已登记",
+                        status="SUCCEEDED", tool="register_m5",
+                        artifacts=[str(m5_asset_id)])
         if e1_report:
-            _tl_add(_tl_task, "VERIFY", "精度评价校验通过",
-                    status="SUCCEEDED", tool="verify_e1")
-        try:
-            st.balloons()
-        except Exception:
-            pass
+            _e1_ok = bool(e1_verification and e1_verification.get("ok") is True)
+            _tl_add(
+                _tl_task,
+                "VERIFY",
+                "精度评价校验通过" if _e1_ok else "精度评价输出校验未完全通过",
+                status="SUCCEEDED" if _e1_ok else "WARNING",
+                error=None if _e1_ok else "输出校验未完全通过；未登记成果。",
+                tool="verify_e1",
+            )
+            if _e1_ok and e1_asset_id:
+                _tl_add(_tl_task, "REGISTER", "精度评价成果已登记",
+                        status="SUCCEEDED", tool="register_e1",
+                        artifacts=[str(e1_asset_id)])
+        if not _optional_postflight_warning:
+            try:
+                st.balloons()
+            except Exception:
+                pass
     else:
-        if not _inference_handled and not _gee_handled:
-            _tl_add(_tl_task, "EXECUTE", "任务执行失败",
-                    status="FAILED", error="任务执行失败，详见终端日志",
+        if (
+            not _inference_handled
+            and not _gee_handled
+            and not _workflow_handled
+            and not _m5_independent_handled
+            and not _e1_independent_handled
+        ):
+            _tl_add(_tl_task, "EXECUTE",
+                    "任务已取消" if _job_was_stopped else "任务执行失败",
+                    status=_failure_timeline_status,
+                    error=None if _job_was_stopped else "任务执行失败，详见终端日志",
                     tool=job_kind or "run_pipeline")
         time.sleep(2)
+    _job_status = "CANCELLED" if _job_was_stopped else ("SUCCEEDED" if success else "FAILED")
+    if not success and (_m5_independent_handled or _e1_independent_handled):
+        _postflight_verification = m5_verification if _m5_independent_handled else e1_verification
+        if isinstance(_postflight_verification, dict) and _postflight_verification.get("ok") is False:
+            _job_status = "WARNING"
+    if _optional_postflight_warning:
+        _job_status = "WARNING"
+    if workflow_result and workflow_result.get("status") == "COMPLETED_WITH_WARNINGS" and success:
+        _job_status = "WARNING"
+    _job_error = (
+        None
+        if success
+        else (
+            "用户已请求中断；本次成果未登记。"
+            if _job_was_stopped
+            else "后台任务未完成；请查看时间线并确认后重试。"
+        )
+    )
+    if _job_status == "WARNING" and _optional_postflight_warning:
+        _job_error = "主流程已完成，但可选后置输出校验未完全通过；相关成果未登记或加载。"
+    elif _job_status == "WARNING" and not success:
+        _job_error = "输出校验未完全通过；成果未登记或加载。"
+    _job_transition(
+        _job_status,
+        progress=100 if success else prog,
+        artifacts=[x for x in (asset_path, inference_asset_id, gee_dataset_id) if x],
+        error=_job_error,
+        metadata={"job_kind": job_kind or "pipeline"},
+    )
+    st.session_state.pop("_active_job_id", None)
     return True
 
 
@@ -4535,10 +6184,11 @@ def run_autotune_sync(ctx, shared, stop_event):
             stop_callback=check_stop,
         )
 
-        if result and result.get("best_shp_path"):
-            register_asset(actual_task, result["best_prob"], result["best_cnt"], result["best_shp_path"])
+        _best_shp = str((result or {}).get("best_shp_path") or "")
+        if result and _best_shp and os.path.isfile(_best_shp) and os.path.getsize(_best_shp) > 0:
+            register_asset(actual_task, result["best_prob"], result["best_cnt"], _best_shp)
             _run_m5_phase(
-                ctx, shared, result["best_shp_path"], actual_task,
+                ctx, shared, _best_shp, actual_task,
                 result["best_prob"], result["best_cnt"], push_log, check_stop,
             )
             _run_e1_phase(ctx, shared, result["best_shp_path"], actual_task, push_log, check_stop)
@@ -4548,14 +6198,17 @@ def run_autotune_sync(ctx, shared, stop_event):
                 f"交并比={result['best_iou'] * 100:.1f}% F1={result['best_f1'] * 100:.1f}%",
             )
             with shared["lock"]:
-                shared["asset_path"] = result["best_shp_path"]
+                shared["asset_path"] = _best_shp
                 shared["autotune_result"] = result
             return True
+        if result and result.get("best_shp_path"):
+            push_log("[AutoTune] 引擎返回结果，但最佳成果文件缺失或为空；不登记为成功。")
         push_status("warning", "参数优化未能得出结果（可能被中断或无有效真值像元）。")
         return False
     except Exception as e:
-        push_log(f"[ERROR] {e}")
-        push_status("error", f"参数优化异常: {e}")
+        safe = safe_error_summary(e)
+        push_log(f"[ERROR] {safe}")
+        push_status("error", f"参数优化异常: {safe}")
         import traceback
         traceback.print_exc()
         return False
@@ -4566,13 +6219,7 @@ def _autotune_worker_entry(ctx, shared, stop_event):
     try:
         ok = run_autotune_sync(ctx, shared, stop_event)
     except Exception as e:
-        tb_lines = traceback.format_exc().split("\n")[:25]
-        with shared["lock"]:
-            lines = list(shared.get("log_lines") or [])
-            lines.append(f"[CRASH] {e}")
-            lines.extend(tb_lines)
-            shared["log_lines"] = lines[-40:]
-            shared["status"] = ("error", str(e))
+        _record_worker_exception(shared, "参数优化线程异常", e)
     finally:
         with shared["lock"]:
             shared["success"] = ok
@@ -4589,6 +6236,28 @@ def maybe_start_pipeline_thread():
         st.session_state.pipeline_progress_value = 0
         st.session_state.executing_pipeline = True
         st.session_state._tl_current_task = at_info["task"]
+        _at_request = at_info.get("execution_request")
+        if not isinstance(_at_request, dict):
+            try:
+                from execution_request import attach_execution_request
+
+                _at_request = attach_execution_request(
+                    at_info,
+                    confirmation_source=str(at_info.get("confirmation_source") or "ui"),
+                ).get("execution_request")
+            except Exception:
+                _at_request = None
+        _at_pending = {
+            "task": at_info.get("task") or "unknown",
+            "mode": "autotune",
+            "plan_id": at_info.get("plan_id"),
+            "execution_request": _at_request,
+        }
+        _at_job = _job_create_for_pending(_at_pending, status="QUEUED")
+        if _at_job is None or _get_job_store().claim(_at_job.job_id) is None:
+            st.error("任务账本不可用或任务已被占用，未启动参数优化。")
+            st.session_state.is_running = False
+            return
 
         stop_ev = threading.Event()
         st.session_state.pipeline_stop_event = stop_ev
@@ -4596,6 +6265,7 @@ def maybe_start_pipeline_thread():
                 status="RUNNING", tool="run_autotune", progress=0)
         shared = {
             "lock": threading.Lock(),
+            "job_id": _at_job.job_id,
             "log_lines": [],
             "progress": 0,
             "status": ("info", "🔬 正在启动参数优化线程…"),
@@ -4635,6 +6305,65 @@ def maybe_start_pipeline_thread():
     if st.session_state.pipeline_thread_started:
         return
     task_info = st.session_state.pending_task
+    try:
+        from execution_request import attach_execution_request
+
+        _existing_request = task_info.get("execution_request") if isinstance(task_info, dict) else {}
+        _confirmation_source = str((_existing_request or {}).get("confirmation_source") or "ui")
+        task_info = attach_execution_request(task_info, confirmation_source=_confirmation_source)
+
+        # 兼容旧的 run_pipeline pending schema：在真正启动线程前补齐可信计划，
+        # 让 Agent/手动入口都落到同一生产执行适配器，而不是旧同步算法。
+        if task_info.get("mode") == "dl" and not task_info.get("inference_plan"):
+            from agent_command_bridge import propose_inference_plan as _propose_inference
+
+            _dl_plan, _dl_errors = _propose_inference(st.session_state, task_info)
+            if not _dl_plan.get("ready"):
+                st.error("推理计划校验未通过：" + "；".join(_dl_errors or _dl_plan.get("blockers") or ["未知条件"]))
+                st.session_state.pending_task = None
+                st.session_state.is_running = False
+                return
+            task_info["inference_plan"] = _dl_plan
+            task_info["plan_id"] = _dl_plan.get("plan_id")
+            task_info = attach_execution_request(task_info, confirmation_source=_confirmation_source)
+        elif task_info.get("mode") == "index" and not task_info.get("index_plan"):
+            import index_agent_loop as _index_loop
+
+            _idx_plan = _index_loop.build_index_plan(
+                task=task_info.get("task") or "",
+                input_dir=os.path.join(root_dir or "", task_info.get("task") or ""),
+                output_dir=os.path.join(final_root or "", task_info.get("task") or ""),
+                points_shp=task_info.get("points_shp") or points_shp or "",
+                force_rerun=bool(task_info.get("force_rerun")),
+            )
+            _idx_ok, _idx_errors = _index_loop.validate_index_plan(_idx_plan)
+            if not _idx_ok:
+                st.error("指数法计划校验未通过：" + "；".join(_idx_errors))
+                st.session_state.pending_task = None
+                st.session_state.is_running = False
+                return
+            _idx_plan["ready"] = True
+            _idx_plan["status"] = "confirmed"
+            task_info["index_plan"] = _idx_plan
+            task_info["plan_id"] = task_info.get("plan_id") or _idx_plan.get("plan_id")
+            task_info = attach_execution_request(task_info, confirmation_source=_confirmation_source)
+        st.session_state.pending_task = task_info
+    except (TypeError, ValueError) as _exec_req_err:
+        st.error(f"执行请求校验失败：{_exec_req_err}")
+        st.session_state.pending_task = None
+        st.session_state.is_running = False
+        return
+    _job_record = _job_create_for_pending(task_info, status="QUEUED")
+    if _job_record is None:
+        st.error("任务账本不可用，已停止启动后台任务；请检查 data 目录权限后重试。")
+        st.session_state.pending_task = None
+        st.session_state.is_running = False
+        return
+    if _get_job_store().claim(_job_record.job_id) is None:
+        st.error("该任务已被另一个执行实例占用，未重复启动。")
+        st.session_state.pending_task = None
+        st.session_state.is_running = False
+        return
     st.session_state.pending_task = None
     st.session_state.pipeline_thread_started = True
     st.session_state.pipeline_log_snapshot = []
@@ -4652,6 +6381,7 @@ def maybe_start_pipeline_thread():
             status="RUNNING", tool="run_pipeline", progress=0)
     shared = {
         "lock": threading.Lock(),
+        "job_id": _job_record.job_id,
         "log_lines": [],
         "progress": 0,
         "status": ("info", "正在启动后台线程…"),
@@ -4660,7 +6390,10 @@ def maybe_start_pipeline_thread():
         "asset_path": None,
         "m5_report": None,
         "m5_verification": None,
+        "m5_asset_id": None,
         "e1_report": None,
+        "e1_verification": None,
+        "e1_asset_id": None,
         "job_kind": task_info.get("mode"),
     }
     st.session_state.pipeline_shared = shared
@@ -4789,6 +6522,7 @@ def maybe_start_pipeline_thread():
         "prob": task_info.get("prob", 0.05),
         "cnt": task_info.get("cnt", 2),
         "mode": task_info.get("mode", "dl"),
+        "index_plan": task_info.get("index_plan"),
         "points_shp": task_info.get("points_shp"),
         "force_rerun": task_info.get("force_rerun", False),
         "m4": task_info.get("m4"),
@@ -4809,7 +6543,7 @@ def maybe_start_pipeline_thread():
     ).start()
 
 
-def _pipeline_monitor_inner():
+def _pipeline_monitor_inner(render: bool = True):
     shared = st.session_state.get("pipeline_shared")
     if shared and shared.get("done") and st.session_state.is_running:
         if finalize_background_pipeline():
@@ -4821,10 +6555,26 @@ def _pipeline_monitor_inner():
             lines = list(shared.get("log_lines") or [])
             prog = int(shared.get("progress", 0))
             status = shared.get("status", ("info", ""))
+            shared_job_id = shared.get("job_id")
     else:
         lines = list(st.session_state.get("pipeline_log_snapshot") or [])
         prog = int(st.session_state.get("pipeline_progress_value", 0))
         status = ("info", "")
+        shared_job_id = None
+
+    active_job_id = shared_job_id or st.session_state.get("_active_job_id")
+    if active_job_id and st.session_state.get("is_running"):
+        _job_progress_update(
+            prog,
+            job_id=active_job_id,
+            metadata={"phase": "RUNNING", "job_kind": (shared or {}).get("job_kind")},
+        )
+
+    # Keep the monitor alive while the drawer is collapsed so completion,
+    # cleanup and ledger finalization still run, but emit no elements that
+    # could reserve a hidden row in the map column.
+    if not render:
+        return
 
     st.markdown('<div class="deck-section-title">⏳ 任务执行状态</div>', unsafe_allow_html=True)
     st.progress(min(100, max(0, prog)))
@@ -4843,6 +6593,41 @@ def _pipeline_monitor_inner():
             st.info(text)
     elif st.session_state.is_running:
         st.caption("后台任务运行中，日志与进度将自动刷新…")
+
+    recovered_records = st.session_state.get("_job_recovery_records") or []
+    if recovered_records:
+        with st.expander(f"🧾 已恢复的任务账本（{len(recovered_records)}）", expanded=False):
+            st.caption("这些任务在进程退出前未进入终态，已标记为 INTERRUPTED；不会自动重跑。")
+            for record in recovered_records[:20]:
+                st.markdown(
+                    f"- `{record.job_id}` · {record.task} · {record.kind} · "
+                    f"进度 {record.progress}% · `INTERRUPTED`"
+                )
+                # 仅为普通推理恢复“计划”入口；不复用旧参数直接启动，用户仍需审阅并确认。
+                if str(record.kind) == "dl" and st.button(
+                    "重新生成推理计划",
+                    key=f"replan_interrupted_{record.job_id}",
+                    use_container_width=True,
+                ):
+                    queue_agent_command(
+                        st.session_state,
+                        {
+                            "sidebar_states": {
+                                "selected_task": str(record.task),
+                                "inference_mode": "深度学习",
+                                "force_rerun": True,
+                            },
+                            "pending_action": {
+                                "type": "propose_inference",
+                                "task": str(record.task),
+                                "force_rerun": True,
+                            },
+                        },
+                    )
+                    st.session_state["_job_recovery_replan_notice"] = (
+                        f"已为中断任务 `{record.task}` 重新生成推理计划；请检查侧栏参数并确认后执行。"
+                    )
+                    st.rerun()
 
     st.markdown('<div class="deck-section-title">🖥️ 系统终端日志</div>', unsafe_allow_html=True)
     with st.container(height=LOG_PANEL_HEIGHT, border=False):
@@ -4877,11 +6662,19 @@ def _pipeline_monitor_inner():
                 # ---- Phase E: PDF 报告入口（任务完成后生成）----
                 _tl_col1, _tl_col2 = st.columns(2)
                 with _tl_col1:
-                    if st.button("📄 生成成果报告", key="_btn_gen_pdf_report"):
-                        _build_pdf_report()
+                    if st.button(
+                        "📄 生成成果报告",
+                        key="_btn_gen_pdf_report",
+                        disabled=isinstance(st.session_state.get("_pending_report_confirm"), dict),
+                    ):
+                        _queue_report_plan("pdf")
                 with _tl_col2:
-                    if st.button("🗺️ 生成监测报告", key="_btn_gen_asset_report"):
-                        _build_asset_report()
+                    if st.button(
+                        "🗺️ 生成监测报告",
+                        key="_btn_gen_asset_report",
+                        disabled=isinstance(st.session_state.get("_pending_report_confirm"), dict),
+                    ):
+                        _queue_report_plan("asset")
                     _amsg = st.session_state.get("_asset_report_msg")
                     if _amsg:
                         if _amsg.get("level") == "success":
@@ -4902,11 +6695,118 @@ def _pipeline_monitor_inner():
                             st.markdown(f"⚠️ **{_amsg.get('text', '未知错误')}**")
                         for _w in (_amsg.get("warnings") or []):
                             st.caption(_w)
+                _pending_report = st.session_state.get("_pending_report_confirm")
+                if isinstance(_pending_report, dict):
+                    _kind_label = "成果报告" if _pending_report.get("kind") == "pdf" else "监测报告"
+                    _report_plan_valid = (
+                        str(_pending_report.get("task_id") or "")
+                        == str(_report_task_id() or "")
+                        and str(_pending_report.get("task_id") or "") not in {"", "unknown"}
+                    )
+                    st.info(
+                        f"已生成{_kind_label}计划（任务 `{_pending_report.get('task_id') or '—'}`），"
+                        "确认后才会读取成果并生成 PDF。"
+                    )
+                    if not _report_plan_valid:
+                        st.warning("当前任务时间线已变化，请取消旧计划后重新生成报告。")
+                    _rpc1, _rpc2 = st.columns(2)
+                    with _rpc1:
+                        if st.button(
+                            f"确认生成{_kind_label}",
+                            key="confirm_report_plan_btn",
+                            type="primary",
+                            use_container_width=True,
+                            disabled=not _report_plan_valid,
+                        ):
+                            _kind = str(_pending_report.get("kind") or "pdf")
+                            _report_plan_id = _pending_report.get("plan_id")
+                            st.session_state.pop("_pending_report_confirm", None)
+                            st.session_state["_active_report_plan_id"] = _report_plan_id
+                            _tl_add(
+                                str(_pending_report.get("task_id") or "unknown"),
+                                "CONFIRM",
+                                f"{_kind_label}计划已确认",
+                                status="SUCCEEDED",
+                                plan_id=_report_plan_id,
+                                tool="report_generator" if _kind == "pdf" else "asset_report_engine",
+                            )
+                            if _kind == "asset":
+                                _build_asset_report()
+                            else:
+                                _build_pdf_report()
+                    with _rpc2:
+                        if st.button("取消报告计划", key="cancel_report_plan_btn", use_container_width=True):
+                            _tl_add(
+                                str(_pending_report.get("task_id") or "unknown"),
+                                "REPORT",
+                                f"{_kind_label}计划已取消",
+                                status="CANCELLED",
+                                plan_id=_pending_report.get("plan_id"),
+                                tool="report_generator" if _pending_report.get("kind") == "pdf" else "asset_report_engine",
+                            )
+                            st.session_state.pop("_pending_report_confirm", None)
+                            st.rerun()
     except Exception:
         pass
 
 
 # ---- Phase E+: 成果报告生成（集成自 E:\\Code\\pdf report_engine.py，栅格统计 + 参考真值对比）----
+def _report_task_id() -> str:
+    """从时间线解析当前报告任务，避免报告入口自行猜测任务。"""
+    try:
+        for _e in reversed(_get_task_timeline().events(limit=50)):
+            if getattr(_e, "task_id", None):
+                return str(_e.task_id)
+    except Exception:
+        pass
+    return str(st.session_state.get("selected_task") or "")
+
+
+def _queue_report_plan(kind: str) -> None:
+    """仅登记报告计划；真正生成必须经过显式确认。"""
+    _kind = "asset" if str(kind) == "asset" else "pdf"
+    _task_id = _report_task_id() or "unknown"
+    _label = "成果报告" if _kind == "pdf" else "监测报告"
+    _plan_id = f"report_{uuid.uuid4().hex}"
+    st.session_state["_pending_report_confirm"] = {
+        "kind": _kind,
+        "task_id": _task_id,
+        "plan_id": _plan_id,
+    }
+    _tl_add(
+        _task_id,
+        "PLAN",
+        f"{_label}计划已生成，等待确认",
+        status="WAITING_CONFIRMATION",
+        plan_id=_plan_id,
+        tool="report_generator" if _kind == "pdf" else "asset_report_engine",
+    )
+
+
+def _record_report_outcome(
+    task_id: str, tool: str, report_path: str = "", error: str = "", plan_id: str = ""
+) -> None:
+    """记录报告文件校验与登记，供 UI 和账本共同消费。"""
+    _task = str(task_id or "unknown")
+    _plan = plan_id or str(st.session_state.get("_active_report_plan_id") or "") or None
+    if report_path and os.path.isfile(report_path) and os.path.getsize(report_path) > 0:
+        _artifact = os.path.basename(str(report_path))
+        _tl_add(_task, "VERIFY", "报告文件存在且非空，校验通过", status="SUCCEEDED", plan_id=_plan, tool=tool)
+        _tl_add(_task, "REGISTER", "报告资产已登记", status="SUCCEEDED", plan_id=_plan, tool=tool, artifacts=[_artifact])
+        _tl_add(_task, "REPORT", "报告已生成并可下载", status="SUCCEEDED", plan_id=_plan, tool=tool, artifacts=[_artifact])
+    else:
+        _tl_add(
+            _task,
+            "VERIFY",
+            "报告文件校验失败",
+            status="FAILED",
+            plan_id=_plan,
+            tool=tool,
+            error=error or "报告文件缺失或为空",
+        )
+    st.session_state.pop("_active_report_plan_id", None)
+
+
 def _build_asset_report():
     try:
         import asset_report_engine as _are
@@ -4935,24 +6835,28 @@ def _build_asset_report():
             _task, progress_callback=lambda p, m: None,
         )
         if _res.success and _res.report_path:
+            _record_report_outcome(_task, "asset_report_engine", _res.report_path)
             st.session_state["_asset_report_msg"] = {
                 "level": "success",
                 "text": "✅ 成果报告已生成",
                 "path": _res.report_path,
             }
         else:
+            _safe_report_error = safe_error_summary(_res.error or "未知错误")
+            _record_report_outcome(_task, "asset_report_engine", error=_safe_report_error)
             _msg = {
                 "level": "warning",
-                "text": f"成果报告生成失败：{_res.error or '未知错误'}",
+                "text": f"成果报告生成失败：{_safe_report_error}",
             }
             _warns = [("· " + w) for w in (_res.warnings or [])]
             if _warns:
                 _msg["warnings"] = _warns
             st.session_state["_asset_report_msg"] = _msg
     except Exception as _re:
+        _record_report_outcome(_report_task_id(), "asset_report_engine", error=safe_error_summary(_re))
         st.session_state["_asset_report_msg"] = {
             "level": "warning",
-            "text": f"成果报告生成异常：{_re}",
+            "text": f"成果报告生成异常：{safe_error_summary(_re)}",
         }
 
 
@@ -4997,6 +6901,7 @@ def _build_pdf_report():
             _task_ctx, capabilities=_caps, timeline=_events, assets=_assets,
         )
         if _res.success and _res.report_path:
+            _record_report_outcome(_task_id, "report_generator", _res.report_path)
             st.success("✅ 成果报告已生成")
             st.markdown(f"`{_res.report_path}`")
             try:
@@ -5011,11 +6916,14 @@ def _build_pdf_report():
             except Exception:
                 pass
         else:
-            st.warning(f"成果报告生成失败：{_res.error or '未知错误'}")
+            _safe_report_error = safe_error_summary(_res.error or "未知错误")
+            _record_report_outcome(_task_id, "report_generator", error=_safe_report_error)
+            st.warning(f"成果报告生成失败：{_safe_report_error}")
         for _w in (_res.warnings or []):
             st.caption("· " + _w)
     except Exception as _re:
-        st.warning(f"成果报告生成异常：{_re}")
+        _record_report_outcome(_report_task_id(), "report_generator", error=safe_error_summary(_re))
+        st.warning(f"成果报告生成异常：{safe_error_summary(_re)}")
 
 
 _PIPELINE_USE_FRAGMENT = False
@@ -5026,11 +6934,13 @@ except (TypeError, AttributeError):
     _pipeline_monitor = _pipeline_monitor_inner
 
 
-# ---- 右侧指挥台：填充状态 / 日志面板 ----
+# ---- 地图下方状态抽屉：填充状态 / 日志面板 ----
 maybe_start_pipeline_thread()
 if _log_panel_slot is not None:
     with _log_panel_slot:
-        _pipeline_monitor()
+        _pipeline_monitor(render=True)
+else:
+    _pipeline_monitor(render=False)
 
 components.html(
     """
@@ -5039,21 +6949,219 @@ components.html(
       const win = window.parent || window;
       const doc = win.document;
       const setImp = (el, prop, val) => el?.style?.setProperty(prop, val, "important");
+      const safeObserve = (observer, target, options) => {
+        // Streamlit component iframes can expose a cross-realm Document
+        // proxy that fails the MutationObserver Node brand check.  Initial
+        // binding plus timed layout sync is sufficient for reruns; avoid
+        // installing a fragile cross-realm observer altogether.
+        return false;
+      };
+
+      // 只把真正的三维地球/二维地图当作地图画布。定位命令通过
+      // components.html 生成的无 src 辅助 iframe 必须保持 0 高度。
+      const getPrimaryMapFrame = (mapCol) =>
+        mapCol?.querySelector('iframe[src*="/globe"]') ||
+        mapCol?.querySelector('iframe[title*="streamlit_folium"]') ||
+        null;
+
+      const getPrimaryMapBox = (mapCol) => {
+        const frame = getPrimaryMapFrame(mapCol);
+        return frame?.closest('[data-testid="stIFrame"]') ||
+          frame?.closest('[data-testid="stCustomComponentV1"]') ||
+          frame ||
+          mapCol;
+      };
+
+      const relayoutDismissibleAlerts = () => {
+        let index = 0;
+        doc.querySelectorAll('[data-testid="stAlert"].cstf-dismissible-alert').forEach((alert) => {
+          if (alert.dataset.cstfDismissed === "1") return;
+          alert.style.setProperty("--cstf-alert-top", `${16 + index * 92}px`);
+          index += 1;
+        });
+      };
+
+      const bindDismissibleAlerts = () => {
+        doc.querySelectorAll('[data-testid="stAlert"]').forEach((alert) => {
+          if (alert.dataset.cstfDismissible === "1") return;
+          alert.dataset.cstfDismissible = "1";
+          const noticeKey = `cstf-dismissed:${encodeURIComponent(
+            (alert.textContent || "").replace(/\\s+/g, " ").trim().slice(0, 240)
+          )}`;
+          try {
+            if (win.sessionStorage.getItem(noticeKey) === "1") {
+              alert.dataset.cstfDismissed = "1";
+              alert.style.display = "none";
+              return;
+            }
+          } catch (_) {}
+          alert.classList.add("cstf-dismissible-alert");
+          const close = doc.createElement("button");
+          close.type = "button";
+          close.className = "cstf-alert-close";
+          close.setAttribute("aria-label", "关闭通知");
+          close.title = "关闭通知";
+          close.textContent = "×";
+          close.addEventListener("click", () => {
+            alert.dataset.cstfDismissed = "1";
+            alert.style.display = "none";
+            try { win.sessionStorage.setItem(noticeKey, "1"); } catch (_) {}
+            relayoutDismissibleAlerts();
+          });
+          alert.appendChild(close);
+        });
+        relayoutDismissibleAlerts();
+      };
+
+      bindDismissibleAlerts();
+      if (!win.__cstfAlertObserver && doc.documentElement && doc.documentElement.nodeType === 1) {
+        win.__cstfAlertObserver = new win.MutationObserver(() => {
+          win.setTimeout(bindDismissibleAlerts, 20);
+        });
+        safeObserve(win.__cstfAlertObserver, doc.documentElement, { childList: true, subtree: true });
+      }
+
+      const resetLayoutDefaults = () => {
+        const defaults = doc.querySelector(".cstf-layout-defaults");
+        if (!defaults) return;
+        const reserve = defaults.getAttribute("data-status-reserve");
+        if (reserve) doc.documentElement.style.setProperty("--cstf-status-panel-reserve", `${reserve}px`, "important");
+      };
+
+      // Streamlit 会在按钮交互后替换布局节点，但 iframe 中的脚本不一定重新执行。
+      // 监听默认值节点，避免旧拖拽值继续覆盖折叠/展开后的新布局。
+      let layoutDefaultsSignature = "";
+      const observeLayoutDefaults = () => {
+        const sync = () => {
+          const defaults = doc.querySelector(".cstf-layout-defaults");
+          if (!defaults) return;
+          const signature = [
+            defaults.getAttribute("data-status-reserve") || "",
+            defaults.getAttribute("data-agent-width") || "",
+          ].join("|");
+          if (signature === layoutDefaultsSignature) return;
+          layoutDefaultsSignature = signature;
+          resetLayoutDefaults();
+          syncWorkbenchHeight();
+        };
+        sync();
+        if (!doc.documentElement || doc.documentElement.nodeType !== 1) return;
+        if (win.__cstfLayoutDefaultsObserver) return;
+        win.__cstfLayoutDefaultsObserver = new win.MutationObserver(sync);
+        safeObserve(win.__cstfLayoutDefaultsObserver, doc.documentElement, {
+          subtree: true,
+          childList: true,
+          attributes: true,
+          attributeFilter: ["data-status-reserve", "data-agent-width"],
+        });
+      };
+
+      const syncStatusHandlePosition = (handle, mapCol) => {
+        if (!handle || !mapCol) return;
+        const mapRect = getPrimaryMapBox(mapCol)?.getBoundingClientRect() || mapCol.getBoundingClientRect();
+        if (!mapRect || mapRect.width < 4 || mapRect.height < 4) return;
+        handle.style.left = `${mapRect.left}px`;
+        handle.style.top = `${mapRect.bottom}px`;
+        handle.style.width = `${mapRect.width}px`;
+        const reserve = parseFloat(
+          win.getComputedStyle(doc.documentElement).getPropertyValue("--cstf-status-panel-reserve")
+        ) || 272;
+        handle.setAttribute("aria-valuenow", String(Math.round(reserve)));
+      };
+
+      const syncStatusToggle = (toggle, mapCol) => {
+        if (!toggle || !mapCol) return;
+        const mapRect = getPrimaryMapBox(mapCol)?.getBoundingClientRect() || mapCol.getBoundingClientRect();
+        if (!mapRect || mapRect.width < 4 || mapRect.height < 4) return;
+        const state = doc.querySelector(".cstf-status-toggle-state");
+        const collapsed = state?.getAttribute("data-collapsed") === "1";
+        const nextText = collapsed ? "▲" : "▼";
+        const nextLabel = collapsed ? "展开任务状态与系统日志" : "收起任务状态与系统日志";
+        if (toggle.textContent !== nextText) toggle.textContent = nextText;
+        if (toggle.getAttribute("aria-label") !== nextLabel) toggle.setAttribute("aria-label", nextLabel);
+        if (toggle.title !== nextLabel) toggle.title = nextLabel;
+        // 水平固定在分界线中点：展开时 ▼ 位于状态区内侧；收起时 ▲ 的底边贴合分界线。
+        const toggleHeight = toggle.getBoundingClientRect().height;
+        toggle.style.left = `${(mapRect.left + mapRect.right) / 2}px`;
+        toggle.style.top = `${collapsed ? mapRect.bottom - toggleHeight : mapRect.bottom}px`;
+      };
+
+      const bindStatusToggle = () => {
+        const mapCol = doc.querySelector('div[data-testid="stColumn"]:has(.cockpit-map-col)');
+        if (!mapCol) return;
+        let toggle = doc.querySelector(".cstf-status-edge-toggle");
+        if (!toggle) {
+          toggle = doc.createElement("button");
+          toggle.type = "button";
+          toggle.className = "cstf-status-edge-toggle";
+          doc.body.appendChild(toggle);
+        }
+        // Streamlit may replace the component iframe or the bridge marker on
+        // every rerun.  Rebind the persistent edge button whenever its
+        // listener marker is missing, instead of binding only on first create.
+        if (toggle.dataset.cstfStatusClickBound !== "1") {
+          // Use a parent-document inline handler.  A listener callback
+          // created inside this component iframe can be discarded when
+          // Streamlit replaces the iframe during a rerun.
+          toggle.setAttribute(
+            "onclick",
+            "const native = document.querySelector('div.st-key-agent_status_panel_toggle button'); if (native) native.click();"
+          );
+          toggle.__cstfStatusClickBound = true;
+          toggle.dataset.cstfStatusClickBound = "1";
+        }
+        syncStatusToggle(toggle, mapCol);
+      };
+
+      // Streamlit replaces the hidden bridge node during a rerun. Observe its
+      // data-collapsed state so the edge button immediately flips between
+      // ▼ (collapse) and ▲ (expand), instead of retaining the previous label.
+      const observeStatusToggleState = () => {
+        if (!doc.documentElement || doc.documentElement.nodeType !== 1 || win.__cstfStatusToggleObserver) return;
+        const sync = () => {
+          syncStatusToggle(
+            doc.querySelector(".cstf-status-edge-toggle"),
+            doc.querySelector('div[data-testid="stColumn"]:has(.cockpit-map-col)')
+          );
+        };
+        win.__cstfStatusToggleObserver = new win.MutationObserver(sync);
+        safeObserve(win.__cstfStatusToggleObserver, doc.documentElement, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ["data-collapsed"],
+        });
+        sync();
+      };
 
       const syncWorkbenchHeight = () => {
         const header = doc.querySelector('[data-testid="stHeader"]');
         const headerH = header ? header.offsetHeight : 56;
         const h = Math.max(480, win.innerHeight - headerH - 6);
         const px = h + "px";
+        const reserve = parseFloat(
+          win.getComputedStyle(doc.documentElement).getPropertyValue("--cstf-status-panel-reserve")
+        ) || 0;
+        const mapH = Math.max(280, h - reserve);
+        const mapPx = mapH + "px";
         doc.documentElement.style.setProperty("--workbench-h", px);
-        doc.querySelectorAll(
-          'div[data-testid="stColumn"]:has(.cockpit-map-col) [data-testid="stIFrame"], ' +
-          'div[data-testid="stColumn"]:has(.cockpit-map-col) [data-testid="stIFrame"] iframe'
-        ).forEach((el) => {
-          if (el.offsetHeight <= 4) return;
-          setImp(el, "height", px);
-          setImp(el, "max-height", px);
+        const mapCol = doc.querySelector('div[data-testid="stColumn"]:has(.cockpit-map-col)');
+        const mapFrame = getPrimaryMapFrame(mapCol);
+        const mapHost = getPrimaryMapBox(mapCol);
+        const mapContainer = mapFrame?.closest('[data-testid="stElementContainer"]');
+        new Set([mapFrame, mapHost, mapContainer]).forEach((el) => {
+          if (!el) return;
+          setImp(el, "height", mapPx);
+          setImp(el, "max-height", mapPx);
         });
+        syncStatusHandlePosition(
+          doc.querySelector(".cstf-status-edge-handle"),
+          mapCol
+        );
+        syncStatusToggle(
+          doc.querySelector(".cstf-status-edge-toggle"),
+          mapCol
+        );
       };
 
       const lockPageWheel = () => {
@@ -5085,10 +7193,641 @@ components.html(
         );
       };
 
+      const syncDockHandlePosition = (handle, row, mapCol, sideCol) => {
+        if (!handle || !row || !mapCol || !sideCol) return;
+        const rr = row.getBoundingClientRect();
+        const mr = mapCol.getBoundingClientRect();
+        const sr = sideCol.getBoundingClientRect();
+        handle.style.left = `${(mr.right + sr.left) / 2}px`;
+        handle.style.top = `${rr.top}px`;
+        handle.style.height = `${rr.height}px`;
+        handle.setAttribute("aria-valuenow", String(Math.round(sr.width / Math.max(1, rr.width) * 100)));
+      };
+
+      // Inline handlers are compiled by the parent document.  They therefore
+      // survive replacement of this temporary Streamlit component iframe and
+      // can keep receiving pointer events after the cursor leaves the 14/16px
+      // edge hit area.
+      const parentResizePointerDown = String.raw`
+        const handle = this;
+        const win = window;
+        const doc = document;
+        if (event.button !== 0) return false;
+        const kind = handle.dataset.cstfResizeKind;
+        if (kind !== "dock" && kind !== "status") return false;
+        if (typeof win.__cstfActiveResizeCleanup === "function") {
+          win.__cstfActiveResizeCleanup();
+        }
+
+        const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+        const setImp = (el, prop, value) => {
+          if (el && el.style) el.style.setProperty(prop, value, "important");
+        };
+        const getPrimaryMapFrame = (mapCol) =>
+          (mapCol && mapCol.querySelector('iframe[src*="/globe"]')) ||
+          (mapCol && mapCol.querySelector('iframe[title*="streamlit_folium"]')) ||
+          null;
+        const getPrimaryMapBox = (mapCol) => {
+          const frame = getPrimaryMapFrame(mapCol);
+          return (frame && frame.closest('[data-testid="stIFrame"]')) ||
+            (frame && frame.closest('[data-testid="stCustomComponentV1"]')) ||
+            frame || mapCol;
+        };
+        const getNodes = () => {
+          const mapCol = doc.querySelector('div[data-testid="stColumn"]:has(.cockpit-map-col)');
+          const sideCol = doc.querySelector('div[data-testid="stColumn"]:has(.command-deck-side)');
+          return {
+            mapCol,
+            sideCol,
+            row: mapCol && mapCol.parentElement,
+            mapFrame: getPrimaryMapFrame(mapCol),
+            mapBox: getPrimaryMapBox(mapCol),
+            dockHandle: doc.querySelector(".cstf-dock-resize-handle"),
+            statusHandle: doc.querySelector(".cstf-status-edge-handle"),
+            statusToggle: doc.querySelector(".cstf-status-edge-toggle"),
+          };
+        };
+        const getReserve = () => parseFloat(
+          win.getComputedStyle(doc.documentElement).getPropertyValue("--cstf-status-panel-reserve")
+        ) || 272;
+        const setLayoutParam = (name, value) => {
+          try {
+            const url = new URL(win.location.href);
+            url.searchParams.set(name, String(Math.round(value)));
+            win.history.replaceState({}, "", url.toString());
+          } catch (_) {}
+        };
+        const syncResizeGeometry = () => {
+          const nodes = getNodes();
+          if (!nodes.mapCol) return;
+          const header = doc.querySelector('[data-testid="stHeader"]');
+          const headerH = header ? header.offsetHeight : 56;
+          const workbenchH = Math.max(480, win.innerHeight - headerH - 6);
+          const reserve = getReserve();
+          const mapH = Math.max(280, workbenchH - reserve);
+          doc.documentElement.style.setProperty("--workbench-h", workbenchH + "px");
+          const mapContainer = nodes.mapFrame && nodes.mapFrame.closest('[data-testid="stElementContainer"]');
+          [nodes.mapFrame, nodes.mapBox, mapContainer].forEach((el) => {
+            setImp(el, "height", mapH + "px");
+            setImp(el, "max-height", mapH + "px");
+          });
+
+          if (nodes.dockHandle && nodes.row && nodes.sideCol) {
+            const rowRect = nodes.row.getBoundingClientRect();
+            const mapColRect = nodes.mapCol.getBoundingClientRect();
+            const sideRect = nodes.sideCol.getBoundingClientRect();
+            nodes.dockHandle.style.left = ((mapColRect.right + sideRect.left) / 2) + "px";
+            nodes.dockHandle.style.top = rowRect.top + "px";
+            nodes.dockHandle.style.height = rowRect.height + "px";
+            nodes.dockHandle.setAttribute(
+              "aria-valuenow",
+              String(Math.round(sideRect.width / Math.max(1, rowRect.width) * 100))
+            );
+          }
+
+          const mapRect = nodes.mapBox && nodes.mapBox.getBoundingClientRect();
+          if (!mapRect || mapRect.width < 4 || mapRect.height < 4) return;
+          if (nodes.statusHandle) {
+            const statusHandle = nodes.statusHandle;
+            statusHandle.style.left = mapRect.left + "px";
+            statusHandle.style.top = mapRect.bottom + "px";
+            statusHandle.style.width = mapRect.width + "px";
+            statusHandle.setAttribute("aria-valuenow", String(Math.round(reserve)));
+          }
+          if (nodes.statusToggle) {
+            const state = doc.querySelector(".cstf-status-toggle-state");
+            const collapsed = state && state.getAttribute("data-collapsed") === "1";
+            const label = collapsed ? "展开任务状态与系统日志" : "收起任务状态与系统日志";
+            nodes.statusToggle.textContent = collapsed ? "▲" : "▼";
+            nodes.statusToggle.setAttribute("aria-label", label);
+            nodes.statusToggle.title = label;
+            const toggleHeight = nodes.statusToggle.getBoundingClientRect().height;
+            nodes.statusToggle.style.left = ((mapRect.left + mapRect.right) / 2) + "px";
+            nodes.statusToggle.style.top = (collapsed ? mapRect.bottom - toggleHeight : mapRect.bottom) + "px";
+          }
+        };
+        const applyDockWidth = (sidePct) => {
+          const nodes = getNodes();
+          if (!nodes.row || !nodes.mapCol || !nodes.sideCol) return sidePct;
+          const rowRect = nodes.row.getBoundingClientRect();
+          const mapRect = nodes.mapCol.getBoundingClientRect();
+          const sideRect = nodes.sideCol.getBoundingClientRect();
+          const gap = Math.max(0, sideRect.left - mapRect.right);
+          const available = Math.max(1, rowRect.width - gap);
+          const pct = clamp(sidePct, 24, 48);
+          const sidePx = available * pct / 100;
+          const mapPx = available - sidePx;
+          [[nodes.mapCol, mapPx], [nodes.sideCol, sidePx]].forEach((pair) => {
+            setImp(pair[0], "flex", "0 0 " + pair[1] + "px");
+            setImp(pair[0], "width", pair[1] + "px");
+            setImp(pair[0], "max-width", pair[1] + "px");
+          });
+          syncResizeGeometry();
+          return pct;
+        };
+        const applyStatusReserve = (value) => {
+          const next = clamp(value, 192, 392);
+          doc.documentElement.style.setProperty(
+            "--cstf-status-panel-reserve",
+            next + "px",
+            "important"
+          );
+          syncResizeGeometry();
+          return next;
+        };
+
+        const startNodes = getNodes();
+        let drag = null;
+        if (kind === "dock") {
+          if (!startNodes.row || !startNodes.mapCol || !startNodes.sideCol) return false;
+          const rowRect = startNodes.row.getBoundingClientRect();
+          const mapRect = startNodes.mapCol.getBoundingClientRect();
+          const sideRect = startNodes.sideCol.getBoundingClientRect();
+          const available = Math.max(1, rowRect.width - Math.max(0, sideRect.left - mapRect.right));
+          drag = {
+            kind: "dock",
+            startX: event.clientX,
+            startSide: sideRect.width,
+            startAvailable: available,
+            currentPct: sideRect.width / available * 100,
+          };
+          doc.body.classList.add("cstf-resizing-agent");
+        } else {
+          const current = getReserve();
+          drag = {
+            kind: "status",
+            startY: event.clientY,
+            startReserve: current,
+            currentReserve: current,
+          };
+          doc.body.classList.add("cstf-resizing-status");
+        }
+
+        // A full-page transparent capture surface keeps the pointer in the
+        // parent document even while it crosses the embedded map iframe.
+        const overlay = doc.createElement("div");
+        overlay.className = "cstf-resize-capture";
+        overlay.setAttribute("aria-hidden", "true");
+        overlay.style.position = "fixed";
+        overlay.style.inset = "0";
+        overlay.style.zIndex = "2147483000";
+        overlay.style.background = "transparent";
+        overlay.style.cursor = kind === "dock" ? "col-resize" : "row-resize";
+        overlay.style.touchAction = "none";
+        overlay.style.userSelect = "none";
+        doc.body.appendChild(overlay);
+
+        let move = null;
+        let stop = null;
+        const cleanup = () => {
+          if (move) win.removeEventListener("pointermove", move, true);
+          if (stop) {
+            win.removeEventListener("pointerup", stop, true);
+            win.removeEventListener("pointercancel", stop, true);
+            win.removeEventListener("blur", stop, true);
+          }
+          if (move) {
+            overlay.removeEventListener("pointermove", move, true);
+            overlay.removeEventListener("mousemove", move, true);
+          }
+          if (stop) {
+            overlay.removeEventListener("pointerup", stop, true);
+            overlay.removeEventListener("pointercancel", stop, true);
+            overlay.removeEventListener("mouseup", stop, true);
+          }
+          overlay.remove();
+          doc.body.classList.remove("cstf-resizing-agent", "cstf-resizing-status");
+          if (win.__cstfActiveResizeCleanup === cleanup) {
+            win.__cstfActiveResizeCleanup = null;
+          }
+        };
+        move = (moveEvent) => {
+          if (!drag) return;
+          if (drag.kind === "dock") {
+            const pct = clamp(
+              (drag.startSide + drag.startX - moveEvent.clientX) /
+                Math.max(1, drag.startAvailable) * 100,
+              24,
+              48
+            );
+            drag.currentPct = applyDockWidth(pct);
+          } else {
+            drag.currentReserve = applyStatusReserve(
+              drag.startReserve + drag.startY - moveEvent.clientY
+            );
+          }
+          moveEvent.preventDefault();
+        };
+        stop = () => {
+          if (drag) {
+            if (drag.kind === "dock") {
+              setLayoutParam("cstf_agent_w", drag.currentPct);
+            } else {
+              setLayoutParam("cstf_status_h", drag.currentReserve - 8);
+            }
+          }
+          drag = null;
+          cleanup();
+          syncResizeGeometry();
+        };
+        win.__cstfActiveResizeCleanup = cleanup;
+        win.addEventListener("pointermove", move, true);
+        win.addEventListener("pointerup", stop, true);
+        win.addEventListener("pointercancel", stop, true);
+        win.addEventListener("blur", stop, true);
+        overlay.addEventListener("pointermove", move, true);
+        overlay.addEventListener("mousemove", move, true);
+        overlay.addEventListener("pointerup", stop, true);
+        overlay.addEventListener("pointercancel", stop, true);
+        overlay.addEventListener("mouseup", stop, true);
+        try { handle.focus({ preventScroll: true }); } catch (_) {}
+        event.preventDefault();
+        event.stopPropagation();
+        return false;
+      `;
+
+      const parentResizeKeyDown = String.raw`
+        const kind = this.dataset.cstfResizeKind;
+        const key = event.key;
+        const dockKey = kind === "dock" && (key === "ArrowLeft" || key === "ArrowRight");
+        const statusKey = kind === "status" && (key === "ArrowUp" || key === "ArrowDown");
+        if (!dockKey && !statusKey) return;
+        const rect = this.getBoundingClientRect();
+        const x = (rect.left + rect.right) / 2;
+        const y = (rect.top + rect.bottom) / 2;
+        const dx = dockKey ? (key === "ArrowLeft" ? -20 : 20) : 0;
+        const dy = statusKey ? (key === "ArrowUp" ? -20 : 20) : 0;
+        const PointerCtor = window.PointerEvent || window.MouseEvent;
+        const init = { bubbles: true, cancelable: true, button: 0, buttons: 1, pointerId: 91 };
+        this.dispatchEvent(new PointerCtor("pointerdown", Object.assign({}, init, { clientX: x, clientY: y })));
+        window.dispatchEvent(new PointerCtor("pointermove", Object.assign({}, init, { clientX: x + dx, clientY: y + dy })));
+        window.dispatchEvent(new PointerCtor("pointerup", Object.assign({}, init, { clientX: x + dx, clientY: y + dy, buttons: 0 })));
+        event.preventDefault();
+        event.stopPropagation();
+        return false;
+      `;
+
+      const bindAgentResize = () => {
+        const mapCol = doc.querySelector('div[data-testid="stColumn"]:has(.cockpit-map-col)');
+        const sideCol = doc.querySelector('div[data-testid="stColumn"]:has(.command-deck-side)');
+        const row = mapCol?.parentElement;
+        if (!mapCol || !sideCol || !row) return;
+
+        let handle = doc.querySelector(".cstf-dock-resize-handle");
+        if (handle && (
+          handle.dataset.cstfResizeVersion !== "3" ||
+          handle.__cstfMapCol !== mapCol ||
+          handle.__cstfSideCol !== sideCol
+        )) {
+          handle.remove();
+          handle = null;
+        }
+        if (!handle) {
+          handle = doc.createElement("div");
+          handle.className = "cstf-dock-resize-handle";
+          handle.setAttribute("role", "separator");
+          handle.setAttribute("aria-orientation", "vertical");
+          handle.setAttribute("aria-label", "对话区宽度，可拖拽调整地图与 Agent 宽度");
+          handle.setAttribute("aria-valuemin", "24");
+          handle.setAttribute("aria-valuemax", "48");
+          handle.tabIndex = 0;
+          doc.body.appendChild(handle);
+        }
+        handle.dataset.cstfResizeVersion = "3";
+        handle.dataset.cstfResizeKind = "dock";
+        handle.setAttribute("onpointerdown", parentResizePointerDown);
+        handle.setAttribute("onkeydown", parentResizeKeyDown);
+        handle.__cstfMapCol = mapCol;
+        handle.__cstfSideCol = sideCol;
+        syncDockHandlePosition(handle, row, mapCol, sideCol);
+      };
+
+      const bindStatusResize = () => {
+        const mapCol = doc.querySelector('div[data-testid="stColumn"]:has(.cockpit-map-col)');
+        if (!mapCol) return;
+        let handle = doc.querySelector(".cstf-status-edge-handle");
+        if (handle && (
+          handle.dataset.cstfResizeVersion !== "3" ||
+          handle.__cstfMapCol !== mapCol
+        )) {
+          handle.remove();
+          handle = null;
+        }
+        if (!handle) {
+          handle = doc.createElement("div");
+          handle.className = "cstf-status-edge-handle";
+          handle.setAttribute("role", "separator");
+          handle.setAttribute("aria-orientation", "horizontal");
+          handle.setAttribute("aria-label", "拖拽调整地图与状态区高度");
+          handle.setAttribute("title", "拖拽调整地图与状态区高度");
+          handle.setAttribute("aria-valuemin", "192");
+          handle.setAttribute("aria-valuemax", "392");
+          handle.tabIndex = 0;
+          doc.body.appendChild(handle);
+        }
+        handle.dataset.cstfResizeVersion = "3";
+        handle.dataset.cstfResizeKind = "status";
+        handle.setAttribute("onpointerdown", parentResizePointerDown);
+        handle.setAttribute("onkeydown", parentResizeKeyDown);
+        handle.__cstfMapCol = mapCol;
+        syncStatusHandlePosition(handle, mapCol);
+      };
+
+      // Resize handles live in the parent Streamlit document while this code
+      // runs inside a short-lived component iframe.  Install one controller
+      // in the parent page so pointer move/up and MutationObserver callbacks
+      // remain valid across component reruns.
+      const installParentResizeController = () => {
+        const controllerVersion = "2026-08-23-edge-resize-v2";
+        if (win.__cstfEdgeResizeController?.version === controllerVersion) {
+          win.__cstfEdgeResizeController.sync();
+          return;
+        }
+        const controllerSource = String.raw`
+          (() => {
+            const win = window;
+            const doc = win.document;
+            const version = "2026-08-23-edge-resize-v2";
+            const previous = win.__cstfEdgeResizeController;
+            if (previous && typeof previous.destroy === "function") previous.destroy();
+
+            const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+            const setImp = (el, prop, value) => {
+              if (el && el.style) el.style.setProperty(prop, value, "important");
+            };
+            const getPrimaryMapFrame = (mapCol) =>
+              (mapCol && mapCol.querySelector('iframe[src*="/globe"]')) ||
+              (mapCol && mapCol.querySelector('iframe[title*="streamlit_folium"]')) ||
+              null;
+            const getPrimaryMapBox = (mapCol) => {
+              const frame = getPrimaryMapFrame(mapCol);
+              return (frame && frame.closest('[data-testid="stIFrame"]')) ||
+                (frame && frame.closest('[data-testid="stCustomComponentV1"]')) ||
+                frame || mapCol;
+            };
+            const getNodes = () => {
+              const mapCol = doc.querySelector('div[data-testid="stColumn"]:has(.cockpit-map-col)');
+              const sideCol = doc.querySelector('div[data-testid="stColumn"]:has(.command-deck-side)');
+              return {
+                mapCol,
+                sideCol,
+                row: mapCol && mapCol.parentElement,
+                mapFrame: getPrimaryMapFrame(mapCol),
+                mapBox: getPrimaryMapBox(mapCol),
+                dockHandle: doc.querySelector(".cstf-dock-resize-handle"),
+                statusHandle: doc.querySelector(".cstf-status-edge-handle"),
+                statusToggle: doc.querySelector(".cstf-status-edge-toggle"),
+              };
+            };
+            const getReserve = () => parseFloat(
+              win.getComputedStyle(doc.documentElement).getPropertyValue("--cstf-status-panel-reserve")
+            ) || 272;
+            const setLayoutParam = (name, value) => {
+              try {
+                const url = new URL(win.location.href);
+                url.searchParams.set(name, String(Math.round(value)));
+                win.history.replaceState({}, "", url.toString());
+              } catch (_) {}
+            };
+
+            const sync = () => {
+              const nodes = getNodes();
+              if (!nodes.mapCol) return;
+              const header = doc.querySelector('[data-testid="stHeader"]');
+              const headerH = header ? header.offsetHeight : 56;
+              const workbenchH = Math.max(480, win.innerHeight - headerH - 6);
+              const reserve = getReserve();
+              const mapH = Math.max(280, workbenchH - reserve);
+              doc.documentElement.style.setProperty("--workbench-h", workbenchH + "px");
+              const mapContainer = nodes.mapFrame && nodes.mapFrame.closest('[data-testid="stElementContainer"]');
+              [nodes.mapFrame, nodes.mapBox, mapContainer].forEach((el) => {
+                setImp(el, "height", mapH + "px");
+                setImp(el, "max-height", mapH + "px");
+              });
+
+              if (nodes.dockHandle && nodes.row && nodes.sideCol) {
+                const rowRect = nodes.row.getBoundingClientRect();
+                const mapColRect = nodes.mapCol.getBoundingClientRect();
+                const sideRect = nodes.sideCol.getBoundingClientRect();
+                nodes.dockHandle.style.left = ((mapColRect.right + sideRect.left) / 2) + "px";
+                nodes.dockHandle.style.top = rowRect.top + "px";
+                nodes.dockHandle.style.height = rowRect.height + "px";
+                nodes.dockHandle.setAttribute(
+                  "aria-valuenow",
+                  String(Math.round(sideRect.width / Math.max(1, rowRect.width) * 100))
+                );
+              }
+
+              const mapRect = nodes.mapBox && nodes.mapBox.getBoundingClientRect();
+              if (!mapRect || mapRect.width < 4 || mapRect.height < 4) return;
+              if (nodes.statusHandle) {
+                const statusHandle = nodes.statusHandle;
+                statusHandle.style.left = mapRect.left + "px";
+                statusHandle.style.top = mapRect.bottom + "px";
+                statusHandle.style.width = mapRect.width + "px";
+                statusHandle.setAttribute("aria-valuenow", String(Math.round(reserve)));
+              }
+              if (nodes.statusToggle) {
+                const state = doc.querySelector(".cstf-status-toggle-state");
+                const collapsed = state && state.getAttribute("data-collapsed") === "1";
+                const label = collapsed ? "展开任务状态与系统日志" : "收起任务状态与系统日志";
+                nodes.statusToggle.textContent = collapsed ? "▲" : "▼";
+                nodes.statusToggle.setAttribute("aria-label", label);
+                nodes.statusToggle.title = label;
+                const toggleHeight = nodes.statusToggle.getBoundingClientRect().height;
+                nodes.statusToggle.style.left = ((mapRect.left + mapRect.right) / 2) + "px";
+                nodes.statusToggle.style.top = (collapsed ? mapRect.bottom - toggleHeight : mapRect.bottom) + "px";
+              }
+            };
+
+            const applyDockWidth = (sidePct) => {
+              const nodes = getNodes();
+              if (!nodes.row || !nodes.mapCol || !nodes.sideCol) return sidePct;
+              const rowRect = nodes.row.getBoundingClientRect();
+              const mapRect = nodes.mapCol.getBoundingClientRect();
+              const sideRect = nodes.sideCol.getBoundingClientRect();
+              const gap = Math.max(0, sideRect.left - mapRect.right);
+              const available = Math.max(1, rowRect.width - gap);
+              const pct = clamp(sidePct, 24, 48);
+              const sidePx = available * pct / 100;
+              const mapPx = available - sidePx;
+              [[nodes.mapCol, mapPx], [nodes.sideCol, sidePx]].forEach((pair) => {
+                const el = pair[0];
+                const px = pair[1];
+                setImp(el, "flex", "0 0 " + px + "px");
+                setImp(el, "width", px + "px");
+                setImp(el, "max-width", px + "px");
+              });
+              sync();
+              return pct;
+            };
+            const applyStatusReserve = (reserve) => {
+              const next = clamp(reserve, 192, 392);
+              doc.documentElement.style.setProperty(
+                "--cstf-status-panel-reserve",
+                next + "px",
+                "important"
+              );
+              sync();
+              return next;
+            };
+
+            let drag = null;
+            const pointerDown = (event) => {
+              if (event.button !== 0) return;
+              const target = event.target && event.target.closest && event.target.closest(
+                ".cstf-dock-resize-handle, .cstf-status-edge-handle"
+              );
+              if (!target) return;
+              const nodes = getNodes();
+              if (target.classList.contains("cstf-dock-resize-handle")) {
+                if (!nodes.row || !nodes.sideCol || !nodes.mapCol) return;
+                const rowRect = nodes.row.getBoundingClientRect();
+                const mapRect = nodes.mapCol.getBoundingClientRect();
+                const sideRect = nodes.sideCol.getBoundingClientRect();
+                const gap = Math.max(0, sideRect.left - mapRect.right);
+                const available = Math.max(1, rowRect.width - gap);
+                drag = {
+                  kind: "dock",
+                  startX: event.clientX,
+                  startSide: sideRect.width,
+                  startAvailable: available,
+                  currentPct: sideRect.width / available * 100,
+                };
+                doc.body.classList.add("cstf-resizing-agent");
+              } else {
+                const current = getReserve();
+                drag = {
+                  kind: "status",
+                  startY: event.clientY,
+                  startReserve: current,
+                  currentReserve: current,
+                };
+                doc.body.classList.add("cstf-resizing-status");
+              }
+              try { target.focus({ preventScroll: true }); } catch (_) {}
+              event.preventDefault();
+              event.stopPropagation();
+            };
+            const move = (event) => {
+              if (!drag) return;
+              if (drag.kind === "dock") {
+                const delta = drag.startX - event.clientX;
+                const pct = clamp(
+                  (drag.startSide + delta) / Math.max(1, drag.startAvailable) * 100,
+                  24,
+                  48
+                );
+                drag.currentPct = applyDockWidth(pct);
+              } else {
+                const next = drag.startReserve + drag.startY - event.clientY;
+                drag.currentReserve = applyStatusReserve(next);
+              }
+              event.preventDefault();
+            };
+            const stop = () => {
+              if (!drag) return;
+              if (drag.kind === "dock") {
+                setLayoutParam("cstf_agent_w", drag.currentPct);
+              } else {
+                setLayoutParam("cstf_status_h", drag.currentReserve - 8);
+              }
+              drag = null;
+              doc.body.classList.remove("cstf-resizing-agent", "cstf-resizing-status");
+              sync();
+            };
+            const keyDown = (event) => {
+              const target = event.target && event.target.closest && event.target.closest(
+                ".cstf-dock-resize-handle, .cstf-status-edge-handle"
+              );
+              if (!target) return;
+              if (target.classList.contains("cstf-dock-resize-handle")) {
+                if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+                const nodes = getNodes();
+                if (!nodes.row || !nodes.sideCol || !nodes.mapCol) return;
+                const rowRect = nodes.row.getBoundingClientRect();
+                const mapRect = nodes.mapCol.getBoundingClientRect();
+                const sideRect = nodes.sideCol.getBoundingClientRect();
+                const available = Math.max(1, rowRect.width - Math.max(0, sideRect.left - mapRect.right));
+                const current = sideRect.width / available * 100;
+                const pct = applyDockWidth(current + (event.key === "ArrowLeft" ? 2 : -2));
+                setLayoutParam("cstf_agent_w", pct);
+              } else {
+                if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+                const next = applyStatusReserve(getReserve() + (event.key === "ArrowUp" ? 20 : -20));
+                setLayoutParam("cstf_status_h", next - 8);
+              }
+              event.preventDefault();
+            };
+
+            let syncQueued = false;
+            const queueSync = () => {
+              if (syncQueued) return;
+              syncQueued = true;
+              win.requestAnimationFrame(() => {
+                syncQueued = false;
+                sync();
+              });
+            };
+            doc.addEventListener("pointerdown", pointerDown, true);
+            win.addEventListener("pointermove", move, true);
+            win.addEventListener("pointerup", stop, true);
+            win.addEventListener("pointercancel", stop, true);
+            doc.addEventListener("keydown", keyDown, true);
+            win.addEventListener("resize", queueSync);
+            const observer = new win.MutationObserver(queueSync);
+            if (doc.documentElement) observer.observe(doc.documentElement, { childList: true, subtree: true });
+
+            const destroy = () => {
+              observer.disconnect();
+              doc.removeEventListener("pointerdown", pointerDown, true);
+              win.removeEventListener("pointermove", move, true);
+              win.removeEventListener("pointerup", stop, true);
+              win.removeEventListener("pointercancel", stop, true);
+              doc.removeEventListener("keydown", keyDown, true);
+              win.removeEventListener("resize", queueSync);
+              doc.body.classList.remove("cstf-resizing-agent", "cstf-resizing-status");
+              drag = null;
+            };
+            win.__cstfEdgeResizeController = { version, sync, destroy };
+            sync();
+          })();
+        `;
+        try {
+          const controllerScript = doc.createElement("script");
+          controllerScript.type = "text/javascript";
+          controllerScript.textContent = controllerSource;
+          (doc.head || doc.documentElement).appendChild(controllerScript);
+          controllerScript.remove();
+          if (win.__cstfEdgeResizeController?.version !== controllerVersion) {
+            throw new Error("parent controller did not initialize");
+          }
+        } catch (error) {
+          win.console?.error?.("CSTF resize controller installation failed", error);
+        }
+      };
+
+      resetLayoutDefaults();
       syncWorkbenchHeight();
+      observeLayoutDefaults();
       lockPageWheel();
-      win.addEventListener("resize", syncWorkbenchHeight);
-      [100, 400, 900].forEach((ms) => win.setTimeout(syncWorkbenchHeight, ms));
+      bindAgentResize();
+      bindStatusResize();
+      bindStatusToggle();
+      observeStatusToggleState();
+      bindDismissibleAlerts();
+      const syncAllResizeGeometry = () => {
+        syncWorkbenchHeight();
+        bindAgentResize();
+        bindStatusResize();
+        bindStatusToggle();
+      };
+      if (win.__cstfResizeWindowHandler) {
+        win.removeEventListener("resize", win.__cstfResizeWindowHandler);
+      }
+      win.__cstfResizeWindowHandler = syncAllResizeGeometry;
+      win.addEventListener("resize", win.__cstfResizeWindowHandler);
+      [100, 400, 900].forEach((ms) => win.setTimeout(syncAllResizeGeometry, ms));
     })();
     </script>
     """,
@@ -5105,3 +7844,18 @@ if (
     if not _ps.get("done"):
         time.sleep(3.0)
         st.rerun()
+
+# 每轮 rerun 以快照方式持久化受控消息；命令原文和敏感路径由 ConversationStore 清理，
+# 历史消息只用于展示/上下文，不会被重新入队执行。
+if (
+    st.session_state.get("_conversation_store") is not None
+    and st.session_state.get("_conversation_thread_id")
+    and st.session_state.get("messages") is not None
+):
+    try:
+        st.session_state._conversation_store.replace_messages(
+            st.session_state._conversation_thread_id,
+            st.session_state.messages,
+        )
+    except Exception:
+        pass

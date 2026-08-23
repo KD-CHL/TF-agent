@@ -23,3 +23,5 @@ agent_debug.log
 
 # Local Chroma databases (regenerate on machine)
 **/chroma.sqlite3
+**/jobs.sqlite3
+**/jobs.sqlite3-*

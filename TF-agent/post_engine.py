@@ -10,6 +10,7 @@ import numpy as np
 from tqdm import tqdm
 import geopandas as gpd
 from shapely.geometry import shape
+from agent_context_policy import safe_error_summary
 
 # 累加缓存（_NUMERATOR/_DENOMINATOR）复用安全门闩：
 # 仅当 manifest 存在且 fingerprint 完全一致才允许复用；否则视为不可信旧缓存，
@@ -371,7 +372,7 @@ def generate_double_constraint_complete(source_folder, mask_folder, output_path,
                     except Exception:
                         continue
         except Exception as e:
-            logger(f"❌ 累加文件创建失败: {e}")
+            logger(f"❌ 累加文件创建失败: {safe_error_summary(e)}")
             _interrupted = True
 
         if _interrupted:
@@ -385,7 +386,7 @@ def generate_double_constraint_complete(source_folder, mask_folder, output_path,
                                   prob_threshold, min_absolute_count,
                                   output_path, identity=cache_identity)
         except OSError as e:
-            logger(f"   ⚠️ 缓存 manifest 写入失败（不影响本次成果）: {e}")
+            logger(f"   ⚠️ 缓存 manifest 写入失败（不影响本次成果）: {safe_error_summary(e)}")
 
     # --- 阶段 3: 双重筛选与保存（分块处理，避免超大栅格 OOM） ---
     if stop_callback and stop_callback():
@@ -416,7 +417,7 @@ def generate_double_constraint_complete(source_folder, mask_folder, output_path,
                     transform=out_transform,
                 )
             except Exception as e:
-                logger(f"   ⚠️ 岸线裁剪矢量读取失败，跳过裁剪: {e}")
+                logger(f"   ⚠️ 岸线裁剪矢量读取失败，跳过裁剪: {safe_error_summary(e)}")
                 clip_mask = None
 
         out_meta.update({"dtype": "uint8", "compress": "lzw"})
@@ -480,7 +481,7 @@ def generate_double_constraint_complete(source_folder, mask_folder, output_path,
         return True
 
     except Exception as e:
-        logger(f"❌ 出错: {e}")
+        logger(f"❌ 出错: {safe_error_summary(e)}")
         import traceback
         traceback.print_exc()
         for _p in (work_tif_path,):

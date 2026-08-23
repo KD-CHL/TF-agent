@@ -24,6 +24,9 @@ streamlit.err.log
 _chat_upload_tmp/
 _analysis_vec_tmp/
 **/chroma.sqlite3
+**/conversations.sqlite3
+**/jobs.sqlite3
+**/jobs.sqlite3-*
 agent_debug.log
 
 # Large data & models
@@ -70,4 +73,4 @@ scan_tidal_data.py
 
 # Acceptance test outputs (regenerated locally)
 tests/acceptance/_out/
-
+acceptance_matrix.json

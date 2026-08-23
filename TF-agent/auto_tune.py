@@ -18,6 +18,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
+from agent_context_policy import safe_error_summary
 
 # 超过该像元数则不对 NUM/DEN 与参考真值做整幅驻内存（避免 guangdong4 等级别 OOM）；分块峰值约 TILE² 量级。
 _MAX_PIXELS_FULL_RAM = 180_000_000
@@ -119,7 +120,7 @@ def _load_reference_gdf(
 
             gdf = clip_truth_to_task_aoi(gdf, aoi_shp_path, task_name, logger=logger)
         except Exception as e:
-            logger(f"  ⚠️ 任务 AOI 裁剪失败，使用未裁剪真值: {e}")
+            logger(f"  ⚠️ 任务 AOI 裁剪失败，使用未裁剪真值: {safe_error_summary(e)}")
     return gdf
 
 

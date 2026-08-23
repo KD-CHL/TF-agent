@@ -354,6 +354,7 @@ def build_globe_payload(
     globe_port: Optional[int] = None,
     prefer_center: bool = False,
     force_local: bool = False,
+    channel_id: Optional[str] = None,
 ) -> dict:
     lat, lon = float(center[0]), float(center[1])
     tile_clients = tile_clients if tile_clients is not None else {}
@@ -387,6 +388,9 @@ def build_globe_payload(
             "chinaCenter": dict(DEFAULT_CAMERA["china_center"]),
         },
         "debugCamera": bool(os.environ.get("CSTF_GLOBE_DEBUG", "").strip() in {"1", "true", "yes"}),
+        # Per-Streamlit-session channel prevents AOI messages from one browser
+        # session being consumed by another session sharing this local server.
+        "channelId": str(channel_id or "default"),
     }
 
     rects: List[Tuple[float, float, float, float]] = []
@@ -540,6 +544,8 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
       background: #2e6ac0; border-color: #7fb2ff; color: #fff;
     }}
     .cesium-viewer-bottom {{ display: none !important; }}
+    .cesium-navigation-help-button,
+    .cesium-navigation-help-wrapper {{ display: none !important; }}
     .cesium-viewer .cesium-widget-credits {{ font-size: 10px; opacity: 0.55; }}
   </style>
 </head>
@@ -649,7 +655,7 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
       homeButton: true,
       sceneModePicker: true,
       baseLayerPicker: false,
-      navigationHelpButton: true,
+      navigationHelpButton: false,
       fullscreenButton: true,
       infoBox: false,
       selectionIndicator: false,
@@ -1011,14 +1017,14 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
 
   function notifyReadyToServer() {{
     try {{
-      fetch("./api/map/ready", {{ method: "GET", cache: "no-store" }}).catch(function() {{}});
+      fetch("./api/map/ready?channel_id=" + encodeURIComponent(CFG.channelId || "default"), {{ method: "GET", cache: "no-store" }}).catch(function() {{}});
     }} catch (e) {{}}
   }}
 
   function notifyAckToServer(commandId, ok) {{
     try {{
       fetch(
-        "./api/map/ack?command_id=" + encodeURIComponent(commandId || "") + "&ok=" + (ok ? "1" : "0"),
+        "./api/map/ack?channel_id=" + encodeURIComponent(CFG.channelId || "default") + "&command_id=" + encodeURIComponent(commandId || "") + "&ok=" + (ok ? "1" : "0"),
         {{ method: "GET", cache: "no-store" }}
       ).catch(function() {{}});
     }} catch (e) {{}}
@@ -1279,7 +1285,8 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
   function sendAoi(kind, geometry, source, label) {{
     const msg = {{ kind: kind, geometry: geometry, source: source || "", label: label || null }};
     try {{
-      fetch("./api/map/aoi", {{
+      const channelQuery = "?channel_id=" + encodeURIComponent(CFG.channelId || "default");
+      fetch("./api/map/aoi" + channelQuery, {{
         method: "POST",
         headers: {{ "Content-Type": "application/json" }},
         body: JSON.stringify(msg),

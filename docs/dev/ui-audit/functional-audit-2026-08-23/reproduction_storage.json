@@ -1,0 +1,71 @@
+{
+  "aoi_cross_client": {
+    "a_messages": [
+      {
+        "geometry": {
+          "coordinates": [
+            121.15,
+            30.45
+          ],
+          "type": "Point"
+        },
+        "kind": "selected",
+        "seq": 1,
+        "source": "audit-A"
+      }
+    ],
+    "b_messages": [
+      {
+        "geometry": {
+          "coordinates": [
+            121.15,
+            30.45
+          ],
+          "type": "Point"
+        },
+        "kind": "selected",
+        "seq": 1,
+        "source": "audit-A"
+      }
+    ]
+  },
+  "context_budget": {
+    "actual_count": 5,
+    "configured_max_messages": 4,
+    "roles": [
+      "system",
+      "user",
+      "user",
+      "user",
+      "user"
+    ]
+  },
+  "conversation_cross_client": {
+    "second_client_messages": [
+      {
+        "content": "A-private-chat",
+        "image_name": "api_key=EXAMPLE_ONLY.png",
+        "role": "user"
+      }
+    ],
+    "second_client_threads": [
+      "thread_A"
+    ]
+  },
+  "duplicate_workflow_jobs": {
+    "claims": [
+      true,
+      true
+    ],
+    "plan_ids": [
+      null,
+      null
+    ],
+    "request_ids_distinct": true
+  },
+  "notes": [
+    "All values were produced with temporary SQLite files or process-local state.",
+    "The API-key-looking filename is a synthetic non-secret test value.",
+    "Timestamps were omitted because they are irrelevant to the reproduced behavior."
+  ]
+}

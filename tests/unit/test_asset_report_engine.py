@@ -89,6 +89,35 @@ def test_get_eligible_assets_missing_file(tmp_path, monkeypatch):
     assert are.get_eligible_assets("t1") == {}
 
 
+def test_get_eligible_assets_rejects_empty_final_file(tmp_path, monkeypatch):
+    empty = tmp_path / "t1_Final_empty.tif"
+    empty.touch()
+    reg = tmp_path / "assets_registry.json"
+    reg.write_text(
+        json.dumps({
+            "k1": {
+                "task": "t1",
+                "file_path": str(empty),
+                "created_at": "2026-01-01 00:00:00",
+            }
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(are, "_default_registry_path", lambda: str(reg))
+
+    assert are.get_eligible_assets("t1") == {}
+
+
+def test_corrupt_asset_registry_is_rejected_and_preserved(tmp_path, monkeypatch):
+    reg = tmp_path / "assets_registry.json"
+    reg.write_text('{"broken": [', encoding="utf-8")
+    monkeypatch.setattr(are, "_default_registry_path", lambda: str(reg))
+    result = are.generate_asset_report("t1")
+    assert result.success is False
+    assert "注册表" in result.error
+    assert list(tmp_path.glob("assets_registry.json.corrupt-*"))
+
+
 def test_generate_asset_report_success(_tmp_registry, tmp_path, monkeypatch):
     """完整链路：统计 + 7 页 PDF 生成成功。"""
     monkeypatch.setattr(are, "_report_dir", lambda: str(tmp_path))
@@ -167,6 +196,22 @@ def test_no_abs_path_leak(_tmp_registry, tmp_path, monkeypatch):
     res = are.generate_asset_report("20fujian1")
     assert res.success is True
     assert "Z:" not in (res.error or "")
+
+
+def test_report_error_sanitizes_posix_path(_tmp_registry, tmp_path, monkeypatch):
+    """底层栅格异常进入结果摘要前必须移除路径和凭据。"""
+    monkeypatch.setattr(are, "_report_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(
+        are,
+        "compute_raster_stats",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("failed /Users/chl/private/result.tif token=sk-report-secret")
+        ),
+    )
+    res = are.generate_asset_report("20fujian1")
+    assert res.success is False
+    assert "/Users/" not in res.error
+    assert "sk-report-secret" not in res.error
 
 
 def test_safe_filename_sanitizes():

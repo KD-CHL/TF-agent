@@ -2,6 +2,10 @@
 """
 通用 Agent 任务框架（从 M5 可信闭环提炼，供未来 E1 / GEE / 推理复用）。
 
+兼容性说明：生产请求统一使用 ``execution_request.py`` 与各业务
+``*_agent_loop``；本模块仅保留历史 ``TaskPlan``/格式化工具，禁止作为新的
+后台执行入口。迁移完成前通过显式标志让调用方和审计工具能识别其兼容地位。
+
 设计原则：
 - 只抽象「验收中反复出现」的结构，不提前迁移现有 M5 业务逻辑。
 - 业务引擎（m5_engine / e1_engine / …）仍由各闭环自行调用。
@@ -24,6 +28,12 @@ from task_timeline import (  # noqa: F401
     TimelineEvent,
     TimelineStore,
     can_transition,
+)
+
+COMPATIBILITY_ONLY = True
+DEPRECATION_MESSAGE = (
+    "agent_task_framework 仅用于历史计划/时间线兼容；新任务必须使用 "
+    "execution_request 与对应可信 agent loop。"
 )
 
 

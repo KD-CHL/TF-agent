@@ -148,6 +148,25 @@ class TestSummaryInjection:
         s = compact_summary(aoi)
         assert "invalid" in s
 
+    def test_redacted_summary_hides_label_and_precise_failure_details(self):
+        aoi = AOIContext(
+            aoi_id="aoi-secure",
+            source="map_polygon",
+            geometry={},
+            bbox=(200.0, 30.0, 201.0, 31.0),
+            centroid=(200.5, 30.5),
+            area_km2=0.0,
+            valid=False,
+            label="/Users/chl/private/token=sk-secret.tif",
+            warnings=["经度越界: 200.0..201.0", "token=sk-secret"],
+        )
+        summary = compact_summary(aoi, include_spatial=False)
+        assert "spatial=redacted" in summary
+        assert "/Users/" not in summary
+        assert "sk-secret" not in summary
+        assert "200.0..201.0" not in summary
+        assert "空间校验未通过" in summary
+
 
 class TestAOISingleton:
     def test_new_selection_overrides_old(self):

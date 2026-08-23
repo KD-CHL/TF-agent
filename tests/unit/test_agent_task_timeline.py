@@ -16,7 +16,7 @@ _TF_AGENT = os.path.normpath(
 if _TF_AGENT not in sys.path:
     sys.path.insert(0, _TF_AGENT)
 
-from task_timeline import PHASES, STATUSES, TimelineEvent, TimelineStore  # noqa: E402
+from task_timeline import PHASES, STATUSES, TimelineEvent, TimelineStore, timeline_ledger_path  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # 模型层
@@ -188,13 +188,49 @@ class TestSafetyAndSummary:
             "EXECUTE",
             status="FAILED",
             message="失败",
-            details={"token": "sk-abc", "path": "Z:/secret/model.pth", "msg": "ok"},
+            details={
+                "token": "sk-abc",
+                "path": "Z:/secret/model.pth",
+                "proxy": "https://user:pass@example.invalid/api",
+                "msg": "ok",
+            },
         )
         ev = store.latest()
         assert "token" not in ev.details
         assert "sk-abc" not in json.dumps(ev.details)
         assert "Z:/" not in json.dumps(ev.details)
+        assert "user:pass@" not in json.dumps(ev.details)
         assert ev.details["msg"] == "ok"
+
+    def test_message_and_error_are_sanitized_before_persistence(self):
+        store = TimelineStore()
+        event = store.add(
+            "a",
+            "EXECUTE",
+            status="FAILED",
+            message="failed /Users/chl/private/file.tif token=sk-secret",
+            error="proxy=https://user:pass@example.invalid/api",
+        )
+        assert "/Users/" not in event.message
+        assert "sk-secret" not in event.message
+        assert "user:pass@" not in (event.error or "")
+
+    def test_spatial_metadata_is_redacted_before_persistence(self):
+        store = TimelineStore()
+        event = store.add(
+            "a",
+            "VERIFY",
+            status="FAILED",
+            message="bounds: left=120.600000, bottom=30.200000, right=121.200000, top=30.900000",
+            error="crs: EPSG:4326; resolution: x=0.00025, y=0.00025",
+            details={"aoi": "bbox=(120.6,30.2,121.2,30.9)"},
+        )
+        payload = json.dumps(event.to_dict(), ensure_ascii=False)
+        assert "120.600000" not in payload
+        assert "EPSG:4326" not in payload
+        assert "0.00025" not in payload
+        assert "120.6" not in payload
+        assert "<spatial-redacted>" in payload
 
     def test_artifacts_relative_only(self):
         store = TimelineStore()
@@ -212,6 +248,12 @@ class TestSafetyAndSummary:
         suffixes = {p.suffix.lower() for p in tmp_path.iterdir()}
         assert not (suffixes & {".db", ".sqlite", ".sqlite3", ".duckdb"})
 
+    def test_configured_ledger_path_is_explicit_and_isolated(self, tmp_path, monkeypatch):
+        configured = tmp_path / "isolated" / "timeline.json"
+        monkeypatch.setenv("CSTF_TIMELINE_LEDGER_PATH", str(configured))
+        assert timeline_ledger_path() == str(configured)
+        assert timeline_ledger_path(str(tmp_path / "explicit.json")) == str(tmp_path / "explicit.json")
+
 
 # ---------------------------------------------------------------------------
 # 与 agent_task_framework 集成
@@ -225,6 +267,12 @@ class TestFrameworkIntegration:
         assert atf.TimelineEvent is TimelineEvent
         assert atf.TimelineStore is TimelineStore
         assert hasattr(atf, "STATE_PENDING_PLAN")
+
+    def test_framework_is_explicitly_compatibility_only(self):
+        import agent_task_framework as atf
+
+        assert atf.COMPATIBILITY_ONLY is True
+        assert "execution_request" in atf.DEPRECATION_MESSAGE
 
     def test_confirm_gate_still_enforced(self):
         import agent_task_framework as atf

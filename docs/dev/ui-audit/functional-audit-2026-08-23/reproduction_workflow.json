@@ -1,0 +1,71 @@
+{
+  "cancelled_restart": {
+    "after": "COMPLETED_WITH_WARNINGS",
+    "before": "CANCELLED",
+    "calls": [
+      "gee_download",
+      "local_inference",
+      "pdf_report"
+    ]
+  },
+  "changed_params": {
+    "calls": [
+      "gee_download",
+      "local_inference",
+      "pdf_report"
+    ],
+    "result": "COMPLETED_WITH_WARNINGS",
+    "target_year": 2025
+  },
+  "mid_step_cancel": {
+    "first_step_asset": "asset_gee_download",
+    "first_step_status": "SUCCEEDED",
+    "result": "CANCELLED"
+  },
+  "need_report_false": {
+    "calls": [
+      "gee_download",
+      "local_inference",
+      "pdf_report"
+    ],
+    "pdf_called": true,
+    "result": "COMPLETED_WITH_WARNINGS"
+  },
+  "ready_while_heavy_running": [
+    "h2"
+  ],
+  "recovery": {
+    "approved_params": null,
+    "context": {},
+    "depends_on": {
+      "e1_quality": [],
+      "gee_download": [],
+      "local_inference": [],
+      "m5_change": [],
+      "pdf_report": []
+    },
+    "required": {
+      "e1_quality": false,
+      "gee_download": false,
+      "local_inference": false,
+      "m5_change": false,
+      "pdf_report": false
+    }
+  },
+  "unconfirmed": {
+    "after": "COMPLETED_WITH_WARNINGS",
+    "before": {
+      "confirmed": false,
+      "status": "PENDING"
+    },
+    "calls": [
+      "gee_download",
+      "local_inference",
+      "pdf_report"
+    ]
+  },
+  "notes": [
+    "The reproduction used temporary ledgers and override executors.",
+    "No GEE request, model inference, PDF generation, download, or long-running task was started."
+  ]
+}

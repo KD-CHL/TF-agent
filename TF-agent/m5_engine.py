@@ -23,6 +23,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 import cstf_ux as ux
+from agent_context_policy import safe_error_summary
 
 _TASK_RE = re.compile(r"^(\d{2})(.+)$")
 
@@ -207,7 +208,7 @@ class M5_AnomalyDetector:
             reduction_gdf = gpd.overlay(gdf_base, gdf_curr, how="difference")
             siltation_gdf = gpd.overlay(gdf_curr, gdf_base, how="difference")
         except Exception as e:
-            ux.warn(f"差集运算异常，已按空变化图层处理: {e}", log)
+            ux.warn(f"差集运算异常，已按空变化图层处理: {safe_error_summary(e)}", log)
             reduction_gdf = gpd.GeoDataFrame(geometry=[], crs=gdf_base.crs)
             siltation_gdf = gpd.GeoDataFrame(geometry=[], crs=gdf_base.crs)
 
@@ -400,5 +401,5 @@ def run_m5_after_synthesis(
         report["baseline_task"] = baseline_task
         return report
     except Exception as e:
-        logger(f"[M5] 异常检测失败: {e}")
+        logger(f"[M5] 异常检测失败: {safe_error_summary(e)}")
         return None

@@ -95,6 +95,22 @@ class TestE1Preflight(unittest.TestCase):
 
 
 class TestE1VerifyAndSummary(unittest.TestCase):
+    def test_empty_report_file_fails_verification(self):
+        with tempfile.TemporaryDirectory() as td:
+            report_path = os.path.join(td, "empty-report.json")
+            Path(report_path).touch()
+            report = {
+                "reference": "师姐_2020",
+                "report_path": report_path,
+                "comparisons": {"pair": {"jaccard_iou": 0.2}},
+            }
+
+            verification = e1_agent_loop.verify_e1_outputs(report)
+
+            self.assertFalse(verification["ok"])
+            failed = {c["name"] for c in verification["checks"] if not c["passed"]}
+            self.assertIn("report_json_on_disk", failed)
+
     def test_verify_and_summary(self):
         with tempfile.TemporaryDirectory() as td:
             report_path = os.path.join(td, "E1_PIXEL_REPORT_24zhejiang1.json")

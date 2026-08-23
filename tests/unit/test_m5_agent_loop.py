@@ -74,11 +74,31 @@ class TestM5Preflight(unittest.TestCase):
 
 
 class TestM5VerifyAndSummary(unittest.TestCase):
+    def test_empty_report_file_fails_verification(self):
+        with tempfile.TemporaryDirectory() as td:
+            report_path = os.path.join(td, "empty-report.json")
+            Path(report_path).touch()
+            report = {
+                "target_roi": "24zhejiang1",
+                "baseline_task": "20zhejiang1",
+                "current_shp": "current.shp",
+                "baseline_shp": "baseline.shp",
+                "alert_level": "GREEN",
+                "report_path": report_path,
+                "quantitative_metrics": {"area_evolution": {}},
+            }
+
+            verification = m5_agent_loop.verify_m5_outputs(report)
+
+            self.assertFalse(verification["ok"])
+            failed = {c["name"] for c in verification["checks"] if not c["passed"]}
+            self.assertIn("report_json_on_disk", failed)
+
     def test_verify_and_summary(self):
         with tempfile.TemporaryDirectory() as td:
             report_path = os.path.join(td, "ADVANCED_ALERT_REPORT_24zhejiang1.json")
             loss = os.path.join(td, "24zhejiang1_loss_zones.shp")
-            Path(loss).write_bytes(b"")
+            Path(loss).write_bytes(b"shp")
             report = {
                 "target_roi": "24zhejiang1",
                 "baseline_task": "20zhejiang1",

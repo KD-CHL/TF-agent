@@ -119,6 +119,17 @@ class TestSummaryWhitelist:
         assert "Z:" not in text and "C:" not in text and "/home/" not in text
         assert "model.pth" not in text
 
+    def test_injection_redacts_precise_spatial_fields_without_consent(self):
+        aoi = aoi_from_bbox(120.6, 30.2, 121.2, 30.9)
+        text = aoi_recommendation_text(aoi, capabilities=None, include_spatial=False)
+        assert "spatial=redacted" in text
+        assert "120.6" not in text and "30.2" not in text
+
+    def test_injection_can_include_spatial_fields_only_when_requested(self):
+        aoi = aoi_from_bbox(120.6, 30.2, 121.2, 30.9)
+        text = aoi_recommendation_text(aoi, capabilities=None, include_spatial=True)
+        assert "bbox=" in text and "centroid=" in text
+
 
 class TestCapabilityGate:
     def test_recommendation_obeys_blocked_capability(self):

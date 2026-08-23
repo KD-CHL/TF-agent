@@ -104,9 +104,14 @@ def process_aoi_cleared(state: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True, "echo": None, "errors": []}
 
 
-def aoi_recommendation_text(aoi: AOIContext, capabilities: Optional[Dict[str, str]]) -> str:
-    """Copilot 注入：AOI 摘要 + 基于能力的推荐（白名单字段）。"""
-    lines = [compact_summary(aoi)]
+def aoi_recommendation_text(
+    aoi: AOIContext,
+    capabilities: Optional[Dict[str, str]],
+    *,
+    include_spatial: bool = False,
+) -> str:
+    """Copilot 注入：AOI 摘要 + 能力推荐；精确空间字段需显式授权。"""
+    lines = [compact_summary(aoi, include_spatial=include_spatial)]
     if not aoi.valid:
         lines.append("该 AOI 无效，仅作参考，不推荐任何执行。")
         return "\n".join(lines)

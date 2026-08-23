@@ -35,6 +35,19 @@ def _base_state() -> dict:
     return s
 
 
+class TestCommandScalarValidation(unittest.TestCase):
+    def test_invalid_iso_date_is_not_applied(self):
+        state = _base_state()
+        apply_system_command(state, {"sidebar_states": {"m4_start_date": "2020-02-31"}})
+        self.assertNotEqual(state["ui_m4_start_date"], "2020-02-31")
+
+    def test_non_finite_threshold_is_not_applied(self):
+        state = _base_state()
+        before = state["ui_prob_th"]
+        apply_system_command(state, {"sidebar_states": {"prob_th": float("nan")}})
+        self.assertEqual(state["ui_prob_th"], before)
+
+
 # ============================================================
 # 任务 1：torch.load 必须 weights_only=True（安全加载）
 # ============================================================
@@ -348,6 +361,11 @@ class TestHeavyToolConfirmationGate(unittest.TestCase):
         self.assertFalse(result.errors, result.errors)
         self.assertIn("pending_autotune", state)
         self.assertEqual(state["pending_autotune"]["reference_id"], "师姐_2020")
+        self.assertEqual(state["pending_autotune"]["mode"], "autotune")
+        self.assertEqual(
+            state["pending_autotune"]["execution_request"]["entrypoint"],
+            "autotune",
+        )
 
     def test_image_driven_llm_command_cannot_bypass_confirmation(self):
         """上传图片产生的 LLM 指令走同一解析/合流路径，必须同样经过确认门闩。"""

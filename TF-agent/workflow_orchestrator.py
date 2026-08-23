@@ -23,11 +23,19 @@
 from __future__ import annotations
 
 import json
+import copy
+import hashlib
 import os
+import re
+import shutil
 import tempfile
+import threading
 import uuid
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from agent_context_policy import describe_local_path, redact_spatial_metadata, safe_error_summary, sanitize_external_text
+from asset_registry_schema import ensure_valid_registry, valid_entries
 
 # ---------------------------------------------------------------
 #  1. 常量与状态
@@ -95,6 +103,11 @@ _DEFAULT_DATA_DIR = os.path.normpath(
 WORKFLOW_LEDGER_PATH = os.path.join(_DEFAULT_DATA_DIR, "workflow_ledger.json")
 MAX_LEDGER_HISTORY = 50
 
+_WORKFLOW_LOCK_GUARD = threading.RLock()
+_WORKFLOW_LOCKS: Dict[str, threading.RLock] = {}
+_HEAVY_SLOT_COND = threading.Condition(threading.RLock())
+_ACTIVE_HEAVY_WORKFLOWS: set[str] = set()
+
 # 会话状态键
 STATE_WORKFLOW_PENDING_PLAN = "_workflow_pending_plan"
 STATE_WORKFLOW_PLAN_CONFIRMED = "_workflow_plan_confirmed"   # set[workflow_id]
@@ -113,16 +126,43 @@ def new_workflow_id() -> str:
     return WORKFLOW_ID_PREFIX + uuid.uuid4().hex
 
 
+def _workflow_lock(workflow_id: str) -> threading.RLock:
+    """Return the process-local execution lock for one workflow identity."""
+    key = str(workflow_id or "") or "__missing_workflow_id__"
+    with _WORKFLOW_LOCK_GUARD:
+        lock = _WORKFLOW_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _WORKFLOW_LOCKS[key] = lock
+        return lock
+
+
+def _acquire_heavy_slot(workflow_id: str) -> None:
+    """Serialize heavyweight external jobs across workflow identities."""
+    key = str(workflow_id or "") or "__missing_workflow_id__"
+    with _HEAVY_SLOT_COND:
+        while _ACTIVE_HEAVY_WORKFLOWS and key not in _ACTIVE_HEAVY_WORKFLOWS:
+            _HEAVY_SLOT_COND.wait(timeout=0.5)
+        _ACTIVE_HEAVY_WORKFLOWS.add(key)
+
+
+def _release_heavy_slot(workflow_id: str) -> None:
+    key = str(workflow_id or "") or "__missing_workflow_id__"
+    with _HEAVY_SLOT_COND:
+        _ACTIVE_HEAVY_WORKFLOWS.discard(key)
+        _HEAVY_SLOT_COND.notify_all()
+
+
 def _sensitive_filtered(text: str) -> str:
     """去掉敏感值（key/token/credentials 值），防泄漏。"""
     if not text:
         return ""
-    import re
-    low = text.lower()
+    raw = str(text)
+    low = raw.lower()
     for k in _SENSITIVE_KEY_SUBSTRINGS:
         if k in low:
             return "<redacted>"
-    return str(text)
+    return redact_spatial_metadata(sanitize_external_text(raw))[:500]
 
 
 # ---------------------------------------------------------------
@@ -227,17 +267,19 @@ def build_analysis_workflow(
         condition=m5_condition,
     ))
 
-    # 5) PDF 报告（必需；如 E1/M5 执行则依赖它们）
+    # 5) PDF 报告（必需；用户明确要求的 E1/M5 是硬依赖，自动步骤是软依赖）
     report_deps = ["local_inference"]
+    report_optional_deps: List[str] = []
     if e1_condition not in ("user_skipped",):
-        report_deps.append("e1_quality")
+        (report_deps if need_e1 is True else report_optional_deps).append("e1_quality")
     if m5_condition not in ("user_skipped", "no_baseline_year"):
-        report_deps.append("m5_change")
+        (report_deps if need_m5 is True else report_optional_deps).append("m5_change")
     steps.append(_step(
         step_id="pdf_report",
         tool=TOOL_PDF_REPORT,
         depends_on=report_deps,
-        required=True,
+        optional_depends_on=report_optional_deps,
+        required=(need_report is not False),
         condition="report_required",
     ))
 
@@ -284,6 +326,9 @@ def build_analysis_workflow(
         "status": WF_PENDING,
         "confirmed": False,
         "approved_params": None,      # 确认时的参数快照
+        "approved_spec_hash": None,
+        "revision": 1,
+        "approved_revision": None,
         "confirmation_source": None,
         "allowed_parent_workflow_id": None,
         "warnings": warnings,
@@ -294,6 +339,7 @@ def build_analysis_workflow(
         "created_at": _now_str(),
         "updated_at": _now_str(),
     }
+    workflow["spec_hash"] = _spec_hash(_extract_params_snapshot(workflow))
     if not blockers:
         workflow["status"] = WF_PENDING
     else:
@@ -306,6 +352,7 @@ def _step(
     step_id: str,
     tool: str,
     depends_on: List[str],
+    optional_depends_on: Optional[List[str]] = None,
     required: bool,
     condition: Optional[str],
 ) -> Dict[str, Any]:
@@ -313,6 +360,7 @@ def _step(
         "step_id": step_id,
         "tool": tool,
         "depends_on": list(depends_on),
+        "optional_depends_on": list(optional_depends_on or []),
         "required": bool(required),
         "condition": condition,
         "status": STEP_PENDING,
@@ -398,14 +446,22 @@ def validate_analysis_workflow(
     final_root = str(ctx.get("final_root") or "")
     mask_root = str(ctx.get("mask_root") or "")
     model_path = str(ctx.get("model_path") or "")
-    if root_dir and not os.path.isdir(root_dir):
-        blockers.append(f"影像根目录不存在: {root_dir}")
-    if final_root and not os.path.isdir(final_root):
-        blockers.append(f"成果根目录不存在: {final_root}")
-    if mask_root and not os.path.isdir(mask_root):
-        blockers.append(f"掩膜根目录不存在: {mask_root}")
-    if model_path and not os.path.isfile(model_path):
-        warnings.append(f"模型权重路径不存在（执行时将再校验）: {model_path}")
+    if not root_dir:
+        blockers.append("缺少影像根目录。")
+    elif not os.path.isdir(root_dir):
+        blockers.append(f"影像根目录不存在: {describe_local_path(root_dir)}")
+    if not final_root:
+        blockers.append("缺少成果根目录。")
+    elif not os.path.isdir(final_root):
+        blockers.append(f"成果根目录不存在: {describe_local_path(final_root)}")
+    if not mask_root:
+        blockers.append("缺少掩膜根目录。")
+    elif not os.path.isdir(mask_root):
+        blockers.append(f"掩膜根目录不存在: {describe_local_path(mask_root)}")
+    if not model_path:
+        blockers.append("缺少模型权重路径。")
+    elif not os.path.isfile(model_path):
+        blockers.append(f"模型权重路径不存在: {describe_local_path(model_path)}")
 
     for step in workflow.get("steps") or []:
         tool = step.get("tool")
@@ -530,6 +586,9 @@ def confirm_workflow(
     plan["status"] = WF_CONFIRMED
     plan["confirmation_source"] = "parent_workflow"
     plan["approved_params"] = approved_params or _extract_params_snapshot(plan)
+    plan["approved_spec_hash"] = _spec_hash(plan["approved_params"])
+    plan["approved_revision"] = int(plan.get("revision") or 1)
+    plan["spec_hash"] = _spec_hash(_extract_params_snapshot(plan))
     plan["updated_at"] = _now_str()
     state[STATE_WORKFLOW_PENDING_PLAN] = plan
     _ledger_upsert(plan, status=WF_CONFIRMED, note="confirmed")
@@ -572,9 +631,14 @@ def _extract_params_snapshot(workflow: Dict[str, Any]) -> Dict[str, Any]:
         "root_dir": ctx.get("root_dir"),
         "final_root": ctx.get("final_root"),
         "mask_root": ctx.get("mask_root"),
+        "shp_path": ctx.get("shp_path"),
+        "e1_data_root": ctx.get("e1_data_root"),
+        "e1_reference": ctx.get("e1_reference"),
         "start_date": ctx.get("start_date"),
         "end_date": ctx.get("end_date"),
         "export_to": ctx.get("export_to"),
+        "gee_proxy_url": ctx.get("gee_proxy_url"),
+        "gee_project_id": ctx.get("gee_project_id"),
         "steps": [
             {"step_id": s["step_id"], "tool": s["tool"], "required": s["required"],
              "condition": s.get("condition")}
@@ -583,16 +647,24 @@ def _extract_params_snapshot(workflow: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _spec_hash(snapshot: Dict[str, Any]) -> str:
+    payload = json.dumps(snapshot or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()[:24]
+
+
 def check_params_changed(workflow: Dict[str, Any]) -> List[str]:
     """确认后的参数变化检测：变化 → workflow 置 PAUSED 并返回变化项。"""
     approved = workflow.get("approved_params")
     if not isinstance(approved, dict):
         return []
     current = _extract_params_snapshot(workflow)
+    current_hash = _spec_hash(current)
+    workflow["spec_hash"] = current_hash
     changes: List[str] = []
     for key in ("aoi_id", "target_year", "baseline_year", "prob", "cnt",
                 "model_path", "root_dir", "final_root", "mask_root",
-                "start_date", "end_date", "export_to"):
+                "shp_path", "e1_data_root", "e1_reference", "start_date",
+                "end_date", "export_to", "gee_proxy_url", "gee_project_id"):
         if approved.get(key) != current.get(key):
             changes.append(
                 f"{key}: {approved.get(key)!r} → {current.get(key)!r}"
@@ -602,7 +674,12 @@ def check_params_changed(workflow: Dict[str, Any]) -> List[str]:
     c_steps = [s["step_id"] for s in current.get("steps") or []]
     if a_steps != c_steps:
         changes.append(f"steps: {a_steps} → {c_steps}")
+    approved_hash = workflow.get("approved_spec_hash")
+    if approved_hash and current_hash != approved_hash and not changes:
+        changes.append("approved_spec_hash 已变化，需要重新确认")
     if changes:
+        if workflow.get("status") != WF_PAUSED:
+            workflow["revision"] = int(workflow.get("revision") or 1) + 1
         workflow["status"] = WF_PAUSED
         workflow["updated_at"] = _now_str()
         _ledger_upsert(workflow, status=WF_PAUSED, note="params_changed")
@@ -613,10 +690,10 @@ def check_params_changed(workflow: Dict[str, Any]) -> List[str]:
 #  5. DAG 执行器
 # ---------------------------------------------------------------
 def find_ready_steps(workflow: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """返回当前 READY 的步骤（依赖全部终态且未失败 → READY）。
+    """返回当前 READY 的步骤（硬/软依赖全部终态后再 READY）。
 
-    - 依赖 SUCCEEDED / REUSED / SKIPPED → 满足；
-    - 必需依赖 FAILED / BLOCKED → 本步 BLOCKED；
+    - 硬依赖 FAILED / BLOCKED → 本步 BLOCKED；
+    - 软依赖 FAILED / BLOCKED → 等待其终态后继续，不阻断本步；
     - 条件为 user_skipped / no_baseline_year / 无参考 → SKIPPED。
     """
     steps = {s["step_id"]: s for s in workflow.get("steps") or []}
@@ -628,6 +705,8 @@ def find_ready_steps(workflow: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     for step in steps.values():
         status = step.get("status")
+        if running_heavy and step.get("tool") in HEAVY_TOOLS:
+            continue
         if status == STEP_READY:
             # 上轮已置 READY 但未执行（多个 READY 时一次只跑一个）→ 继续排队
             ready.append(step)
@@ -636,9 +715,10 @@ def find_ready_steps(workflow: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
 
         # 依赖判定（先于条件跳过：依赖失败必须 BLOCKED，而非 SKIPPED）
-        deps = [steps.get(d) for d in step.get("depends_on") or []]
+        hard_deps = [steps.get(d) for d in step.get("depends_on") or []]
+        optional_deps = [steps.get(d) for d in step.get("optional_depends_on") or []]
         blocked_by = [
-            d["step_id"] for d in deps
+            d["step_id"] for d in hard_deps
             if d and d.get("status") in (STEP_FAILED, STEP_BLOCKED)
         ]
         if blocked_by:
@@ -646,11 +726,13 @@ def find_ready_steps(workflow: Dict[str, Any]) -> List[Dict[str, Any]]:
             step["error"] = f"依赖失败: {', '.join(blocked_by)}"
             step["finished_at"] = _now_str()
             continue
-        deps_terminal = bool(deps) and all(
+        all_deps = [d for d in hard_deps + optional_deps if d]
+        deps_terminal = bool(all_deps) and all(
             d.get("status") in (STEP_SUCCEEDED, STEP_REUSED, STEP_SKIPPED)
-            for d in deps if d
+            or d.get("status") in (STEP_FAILED, STEP_BLOCKED)
+            for d in all_deps
         )
-        if deps and not deps_terminal:
+        if all_deps and not deps_terminal:
             continue  # 依赖尚未终态
 
         # 条件判定（自动跳过）——依赖已满足后才评估
@@ -675,6 +757,8 @@ def _should_skip(workflow: Dict[str, Any], step: Dict[str, Any]) -> bool:
         return not _list_e1_references(ctx.get("e1_data_root") or "")
     if cond == "baseline_available":
         return not _find_baseline_shp(workflow)
+    if cond == "report_required":
+        return (workflow.get("intent") or {}).get("need_report", True) is False
     return False
 
 
@@ -738,7 +822,7 @@ def _find_prediction_asset(
         if row.get("task") != task_id:
             continue
         fp = str(row.get("file_path") or "")
-        if not os.path.isfile(fp):
+        if not _nonempty_path(fp):
             continue
         if fp.lower().endswith((".tif", ".tiff", ".shp")):
             if best is None or str(row.get("created_at") or "") > str(
@@ -922,7 +1006,7 @@ def _run_e1_step(step, workflow, *, exec_ctx, push_log, stop_event) -> Dict[str,
         return {
             "success": False, "status": STEP_FAILED, "outputs": {},
             "assets": [], "metrics": {}, "warnings": [],
-            "error": f"E1 所需当期潮滩 SHP 不存在: {target_shp or '（空）'}",
+            "error": f"E1 所需当期潮滩 SHP 不存在: {describe_local_path(target_shp) if target_shp else '（空）'}",
         }
     plan = e1al.build_e1_preflight(
         final_root=final_root,
@@ -994,7 +1078,7 @@ def _run_m5_step(step, workflow, *, exec_ctx, push_log, stop_event) -> Dict[str,
         return {
             "success": False, "status": STEP_FAILED, "outputs": {},
             "assets": [], "metrics": {}, "warnings": [],
-            "error": f"M5 所需当期潮滩 SHP 不存在: {current_shp or '（空）'}",
+            "error": f"M5 所需当期潮滩 SHP 不存在: {describe_local_path(current_shp) if current_shp else '（空）'}",
         }
     if not baseline_shp:
         return {
@@ -1048,6 +1132,8 @@ def _run_report_step(step, workflow, *, exec_ctx, push_log, stop_event) -> Dict[
     override = (exec_ctx or {}).get("report_executor")
     if override is not None:
         return _apply_override(override, step, workflow, exec_ctx)
+    if _stop_requested(stop_event):
+        return _cancelled_step_result(step, "报告生成前收到取消请求")
     import asset_report_engine as are
 
     task_id = str(workflow.get("task_id") or "")
@@ -1067,7 +1153,7 @@ def _run_report_step(step, workflow, *, exec_ctx, push_log, stop_event) -> Dict[
         return {
             "success": False, "status": STEP_FAILED, "outputs": {},
             "assets": [], "metrics": {}, "warnings": [],
-            "error": f"PDF 报告生成异常: {e}",
+            "error": f"PDF 报告生成异常: {safe_error_summary(e)}",
         }
     if not result or not getattr(result, "success", False):
         err = getattr(result, "error", "") or "PDF 报告生成失败"
@@ -1076,8 +1162,21 @@ def _run_report_step(step, workflow, *, exec_ctx, push_log, stop_event) -> Dict[
             "assets": [], "metrics": {}, "warnings": list(getattr(result, "warnings", []) or []),
             "error": err,
         }
+    if _stop_requested(stop_event):
+        return _cancelled_step_result(step, "报告生成后收到取消请求，结果不会登记")
     report_path = getattr(result, "report_path", None)
     asset_id = _register_report_asset(task_id, report_path, exec_ctx=exec_ctx)
+    if _stop_requested(stop_event):
+        return _cancelled_step_result(step, "报告资产登记后收到取消请求，结果不会提交")
+    if not asset_id:
+        return {
+            "success": False, "status": STEP_FAILED,
+            "outputs": {"report_path": report_path},
+            "assets": [],
+            "metrics": {"sections": len(getattr(result, "sections", []) or [])},
+            "warnings": list(getattr(result, "warnings", []) or []),
+            "error": "报告文件已生成，但报告资产登记失败。",
+        }
     return {
         "success": True, "status": STEP_SUCCEEDED, "outputs": {"report_path": report_path},
         "assets": [{"asset_id": asset_id, "asset_type": ASSET_REPORT,
@@ -1098,6 +1197,26 @@ def _apply_override(override, step, workflow, exec_ctx) -> Dict[str, Any]:
             "error": "override 执行器返回非 dict",
         }
     return res
+
+
+def _stop_requested(stop_event: Optional[Any]) -> bool:
+    return bool(stop_event is not None and stop_event.is_set())
+
+
+def _cancelled_step_result(step: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    step["status"] = STEP_CANCELLED
+    step["asset_id"] = None
+    step["error"] = reason
+    step["finished_at"] = _now_str()
+    return {
+        "success": False,
+        "status": STEP_CANCELLED,
+        "outputs": {},
+        "assets": [],
+        "metrics": {},
+        "warnings": [],
+        "error": reason,
+    }
 
 
 def _run_with_child_confirmation(
@@ -1129,16 +1248,19 @@ def _run_with_child_confirmation(
         result = execute_fn(plan, push_log, stop_event)
     except Exception as e:  # noqa: BLE001
         step["status"] = STEP_FAILED
-        step["error"] = str(e)
+        safe_error = safe_error_summary(e)
+        step["error"] = safe_error
         step["finished_at"] = _now_str()
-        push_log(f"[WF:{workflow.get('workflow_id')[:8]}] ❌ 执行异常: {e}")
+        push_log(f"[WF:{workflow.get('workflow_id')[:8]}] ❌ 执行异常: {safe_error}")
         return {
             "success": False, "status": STEP_FAILED, "outputs": {},
             "assets": [], "metrics": {}, "warnings": [],
-            "error": str(e),
+            "error": safe_error,
         }
+    if _stop_requested(stop_event):
+        return _cancelled_step_result(step, "步骤执行后收到取消请求，结果不会登记")
     if not result or result.get("success") is not True:
-        err = (result or {}).get("error") or "子闭环执行失败"
+        err = sanitize_external_text((result or {}).get("error") or "子闭环执行失败")
         step["status"] = STEP_FAILED
         step["error"] = err
         step["finished_at"] = _now_str()
@@ -1163,10 +1285,19 @@ def _run_with_child_confirmation(
             "warnings": (result or {}).get("warnings") or [],
             "error": step["error"],
         }
-    asset_id = register_fn(plan, result, verification)
+    if _stop_requested(stop_event):
+        return _cancelled_step_result(step, "输出校验后收到取消请求，结果不会登记")
+    registration_error = ""
+    try:
+        asset_id = register_fn(plan, result, verification)
+    except Exception as e:  # noqa: BLE001
+        asset_id = None
+        registration_error = f"资产登记异常: {safe_error_summary(e)}"
+    if _stop_requested(stop_event):
+        return _cancelled_step_result(step, "资产登记后收到取消请求，结果不会提交")
     if not asset_id:
         step["status"] = STEP_FAILED
-        step["error"] = "校验通过但资产登记失败"
+        step["error"] = registration_error or "校验通过但资产登记失败"
         step["finished_at"] = _now_str()
         return {
             "success": False, "status": STEP_FAILED, "outputs": result,
@@ -1203,14 +1334,17 @@ def _run_engine_adapter(
         raw = run_fn(plan, push_log, stop_event)
     except Exception as e:  # noqa: BLE001
         step["status"] = STEP_FAILED
-        step["error"] = str(e)
+        safe_error = safe_error_summary(e)
+        step["error"] = safe_error
         step["finished_at"] = _now_str()
         return {
             "success": False, "status": STEP_FAILED, "outputs": {},
-            "assets": [], "metrics": {}, "warnings": [], "error": str(e),
+            "assets": [], "metrics": {}, "warnings": [], "error": safe_error,
         }
+    if _stop_requested(stop_event):
+        return _cancelled_step_result(step, "步骤执行后收到取消请求，结果不会登记")
     if not raw or raw.get("success") is not True:
-        err = (raw or {}).get("error") or "引擎未生成结果"
+        err = sanitize_external_text((raw or {}).get("error") or "引擎未生成结果")
         step["status"] = STEP_FAILED
         step["error"] = err
         step["finished_at"] = _now_str()
@@ -1230,7 +1364,26 @@ def _run_engine_adapter(
             "success": False, "status": STEP_FAILED, "outputs": raw,
             "assets": [], "metrics": {}, "warnings": [], "error": step["error"],
         }
-    asset_id = register_fn(plan, raw, verification)
+    if _stop_requested(stop_event):
+        return _cancelled_step_result(step, "输出校验后收到取消请求，结果不会登记")
+    registration_error = ""
+    try:
+        asset_id = register_fn(plan, raw, verification)
+    except Exception as e:  # noqa: BLE001
+        asset_id = None
+        registration_error = f"资产登记异常: {safe_error_summary(e)}"
+    if _stop_requested(stop_event):
+        return _cancelled_step_result(step, "资产登记后收到取消请求，结果不会提交")
+    if not asset_id:
+        step["status"] = STEP_FAILED
+        step["error"] = registration_error or "输出校验通过但资产登记失败"
+        step["finished_at"] = _now_str()
+        push_log(f"[WF:{workflow.get('workflow_id')[:8]}] ❌ {step['error']}")
+        return {
+            "success": False, "status": STEP_FAILED, "outputs": raw,
+            "assets": [], "metrics": {}, "warnings": [],
+            "error": step["error"],
+        }
     step["asset_id"] = asset_id
     step["status"] = STEP_SUCCEEDED
     step["finished_at"] = _now_str()
@@ -1257,17 +1410,71 @@ def _find_step(workflow: Dict[str, Any], step_id: str) -> Optional[Dict[str, Any
 # ---------------------------------------------------------------
 #  7. E1 / M5 / PDF 资产登记（workflow 侧；key 约定与 app.py 一致）
 # ---------------------------------------------------------------
+def _nonempty_path(path: Any) -> bool:
+    """Postflight gate: an asset path must exist and contain bytes."""
+    try:
+        return bool(path) and os.path.isfile(str(path)) and os.path.getsize(str(path)) > 0
+    except OSError:
+        return False
+
+
 def _load_assets_registry(registry_path: Optional[str] = None) -> Dict[str, Any]:
     path = registry_path or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "assets_registry.json")
-    if os.path.isfile(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data if isinstance(data, dict) else {}
-        except Exception:  # noqa: BLE001
-            return {}
-    return {}
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        _preserve_corrupt_assets_registry(path)
+        raise ValueError("成果资产注册表 JSON 无效；原文件已保留，已停止写入。") from exc
+    except OSError:
+        raise
+    valid, errors = valid_entries(data)
+    if errors:
+        _preserve_corrupt_assets_registry(path)
+        raise ValueError("成果资产注册表记录结构无效；原文件已保留，已停止写入。")
+    return valid
+
+
+def _preserve_corrupt_file(path: str) -> Optional[str]:
+    """保留损坏的持久化 JSON，避免后续增量写入覆盖原始证据。"""
+    if not os.path.isfile(path):
+        return None
+    stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    backup = f"{path}.corrupt-{stamp}"
+    suffix = 1
+    while os.path.exists(backup):
+        backup = f"{path}.corrupt-{stamp}-{suffix}"
+        suffix += 1
+    try:
+        shutil.copy2(path, backup)
+    except OSError:
+        return None
+    return backup
+
+
+def _preserve_corrupt_assets_registry(path: str) -> Optional[str]:
+    """保留损坏资产注册表证据，避免后续增量登记覆盖原文件。"""
+    return _preserve_corrupt_file(path)
+
+
+def load_assets_registry(registry_path: Optional[str] = None) -> Dict[str, Any]:
+    """读取成果资产注册表的公共只读入口。
+
+    业务调用方不应自行导入不存在的 ``assets_registry`` 模块，也不应重复
+    实现 JSON 读取逻辑；保留 `_load_assets_registry` 供历史内部调用兼容。
+    """
+    return _load_assets_registry(registry_path)
+
+
+def save_assets_registry(registry: Dict[str, Any], registry_path: Optional[str] = None) -> None:
+    """Validate and atomically persist the shared workflow asset registry."""
+    ensure_valid_registry(registry)
+    path = registry_path or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "assets_registry.json")
+    _atomic_write_json(path, registry)
 
 
 def _save_assets_registry(reg: Dict[str, Any],
@@ -1275,6 +1482,7 @@ def _save_assets_registry(reg: Dict[str, Any],
     path = registry_path or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "assets_registry.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    ensure_valid_registry(reg)
     _atomic_write_json(path, reg)
 
 
@@ -1283,6 +1491,8 @@ def _register_e1_workflow_asset(task_id: str, report: Optional[Dict[str, Any]],
     if not report:
         return None
     import e1_agent_loop
+    if not _nonempty_path((report or {}).get("report_path")):
+        return None
     reg = _load_assets_registry((exec_ctx or {}).get("registry_path"))
     key = f"{task_id}_e1"
     map_path = e1_agent_loop.pick_e1_map_path(report)
@@ -1305,6 +1515,8 @@ def _register_m5_workflow_asset(task_id: str, report: Optional[Dict[str, Any]],
     if not report:
         return None
     import m5_agent_loop
+    if not _nonempty_path((report or {}).get("report_path")):
+        return None
     reg = _load_assets_registry((exec_ctx or {}).get("registry_path"))
     key = f"{task_id}_m5"
     map_path = m5_agent_loop.pick_m5_map_path(report)
@@ -1333,7 +1545,13 @@ def _register_m5_workflow_asset(task_id: str, report: Optional[Dict[str, Any]],
 
 def _register_report_asset(task_id: str, report_path: Optional[str],
                            *, exec_ctx: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    if not report_path or not os.path.isfile(str(report_path)):
+    # Registration is a postflight commit: an existing but empty path is not
+    # evidence that report generation completed successfully.
+    if (
+        not report_path
+        or not os.path.isfile(str(report_path))
+        or os.path.getsize(str(report_path)) <= 0
+    ):
         return None
     reg = _load_assets_registry((exec_ctx or {}).get("registry_path"))
     key = f"{task_id}_report"
@@ -1360,6 +1578,26 @@ def run_analysis_workflow(
     stop_event: Optional[Any] = None,
     max_steps: int = 100,
 ) -> Dict[str, Any]:
+    """Execute one workflow under a process-local workflow identity lock."""
+    wf_id = str(workflow.get("workflow_id") or "")
+    with _workflow_lock(wf_id):
+        return _run_analysis_workflow_impl(
+            workflow,
+            exec_ctx=exec_ctx,
+            push_log=push_log,
+            stop_event=stop_event,
+            max_steps=max_steps,
+        )
+
+
+def _run_analysis_workflow_impl(
+    workflow: Dict[str, Any],
+    *,
+    exec_ctx: Optional[Dict[str, Any]] = None,
+    push_log: Callable[[str], None] = print,
+    stop_event: Optional[Any] = None,
+    max_steps: int = 100,
+) -> Dict[str, Any]:
     """完整 DAG 执行：一次只跑一个重型步骤，直到终态。
 
     返回最终结果（写入 workflow["final_result"]）。
@@ -1367,12 +1605,36 @@ def run_analysis_workflow(
     wf_id = str(workflow.get("workflow_id") or "")
     push_log(f"[WF:{wf_id[:8]}] 潮滩分析 Workflow 开始执行")
 
+    if not workflow.get("confirmed"):
+        return _finalize_result(
+            workflow,
+            status=workflow.get("status") or WF_PENDING,
+            errors=["Workflow 尚未确认，拒绝执行任何外部步骤"],
+        )
+    if workflow.get("status") == WF_CANCELLED:
+        return _finalize_result(
+            workflow, status=WF_CANCELLED, errors=["Workflow 已取消，拒绝重新启动"]
+        )
+    if workflow.get("status") in {
+        WF_SUCCEEDED, WF_COMPLETED_WITH_WARNINGS, WF_FAILED,
+    }:
+        return workflow.get("final_result") or _finalize_result(
+            workflow, status=workflow["status"]
+        )
+
+    changes = check_params_changed(workflow)
+    if changes:
+        push_log(f"[WF:{wf_id[:8]}] ⏸ 参数变化，需要重新确认: {'; '.join(changes)}")
+        return _finalize_result(
+            workflow,
+            status=WF_PAUSED,
+            errors=[f"参数变化需重新确认: {'; '.join(changes)}"],
+        )
+
     if workflow.get("status") == WF_PAUSED:
-        changes = check_params_changed(workflow)
-        if changes:
-            push_log(f"[WF:{wf_id[:8]}] ⏸ 参数变化，需要重新确认: {'; '.join(changes)}")
-            return _finalize_result(workflow, status=WF_PAUSED,
-                                    errors=[f"参数变化需重新确认: {'; '.join(changes)}"])
+        return _finalize_result(
+            workflow, status=WF_PAUSED, errors=["Workflow 处于暂停状态，需重新确认后执行"]
+        )
 
     workflow["status"] = WF_RUNNING
     workflow["updated_at"] = _now_str()
@@ -1407,8 +1669,34 @@ def run_analysis_workflow(
             break
         step = ready[0]
         step["status"] = STEP_RUNNING
-        result = run_workflow_step(step, workflow, exec_ctx=exec_ctx,
-                                   push_log=push_log, stop_event=stop_event)
+        _heavy_slot = step.get("tool") in HEAVY_TOOLS
+        if _heavy_slot:
+            _acquire_heavy_slot(wf_id)
+        try:
+            result = run_workflow_step(step, workflow, exec_ctx=exec_ctx,
+                                       push_log=push_log, stop_event=stop_event)
+        finally:
+            if _heavy_slot:
+                _release_heavy_slot(wf_id)
+        if stop_event and stop_event.is_set():
+            step["status"] = STEP_CANCELLED
+            step["asset_id"] = None
+            step["error"] = "步骤完成后收到取消请求，迟到成功不予提交"
+            result = dict(result or {})
+            result.update({
+                "success": False,
+                "status": STEP_CANCELLED,
+                "assets": [],
+                "error": step["error"],
+            })
+            step["result"] = result
+            step["finished_at"] = _now_str()
+            workflow["status"] = WF_CANCELLED
+            workflow["updated_at"] = _now_str()
+            _ledger_upsert(workflow, status=WF_CANCELLED, note="stopped_after_step")
+            return _finalize_result(
+                workflow, status=WF_CANCELLED, errors=[step["error"]]
+            )
         status = result.get("status") or step.get("status")
         if result.get("success"):
             step["status"] = status if status in STEP_TERMINAL else STEP_SUCCEEDED
@@ -1443,6 +1731,10 @@ def run_analysis_workflow(
     workflow["status"] = final
     workflow["updated_at"] = _now_str()
     _ledger_upsert(workflow, status=final, note="finished")
+    try:
+        record_workflow_lineage(workflow)
+    except Exception as exc:  # noqa: BLE001
+        push_log(f"[WF:{wf_id[:8]}] ⚠️ 血缘记录失败: {safe_error_summary(exc)}")
     return _finalize_result(workflow, status=final)
 
 
@@ -1456,7 +1748,7 @@ def _evaluate_workflow_status(workflow: Dict[str, Any]) -> str:
     if required_failed:
         return WF_FAILED
     optional_failed = any(
-        not s.get("required") and s.get("status") == STEP_FAILED
+        not s.get("required") and s.get("status") in (STEP_FAILED, STEP_BLOCKED)
         for s in steps
     )
     pending = any(s.get("status") == STEP_PENDING for s in steps)
@@ -1469,6 +1761,15 @@ def _evaluate_workflow_status(workflow: Dict[str, Any]) -> str:
     if optional_failed or any(s.get("status") == STEP_SKIPPED for s in steps):
         return WF_COMPLETED_WITH_WARNINGS
     return WF_SUCCEEDED
+
+
+def workflow_result_timeline_status(status: Optional[str]) -> str:
+    """Map a workflow result to the timeline status without hiding warnings."""
+    if status == WF_SUCCEEDED:
+        return "SUCCEEDED"
+    if status == WF_COMPLETED_WITH_WARNINGS:
+        return "WARNING"
+    return "FAILED"
 
 
 def _finalize_result(
@@ -1503,9 +1804,10 @@ def _finalize_result(
             warnings.append(
                 f"步骤 {TOOL_LABELS.get(s.get('tool'), s.get('tool'))} 已跳过"
                 f"（条件：{s.get('condition') or '—'}）")
-        elif s.get("status") == STEP_FAILED and not s.get("required"):
+        elif s.get("status") in (STEP_FAILED, STEP_BLOCKED) and not s.get("required"):
+            issue = "被阻塞" if s.get("status") == STEP_BLOCKED else "失败"
             warnings.append(
-                f"可选步骤 {TOOL_LABELS.get(s.get('tool'), s.get('tool'))} 失败"
+                f"可选步骤 {TOOL_LABELS.get(s.get('tool'), s.get('tool'))} {issue}"
                 f"（不影响主流程）: {s.get('error') or '—'}")
 
     result: Dict[str, Any] = {
@@ -1707,9 +2009,13 @@ def _load_lineage_index() -> Dict[str, Any]:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return data if isinstance(data, dict) else {}
-        except Exception:  # noqa: BLE001
-            return {}
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            _preserve_corrupt_file(path)
+            raise ValueError("工作流血缘索引 JSON 无效；原文件已保留，已停止写入。") from exc
+        if not isinstance(data, dict) or any(not isinstance(v, dict) for v in data.values()):
+            _preserve_corrupt_file(path)
+            raise ValueError("工作流血缘索引记录结构无效；原文件已保留，已停止写入。")
+        return data
     return {}
 
 
@@ -1752,6 +2058,7 @@ def record_workflow_lineage(workflow: Dict[str, Any]) -> None:
     """执行结束后，按步骤资产链记录完整血缘。"""
     wf_id = str(workflow.get("workflow_id") or "")
     steps = workflow.get("steps") or []
+    code_commit = _git_head_or_unknown()
     for s in steps:
         asset_id = s.get("asset_id")
         if not asset_id:
@@ -1770,7 +2077,7 @@ def record_workflow_lineage(workflow: Dict[str, Any]) -> None:
                 "tool": s.get("tool"),
                 "plan_id": s.get("plan_id"),
                 "step_id": s.get("step_id"),
-                "code_commit": _git_head_or_unknown(),
+                "code_commit": code_commit,
             },
         )
 
@@ -1786,17 +2093,50 @@ def _asset_type_for_tool(tool: Optional[str]) -> str:
 
 
 def _git_head_or_unknown() -> str:
-    try:
-        import subprocess
-        r = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-            capture_output=True, text=True, timeout=3,
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip()
-    except Exception:  # noqa: BLE001
-        pass
+    """Read a short commit id without forking from a threaded Streamlit process.
+
+    Calling ``subprocess.run(['git', ...])`` after Streamlit/Gateway starts
+    worker threads can trigger macOS fork-with-threads crashes (especially on
+    Python 3.11).  The git metadata is plain text, so resolve HEAD and packed
+    refs directly and fall back to ``unknown`` when the checkout is unavailable.
+    """
+    candidate = os.environ.get("CSTF_GIT_COMMIT") or os.environ.get("GIT_COMMIT")
+    if not candidate:
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        git_path = os.path.join(repo_root, ".git")
+        try:
+            if os.path.isfile(git_path):
+                with open(git_path, "r", encoding="utf-8") as handle:
+                    git_path = handle.read().strip()
+                if git_path.startswith("gitdir:"):
+                    git_path = git_path.split(":", 1)[1].strip()
+                    if not os.path.isabs(git_path):
+                        git_path = os.path.normpath(os.path.join(repo_root, git_path))
+            head_path = os.path.join(git_path, "HEAD")
+            with open(head_path, "r", encoding="utf-8") as handle:
+                head = handle.read().strip()
+            if head.startswith("ref: "):
+                ref = head[5:].strip()
+                ref_path = os.path.join(git_path, ref)
+                if os.path.isfile(ref_path):
+                    with open(ref_path, "r", encoding="utf-8") as handle:
+                        candidate = handle.read().strip()
+                else:
+                    packed = os.path.join(git_path, "packed-refs")
+                    if os.path.isfile(packed):
+                        with open(packed, "r", encoding="utf-8") as handle:
+                            for line in handle:
+                                parts = line.strip().split(" ", 1)
+                                if len(parts) == 2 and parts[1] == ref:
+                                    candidate = parts[0]
+                                    break
+            else:
+                candidate = head
+        except OSError:  # noqa: BLE001
+            candidate = ""
+    match = re.match(r"^[0-9a-fA-F]{7,40}$", str(candidate or "").strip())
+    if match:
+        return match.group(0)[:7].lower()
     return "unknown"
 
 
@@ -1826,15 +2166,39 @@ def load_workflow_ledger(ledger_path: Optional[str] = None) -> Dict[str, Any]:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return data if isinstance(data, dict) else {}
-        except Exception:  # noqa: BLE001
-            return {}
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            _preserve_corrupt_file(path)
+            raise ValueError("工作流账本 JSON 无效；原文件已保留，已停止写入。") from exc
+        if not isinstance(data, dict) or any(not isinstance(v, dict) for v in data.values()):
+            _preserve_corrupt_file(path)
+            raise ValueError("工作流账本记录结构无效；原文件已保留，已停止写入。")
+        return data
     return {}
 
 
 def save_workflow_ledger(ledger: Dict[str, Any],
                          ledger_path: Optional[str] = None) -> None:
     _atomic_write_json(ledger_path or WORKFLOW_LEDGER_PATH, ledger)
+
+
+def _ledger_safe_copy(value: Any, key: str = "") -> Any:
+    """Copy recovery data while removing credential-like fields."""
+    low_key = str(key or "").lower()
+    if any(token in low_key for token in ("token", "secret", "password", "api_key", "credential")):
+        return "<redacted>"
+    if isinstance(value, dict):
+        return {str(k): _ledger_safe_copy(v, str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_ledger_safe_copy(item, key) for item in value]
+    if isinstance(value, tuple):
+        return [_ledger_safe_copy(item, key) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        text = str(value) if isinstance(value, str) else value
+        if isinstance(text, str):
+            text = re.sub(r"(?i)(https?://)([^/@\s]+):([^/@\s]+)@", r"\1<redacted>@", text)
+            return text[:20_000]
+        return text
+    return str(value)[:20_000]
 
 
 def _ledger_upsert(workflow: Dict[str, Any], *, status: str, note: str = "") -> None:
@@ -1845,19 +2209,39 @@ def _ledger_upsert(workflow: Dict[str, Any], *, status: str, note: str = "") -> 
     ledger = load_workflow_ledger()
     row = dict(ledger.get(wf_id) or {})
     row.update({
+        "schema": workflow.get("schema") or WORKFLOW_SCHEMA,
         "workflow_id": wf_id,
         "task_id": workflow.get("task_id"),
         "status": status,
         "goal": workflow.get("goal"),
+        "context": _ledger_safe_copy(workflow.get("context") or {}),
+        "intent": _ledger_safe_copy(workflow.get("intent") or {}),
+        "confirmed": bool(workflow.get("confirmed")),
+        "confirmation_source": workflow.get("confirmation_source"),
+        "approved_params": _ledger_safe_copy(workflow.get("approved_params")),
+        "approved_spec_hash": workflow.get("approved_spec_hash"),
+        "spec_hash": workflow.get("spec_hash"),
+        "revision": int(workflow.get("revision") or 1),
+        "approved_revision": workflow.get("approved_revision"),
         "steps": {
             s["step_id"]: {
                 "tool": s.get("tool"),
                 "status": s.get("status"),
                 "plan_id": s.get("plan_id"),
                 "asset_id": s.get("asset_id"),
+                "depends_on": list(s.get("depends_on") or []),
+                "optional_depends_on": list(s.get("optional_depends_on") or []),
+                "required": bool(s.get("required")),
+                "condition": s.get("condition"),
+                "error": _ledger_safe_copy(s.get("error")),
+                "started_at": s.get("started_at"),
+                "finished_at": s.get("finished_at"),
             }
             for s in workflow.get("steps") or []
         },
+        "warnings": _ledger_safe_copy(workflow.get("warnings") or []),
+        "blockers": _ledger_safe_copy(workflow.get("blockers") or []),
+        "errors": _ledger_safe_copy(workflow.get("errors") or []),
         "note": note,
         "updated_at": _now_str(),
     })
@@ -1883,28 +2267,39 @@ def load_workflow(workflow_id: str,
     if not row:
         return None
     wf: Dict[str, Any] = {
-        "schema": WORKFLOW_SCHEMA,
+        "schema": row.get("schema") or WORKFLOW_SCHEMA,
         "workflow_id": row["workflow_id"],
         "task_id": row.get("task_id"),
         "goal": row.get("goal"),
         "status": row.get("status"),
-        "context": {},
-        "intent": {},
+        "context": copy.deepcopy(row.get("context") or {}),
+        "intent": copy.deepcopy(row.get("intent") or {}),
         "steps": [
             {
                 "step_id": k, "tool": v.get("tool"),
                 "status": v.get("status"),
                 "plan_id": v.get("plan_id"),
                 "asset_id": v.get("asset_id"),
-                "depends_on": [], "required": False, "condition": None,
-                "result": None, "error": None,
-                "started_at": None, "finished_at": None,
+                "depends_on": list(v.get("depends_on") or []),
+                "optional_depends_on": list(v.get("optional_depends_on") or []),
+                "required": bool(v.get("required")),
+                "condition": v.get("condition"),
+                "result": None, "error": v.get("error"),
+                "started_at": v.get("started_at"),
+                "finished_at": v.get("finished_at"),
             }
             for k, v in (row.get("steps") or {}).items()
         ],
-        "confirmed": row.get("status") in (WF_CONFIRMED, WF_RUNNING),
-        "approved_params": None,
-        "warnings": [], "blockers": [], "errors": [],
+        "confirmed": bool(row.get("confirmed")) or row.get("status") in (WF_CONFIRMED, WF_RUNNING),
+        "confirmation_source": row.get("confirmation_source"),
+        "approved_params": copy.deepcopy(row.get("approved_params")),
+        "approved_spec_hash": row.get("approved_spec_hash"),
+        "spec_hash": row.get("spec_hash"),
+        "revision": int(row.get("revision") or 1),
+        "approved_revision": row.get("approved_revision"),
+        "warnings": list(row.get("warnings") or []),
+        "blockers": list(row.get("blockers") or []),
+        "errors": list(row.get("errors") or []),
         "assets": {}, "final_result": None,
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),

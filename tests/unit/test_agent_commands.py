@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import copy
 import json
+import ntpath
 import os
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 _TF_AGENT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "TF-agent"))
 if _TF_AGENT not in sys.path:
@@ -52,6 +55,68 @@ class TestParseSystemCommand(unittest.TestCase):
         self.assertIsNone(parse_system_command("今天天气不错"))
 
 
+class TestCommandSchemaBoundary(unittest.TestCase):
+    def test_out_of_range_map_does_not_mutate_state(self):
+        state = {"sentinel": "keep"}
+        result = apply_system_command(state, {"map": {"lat": 91, "lon": 120, "zoom": 8}})
+        self.assertFalse(result.applied)
+        self.assertTrue(result.errors)
+        self.assertEqual(state, {"sentinel": "keep"})
+
+    def test_unknown_top_level_field_is_rejected(self):
+        state = {}
+        result = apply_system_command(state, {"debug": True})
+        self.assertFalse(result.applied)
+        self.assertEqual(state, {})
+
+    def test_unknown_action_type_is_rejected_before_queue(self):
+        state = {}
+        accepted = __import__("agent_command_bridge").queue_agent_command(
+            state, {"pending_action": {"type": "delete_everything"}}
+        )
+        self.assertFalse(accepted)
+        self.assertNotIn("_pending_agent_commands", state)
+
+    def test_legacy_command_is_normalized_by_same_schema(self):
+        state = {}
+        result, _ = apply_agent_reply_immediate(
+            state, "COMMAND_UPDATE_MAP|30.2|121.5|11"
+        )
+        self.assertTrue(result.applied)
+        self.assertEqual(state["map_center"], [30.2, 121.5])
+
+    def test_nested_m4_schema_rejects_reversed_dates_before_state_mutation(self):
+        state = _base_state()
+        result = apply_system_command(
+            state,
+            {
+                "pending_action": {
+                    "type": "run_m4",
+                    "confirmed": True,
+                    "m4_params": {"start_date": "2020-06-30", "end_date": "2020-06-01"},
+                },
+            },
+        )
+        self.assertFalse(result.applied)
+        self.assertNotIn("pending_task", state)
+
+    def test_nested_m4_schema_normalizes_date_and_numeric_bounds(self):
+        from agent_command_schema import validate_system_command
+
+        command = validate_system_command(
+            {
+                "pending_action": {
+                    "type": "run_m4",
+                    "confirmed": True,
+                    "m4_params": {"start_date": "2020-06-01", "cloud_limit": 120},
+                }
+            }
+        )
+        params = command["pending_action"]["m4_params"]
+        self.assertEqual(params["start_date"].isoformat(), "2020-06-01")
+        self.assertEqual(params["cloud_limit"], 100)
+
+
 class TestDeltaMerge(unittest.TestCase):
     def test_unmentioned_params_preserved(self):
         state = _base_state()
@@ -68,6 +133,19 @@ class TestDeltaMerge(unittest.TestCase):
         self.assertEqual(state["ui_prob_th"], 0.05)
         self.assertEqual(state["ui_min_cnt"], before["ui_min_cnt"])
         self.assertEqual(state["ui_m5_enabled"], before["ui_m5_enabled"])
+
+    def test_flush_exception_is_sanitized_before_ui_warning(self):
+        state = {"_pending_agent_commands": [{"type": "map"}]}
+        with mock.patch(
+            "agent_command_bridge.apply_system_command",
+            side_effect=RuntimeError(
+                "failed /Users/chl/private/file.tif token=sk-secret"
+            ),
+        ):
+            result = flush_pending_agent_commands(state)
+        text = " ".join(result.errors)
+        self.assertNotIn("/Users/", text)
+        self.assertNotIn("sk-secret", text)
 
     def test_null_fields_skipped(self):
         state = _base_state()
@@ -110,6 +188,16 @@ class TestPendingActions(unittest.TestCase):
         self.assertEqual(pt["mode"], "dl")
         self.assertIn("force_rerun", pt)
 
+    def test_manual_inference_plan_preserves_force_rerun_flag(self):
+        state = _base_state()
+        state["ui_force_rerun"] = True
+        # 计划本身会因真实输入缺失而阻断，但 force_rerun 必须仍被保留，
+        # 以便真实 UI 资源就绪后确认执行时不误用旧成果。
+        from agent_command_bridge import propose_inference_plan
+
+        plan, _ = propose_inference_plan(state, {"task": "24zhejiang1"})
+        self.assertTrue(plan["force_rerun"])
+
     def test_run_m4_schema(self):
         state = _base_state()
         cmd = {
@@ -150,6 +238,85 @@ class TestPendingActions(unittest.TestCase):
         pt, _, errs = build_pending_task(state, {"type": "run_pipeline"})
         self.assertIsNone(pt)
         self.assertTrue(errs)
+
+
+class TestWorkflowPreflightBridge(unittest.TestCase):
+    def _workflow_action(self, root: str) -> dict:
+        return {
+            "task": "p1",
+            "aoi": {
+                "type": "Polygon",
+                "coordinates": [[[120.0, 30.0], [121.0, 30.0], [121.0, 31.0],
+                                  [120.0, 31.0], [120.0, 30.0]]],
+            },
+            "root_dir": root,
+            "final_root": root,
+            "mask_root": root,
+            "export_to": "local",
+        }
+
+    def test_workflow_preflight_calls_real_validator(self):
+        import workflow_orchestrator as wo
+        from agent_command_bridge import propose_workflow_plan
+
+        with tempfile.TemporaryDirectory() as td:
+            state = _base_state()
+            with mock.patch.object(
+                wo, "validate_analysis_workflow", wraps=wo.validate_analysis_workflow
+            ) as validator:
+                plan, _ = propose_workflow_plan(state, self._workflow_action(td))
+
+            self.assertTrue(validator.called)
+            self.assertTrue(plan.get("blockers"))
+            self.assertTrue(any("GEE" in blocker for blocker in plan["blockers"]))
+
+    def test_workflow_preflight_failure_is_visible_and_sanitized(self):
+        import workflow_orchestrator as wo
+        from agent_command_bridge import propose_workflow_plan
+
+        with tempfile.TemporaryDirectory() as td:
+            state = _base_state()
+            with mock.patch.object(
+                wo,
+                "validate_analysis_workflow",
+                side_effect=RuntimeError("internal path /Users/private/secret"),
+            ):
+                plan, errors = propose_workflow_plan(state, self._workflow_action(td))
+
+            messages = list(plan.get("blockers") or []) + list(errors)
+            self.assertTrue(any("Workflow 全局校验失败" in message for message in messages))
+            self.assertFalse(any("/Users/private/secret" in message for message in messages))
+
+    def test_workflow_blockers_reject_confirmed_run(self):
+        from agent_command_bridge import apply_system_command, propose_workflow_plan
+
+        with tempfile.TemporaryDirectory() as td:
+            state = _base_state()
+            plan, _ = propose_workflow_plan(state, self._workflow_action(td))
+            result = apply_system_command(
+                state,
+                {
+                    "pending_action": {
+                        "type": "run_workflow",
+                        "confirmed": True,
+                        "workflow_id": plan["workflow_id"],
+                    }
+                },
+            )
+
+            self.assertFalse(result.action_type == "run_workflow")
+            self.assertTrue(any("全局校验" in error for error in result.errors))
+            self.assertNotIn("pending_task", state)
+
+    def test_optional_reference_and_baseline_are_warnings(self):
+        from agent_command_bridge import propose_workflow_plan
+
+        with tempfile.TemporaryDirectory() as td:
+            state = _base_state()
+            plan, _ = propose_workflow_plan(state, self._workflow_action(td))
+            warnings = " ".join(plan.get("warnings") or [])
+            self.assertIn("E1", warnings)
+            self.assertIn("M5", warnings)
 
 
 class TestCoercion(unittest.TestCase):
@@ -220,7 +387,10 @@ class TestStreamlitDeferQueue(unittest.TestCase):
             + "\n[/SYSTEM_COMMAND_JSON]"
         )
         apply_agent_reply_immediate(state, reply)
-        self.assertEqual(state["ui_root_dir"], "E:\\Data\\test")
+        self.assertEqual(state["ui_root_dir"], os.path.normpath("E:/Data/test"))
+
+    def test_windows_path_fixture_uses_windows_semantics(self):
+        self.assertEqual(ntpath.normpath(r"E:/Data/test"), r"E:\Data\test")
 
     def test_scenario_b_e1(self):
         state = _base_state()

@@ -3,7 +3,7 @@ import re
 import base64
 import io
 import threading
-from typing import Optional
+from typing import Optional, Sequence
 
 # Workaround for Windows OpenMP runtime duplication from mixed scientific deps.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -16,9 +16,13 @@ from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage
 from langgraph.prebuilt import create_react_agent
+from llm_backend import BackendUnavailable, LLMBackendConfig, build_chat_model
+from agent_context_policy import redact_spatial_metadata, sanitize_external_text
 
+# Respect explicitly injected environment values (CI, remote gateway and
+# isolated tests). The ignored local .env remains the fallback for developers.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(_THIS_DIR, ".env"), override=True)
+load_dotenv(os.path.join(_THIS_DIR, ".env"), override=False)
 load_dotenv(override=False)
 
 
@@ -38,12 +42,13 @@ def _get_knowledge_collection():
         if _kb_collection is not None:
             return _kb_collection
         print("[CSTF-Agent] 首次触发文献检索，正在连接本地 Chroma 并加载 BGE 嵌入模型…")
-        _db_default = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rs_knowledge_db")
-        db_path = os.environ.get("CHROMA_RS_DB_PATH", _db_default)
+        from knowledge_store import knowledge_db_path, knowledge_embedding_model
+
+        db_path = knowledge_db_path()
         os.makedirs(db_path, exist_ok=True)
         chroma_client = chromadb.PersistentClient(path=db_path)
         bge_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name="BAAI/bge-small-zh-v1.5"
+            model_name=knowledge_embedding_model()
         )
         _kb_collection = chroma_client.get_or_create_collection(
             name="remote_sensing_papers",
@@ -62,11 +67,11 @@ def search_knowledge_base(keywords: str) -> str:
     """
     print(f"\n[Agent 后台动作] 🚀 正在调用 ChromaDB 检索文献，关键词：{keywords}")
 
-    collection = _get_knowledge_collection()
-    results = collection.query(
-        query_texts=[keywords],
-        n_results=2
-    )
+    try:
+        collection = _get_knowledge_collection()
+        results = collection.query(query_texts=[keywords], n_results=2)
+    except Exception:
+        return "本地知识库当前不可用（可能为空、损坏或 embedding 模型未准备好）；未获得可引用资料。"
 
     docs_batch = results.get("documents") or []
     if not docs_batch or not docs_batch[0]:
@@ -74,8 +79,18 @@ def search_knowledge_base(keywords: str) -> str:
 
     metas_batch = results.get("metadatas") or [[]]
     retrieved_context = "【系统从本地数据库中检索到的权威资料如下】：\n"
-    for i, (doc, meta) in enumerate(zip(docs_batch[0], metas_batch[0] if metas_batch else [])):
-        retrieved_context += f"文献 {i+1} (来源: {meta['source']}): {doc}\n"
+    docs = docs_batch[0]
+    metas = metas_batch[0] if metas_batch else []
+    for i, doc in enumerate(docs):
+        meta = metas[i] if i < len(metas) and isinstance(metas[i], dict) else {}
+        source = redact_spatial_metadata(sanitize_external_text(meta.get("source", "未知来源")))[:240]
+        content = redact_spatial_metadata(sanitize_external_text(doc))[:1200]
+        candidate = f"文献 {i+1} (来源: {source}): {content}\n"
+        # Keep retrieval context bounded even when a backend ignores the
+        # requested result size or returns unusually long documents.
+        if len(retrieved_context) + len(candidate) > 4200:
+            break
+        retrieved_context += candidate
         
     retrieved_context += "\n请基于以上检索到的真实资料回答用户的问题，必须在回答中引用文献来源，严禁自行编造公式或法规内容！"
     
@@ -552,26 +567,20 @@ def confirm_gee_download(plan_id: Optional[str] = None) -> str:
 #   QWEN_CHAT_MODEL=qwen-vl-plus       # 需要上传图片解译时改用 VL 系列（qwen-vl-plus / qwen-vl-max）
 #
 # 控制台与计费：https://bailian.console.aliyun.com/  → API-KEY
-_dash_key = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("QWEN_API_KEY")
-_qwen_base = os.environ.get("QWEN_OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-_qwen_model = os.environ.get("QWEN_CHAT_MODEL", "qwen-plus")
-_tiff_mode = os.environ.get("YYNET_TIFF_MODE", "auto").strip().lower()  # auto/native/png
-_attach_geo_meta = os.environ.get("YYNET_ATTACH_GEO_META", "1").strip().lower() not in {"0", "false", "no"}
+_backend_config = LLMBackendConfig.from_env()
+_dash_key = _backend_config.api_key
+_qwen_base = _backend_config.base_url
+_qwen_model = _backend_config.model
+_tiff_mode = os.environ.get("YYNET_TIFF_MODE", "auto").strip().lower()  # legacy local preview mode; external TIFF always PNG
+_attach_geo_meta = os.environ.get("YYNET_ATTACH_GEO_META", "0").strip().lower() not in {"0", "false", "no"}
 _tiff_auto_png_mb = float(os.environ.get("YYNET_TIFF_AUTO_PNG_MB", "12"))
 _vlm_max_side = int(os.environ.get("YYNET_VLM_MAX_SIDE", "2048"))
 
-if not _dash_key:
-    raise RuntimeError(
-        "未检测到 API Key：请设置环境变量 DASHSCOPE_API_KEY（或 QWEN_API_KEY）。"
-        "获取方式：阿里云百炼控制台 → API-KEY。"
-    )
-
-llm = ChatOpenAI(
-    model=_qwen_model,
-    api_key=_dash_key,
-    base_url=_qwen_base,
-    temperature=0.1,
-)
+try:
+    # 只构造轻量客户端，不在导入阶段发起网络请求；无 Key 时保持手动工作台可用。
+    llm = build_chat_model(_backend_config, require_tools=True)
+except BackendUnavailable:
+    llm = None
 
 tools = [
     dispatch_system_command,
@@ -598,7 +607,7 @@ system_prompt_base = """你是 CSTF-Copilot，遥感潮滩分析平台的对话�
 用户不会按固定句式提问；你必须从碎片化、口语化、多意图混杂的句子中还原真实企图，并调用正确工具。
 
 【回复风格 · 必守】
-- 禁止在回复正文中原样罗列内部路径（如 I:\\GEE_data\\20）、工具代码（gee_download /
+- 禁止在回复正文中原样罗列内部路径（如 <本地路径>）、工具代码（gee_download /
   local_inference / e1_quality / m5_change / pdf_report / run_m4 等）、侧栏快照原文或
   模板占位符；计划/状态展示由系统按真实数据生成，你只需用自然语言概括要点。
 - 涉及数字（scene_count / 精度 / 面积）必须来自工具真实返回，禁止编造或复述猜测值。
@@ -732,7 +741,38 @@ I. **端到端潮滩分析 Workflow（GEE→推理→E1/M5→PDF）**
 - 任务不在硬盘列表时假装能跑"""
 
 
-agent_executor = create_react_agent(llm, tools)
+_agent_executor_lock = threading.Lock()
+agent_executor = None
+_text_model_lock = threading.Lock()
+_text_model = None
+
+
+def _get_agent_executor():
+    """首次真正聊天时构造工具型 Agent；未配置后端时返回 None。"""
+    global agent_executor, llm
+    if agent_executor is not None:
+        return agent_executor
+    with _agent_executor_lock:
+        if agent_executor is not None:
+            return agent_executor
+        if llm is None:
+            try:
+                llm = build_chat_model(_backend_config, require_tools=True)
+            except BackendUnavailable:
+                return None
+        agent_executor = create_react_agent(llm, tools)
+        return agent_executor
+
+
+def _get_text_model():
+    """构造不带工具的纯问答后端，允许本地 text-only 模型参与聊天。"""
+    global _text_model
+    if _text_model is not None:
+        return _text_model
+    with _text_model_lock:
+        if _text_model is None:
+            _text_model = build_chat_model(_backend_config, require_tools=False)
+    return _text_model
 
 
 def _percentile_stretch_to_uint8(arr: np.ndarray, valid_mask: np.ndarray = None) -> np.ndarray:
@@ -810,7 +850,7 @@ def _extract_geotiff_meta_text(image_path: str) -> str:
                 + (f"- finite_pixel_ratio: {finite_ratio:.4f}\n" if finite_ratio is not None else "")
             )
     except Exception as exc:
-        return f"[GeoTIFF metadata unavailable: {exc}]"
+        return f"[GeoTIFF metadata unavailable: {sanitize_external_text(exc)[:240]}]"
 
 
 def _estimate_finite_pixel_ratio(image_path: str, sample_max_side: int = 1024) -> float:
@@ -893,7 +933,9 @@ def _build_image_data_url(image_path: str, force_png_for_tiff: bool = False) -> 
             img.save(buf, format="PNG")
             return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
         except Exception as conv_err:
-            raise RuntimeError(f"TIFF conversion failed: {conv_err}") from conv_err
+            raise RuntimeError(
+                f"TIFF conversion failed: {sanitize_external_text(conv_err)[:240]}"
+            ) from conv_err
 
     mime = {
         ".png": "image/png",
@@ -914,86 +956,172 @@ def chat_with_vlm(
     dataset_catalog_text: str = None,
     sidebar_context: str = None,
     capability_summary: str = None,
+    allow_spatial_metadata: bool = False,
+    allow_external_media: bool = False,
+    image_paths: Optional[Sequence[str]] = None,
 ) -> str:
     """处理对话，完美支持多模态视觉能力与物理感知"""
 
-    task_list_str = ", ".join(available_tasks) if available_tasks else "目前硬盘中没有任何数据"
+    def _model_text(value: object, *, limit: int = 4000) -> str:
+        """Normalize every caller-provided text before it enters model context."""
+        text = sanitize_external_text(value)
+        if not allow_spatial_metadata:
+            text = redact_spatial_metadata(text)
+        return text[:limit]
+
+    requested_image_paths = []
+    if image_path:
+        requested_image_paths.append(os.fspath(image_path))
+    if isinstance(image_paths, (str, os.PathLike)):
+        image_paths = [os.fspath(image_paths)]
+    for candidate in image_paths or []:
+        if not candidate:
+            continue
+        normalized = os.fspath(candidate)
+        if normalized not in requested_image_paths:
+            requested_image_paths.append(normalized)
+    if len(requested_image_paths) > 6:
+        return "单轮最多支持 6 张图片附件，请减少选择数量后重试。"
+
+    # UI 之外的调用者也必须显式获得本轮媒体授权，避免把上传影像
+    # 误送到外部 VLM；文本问答不受此门闩影响。
+    if requested_image_paths and not allow_external_media:
+        return "当前会话未授权向外部模型发送影像内容；请先在会话设置中勾选影像发送授权。"
+
+    existing_image_paths = [path for path in requested_image_paths if os.path.exists(path)]
+
+    executor = _get_agent_executor()
+    if executor is None:
+        # 无 tools 的本地后端仍可提供纯问答；只有控制侧栏/跑任务时才要求工具能力。
+        if existing_image_paths and "vision" not in _backend_config.capabilities:
+            return "当前本地模型只支持文本问答，不支持图片输入；地图和手动任务仍可继续使用。"
+        try:
+            text_model = _get_text_model()
+            text_messages = [SystemMessage(content="你是遥感潮滩分析助手，只回答用户问题，不执行系统命令。")]
+            for msg in chat_history[:-1]:
+                text_messages.append({
+                    "role": msg["role"],
+                    "content": _model_text(msg.get("content", "")),
+                })
+            if existing_image_paths:
+                multimodal_content = [{"type": "text", "text": _model_text(user_input)}]
+                for current_path in existing_image_paths:
+                    image_url = _build_image_data_url(
+                        current_path,
+                        force_png_for_tiff=_is_tiff_path(current_path),
+                    )
+                    multimodal_content.append(
+                        {"type": "image_url", "image_url": {"url": image_url}}
+                    )
+                text_messages.append({"role": "user", "content": multimodal_content})
+            else:
+                text_messages.append({"role": "user", "content": _model_text(user_input)})
+            response = text_model.invoke(text_messages)
+            return str(getattr(response, "content", response) or "").strip()
+        except BackendUnavailable:
+            return (
+                "聊天后端尚未配置或当前后端不支持工具调用。请在被忽略的 .env 中配置 "
+                "DASHSCOPE_API_KEY，或选择已配置的本地后端；本地地图和手动任务仍可继续使用。"
+            )
+        except Exception as exc:
+            return f"纯问答后端调用失败：{type(exc).__name__}。请检查本地模型服务状态。"
+
+    task_list_str = ", ".join(_model_text(task, limit=240) for task in (available_tasks or [])) or "目前硬盘中没有任何数据"
     dynamic_prompt = system_prompt_base + f"\n\n【🚨 硬盘可用任务目录（唯一合法 task 名来源）】\n{task_list_str}"
     if sidebar_context and sidebar_context.strip():
-        dynamic_prompt += "\n\n" + sidebar_context.strip()
+        dynamic_prompt += "\n\n" + _model_text(sidebar_context)
     if dataset_catalog_text and dataset_catalog_text.strip():
-        dynamic_prompt += "\n\n【数据集资产目录 · AutoTune reference_id 从此选取】\n" + dataset_catalog_text.strip()
+        dynamic_prompt += "\n\n【数据集资产目录 · AutoTune reference_id 从此选取】\n" + _model_text(dataset_catalog_text)
     if capability_summary and capability_summary.strip():
         dynamic_prompt += (
             "\n\n【能力状态（只读参考，每轮会话快照一次）】\n"
-            + capability_summary.strip()
+            + _model_text(capability_summary)
             + "\n铁律：已 BLOCKED/UNKNOWN 的能力不得声称执行成功；CONDITIONAL 的能力需先确认前置条件。"
         )
 
     messages = [SystemMessage(content=dynamic_prompt)]
 
     for msg in chat_history[:-1]:
-        messages.append({"role": msg["role"], "content": msg["content"]})
+        messages.append({
+            "role": msg["role"],
+            "content": _model_text(msg.get("content", "")),
+        })
 
-    if image_path and os.path.exists(image_path):
-        if _is_tiff_path(image_path):
-            finite_ratio_est = _estimate_finite_pixel_ratio(image_path)
+    attach_geo_meta = False
+    if existing_image_paths:
+        for attachment_index, current_path in enumerate(existing_image_paths, start=1):
+            if not _is_tiff_path(current_path):
+                continue
+            finite_ratio_est = _estimate_finite_pixel_ratio(current_path)
             if finite_ratio_est <= 0.0:
                 return (
-                    "该 GeoTIFF 在采样检测中未发现任何有效像素（均为 NaN/Inf），"
+                    f"第 {attachment_index} 个 GeoTIFF 在采样检测中未发现任何有效像素（均为 NaN/Inf），"
                     "因此无法进行地物解译。请检查数据源、导出流程或尝试提供未损坏的影像。"
                 )
 
-        image_text = user_input
-        if _attach_geo_meta:
-            meta_text = _extract_geotiff_meta_text(image_path)
-            if meta_text:
-                image_text = f"{user_input}\n\n{meta_text}"
+        image_text = _model_text(user_input)
+        attach_geo_meta = bool(_attach_geo_meta and allow_spatial_metadata)
+        if attach_geo_meta:
+            metadata_chunks = []
+            for attachment_index, current_path in enumerate(existing_image_paths, start=1):
+                meta_text = _extract_geotiff_meta_text(current_path)
+                if meta_text:
+                    metadata_chunks.append(f"[附件 {attachment_index}]\n{meta_text}")
+            if metadata_chunks:
+                image_text = f"{_model_text(user_input)}\n\n" + "\n\n".join(metadata_chunks)
 
-        use_force_png = False
-        if _is_tiff_path(image_path):
-            if _tiff_mode == "png":
-                use_force_png = True
-            elif _tiff_mode == "native":
-                use_force_png = False
-            else:
-                use_force_png = _needs_png_in_auto(image_path)
-
-        image_data_url = _build_image_data_url(image_path, force_png_for_tiff=use_force_png)
-        multimodal_content = [
-            {"type": "text", "text": image_text},
-            {"type": "image_url", "image_url": {"url": image_data_url}},
-        ]
+        # Never send a raw GeoTIFF to an external model.  TIFF tags can carry
+        # CRS/bounds even when textual spatial consent is disabled.  Convert
+        # every TIFF to a metadata-free, bounded PNG first; the legacy
+        # YYNET_TIFF_MODE/native setting is intentionally ignored at this
+        # external-data boundary.
+        multimodal_content = [{"type": "text", "text": image_text}]
+        for current_path in existing_image_paths:
+            image_data_url = _build_image_data_url(
+                current_path,
+                force_png_for_tiff=_is_tiff_path(current_path),
+            )
+            multimodal_content.append(
+                {"type": "image_url", "image_url": {"url": image_data_url}}
+            )
         messages.append({"role": "user", "content": multimodal_content})
     else:
-        messages.append({"role": "user", "content": user_input})
+        messages.append({"role": "user", "content": _model_text(user_input)})
 
     try:
-        response = agent_executor.invoke({"messages": messages})
+        response = executor.invoke({"messages": messages})
     except Exception as e:
         if (
-            image_path
-            and os.path.exists(image_path)
-            and _is_tiff_path(image_path)
+            existing_image_paths
+            and any(_is_tiff_path(path) for path in existing_image_paths)
             and _tiff_mode == "auto"
             and "image format is illegal" in str(e).lower()
         ):
-            image_text = user_input
-            if _attach_geo_meta:
-                meta_text = _extract_geotiff_meta_text(image_path)
-                if meta_text:
-                    image_text = f"{user_input}\n\n{meta_text}"
-            retry_url = _build_image_data_url(image_path, force_png_for_tiff=True)
+            image_text = _model_text(user_input)
+            if attach_geo_meta:
+                metadata_chunks = []
+                for attachment_index, current_path in enumerate(existing_image_paths, start=1):
+                    meta_text = _extract_geotiff_meta_text(current_path)
+                    if meta_text:
+                        metadata_chunks.append(f"[附件 {attachment_index}]\n{meta_text}")
+                if metadata_chunks:
+                    image_text = f"{_model_text(user_input)}\n\n" + "\n\n".join(metadata_chunks)
+            retry_content = [{"type": "text", "text": image_text}]
+            for current_path in existing_image_paths:
+                retry_url = _build_image_data_url(
+                    current_path,
+                    force_png_for_tiff=_is_tiff_path(current_path),
+                )
+                retry_content.append(
+                    {"type": "image_url", "image_url": {"url": retry_url}}
+                )
             retry_messages = messages[:-1] + [
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "text", "text": image_text},
-                        {"type": "image_url", "image_url": {"url": retry_url}},
-                    ],
+                    "content": retry_content,
                 }
             ]
-            response = agent_executor.invoke({"messages": retry_messages})
+            response = executor.invoke({"messages": retry_messages})
         else:
             raise
     output_messages = response["messages"]
@@ -1025,7 +1153,7 @@ def chat_with_vlm(
             }
         )
 
-        response_phase2 = agent_executor.invoke({"messages": messages})
+        response_phase2 = executor.invoke({"messages": messages})
         return response_phase2["messages"][-1].content
 
     return final_reply

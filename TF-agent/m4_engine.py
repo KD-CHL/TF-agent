@@ -11,6 +11,8 @@ import ee
 import geemap
 import geopandas as gpd
 
+from agent_context_policy import safe_error_summary
+
 _EE_INIT_KEY = None
 _PROXY_ENV_KEYS = (
     "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy",
@@ -112,7 +114,9 @@ def ensure_ee_initialized(gee_proxy_url=None, gee_project_id=None, push_log=None
                 )
             else:
                 hint = "请在终端执行: earthengine authenticate（需 VPN/代理）"
-            raise RuntimeError(f"GEE 初始化失败：{hint}\n原始错误: {init_err}") from init_err
+            raise RuntimeError(
+                f"GEE 初始化失败：{hint}\n错误摘要: {safe_error_summary(init_err)}"
+            ) from init_err
     _EE_INIT_KEY = init_key
 
 
@@ -136,7 +140,7 @@ def _gee_error_hint(exc: Exception) -> str:
         return "网络连接失败，请在侧栏填写 GEE 代理（如 http://127.0.0.1:7892）并确认 VPN 可用。"
     if any(k in msg for k in ("not authenticated", "credentials", "permission denied")):
         return "GEE 认证或项目权限异常，请执行 earthengine authenticate 并确认 Project ID。"
-    return f"GEE 查询失败：{exc}"
+    return f"GEE 查询失败：{safe_error_summary(exc)}"
 
 
 def _date_chunks(start_date: str, end_date: str, chunk_days: int = 31):
@@ -151,6 +155,14 @@ def _date_chunks(start_date: str, end_date: str, chunk_days: int = 31):
         chunks.append((cur.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")))
         cur = chunk_end + timedelta(days=1)
     return chunks
+
+
+def _nonempty_file(path: str) -> bool:
+    """Return whether a local export is a concrete, non-empty file."""
+    try:
+        return bool(path) and os.path.isfile(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
 
 
 def _load_roi_geometry(roi_path: str, roi_name: str):
@@ -338,6 +350,7 @@ def run_m4_download(
         region_coords = roi_geom.getInfo()["coordinates"]
         n = len(id_list)
 
+        local_tifs = []
         if export_to == "drive":
             push_log(f"[M4] 向 Google Drive 提交 {n} 个导出任务…")
             for i, img_id in enumerate(id_list):
@@ -359,20 +372,22 @@ def run_m4_download(
                     try:
                         on_task_started(task)
                     except Exception as e:  # noqa: BLE001
-                        push_log(f"  |-- 记录任务失败: {e}")
+                        push_log(f"  |-- 记录任务失败: {safe_error_summary(e)}")
                 if (i + 1) % 5 == 0 or i == n - 1:
                     push_log(f"  |-- 已提交 {i + 1}/{n}")
                 _prog(25 + int(75 * (i + 1) / max(n, 1)))
             push_log("[M4] 全部任务已提交。请在 GEE Code Editor → Tasks 或 Google Drive 查看进度。")
         else:
             push_log(f"[M4] 本地下载至 {local_out_dir}")
+            failed_exports = []
             for i, img_id in enumerate(id_list):
                 if _stop():
                     push_log("[M4] 用户中止下载")
                     return None
                 out_tif = os.path.join(local_out_dir, f"{roi_name}_{img_id}.tif")
-                if os.path.isfile(out_tif) and os.path.getsize(out_tif) > 0:
+                if _nonempty_file(out_tif):
                     push_log(f"  |-- 跳过已存在: {os.path.basename(out_tif)}")
+                    local_tifs.append(out_tif)
                 else:
                     img = _export_image(img_id)
                     try:
@@ -383,16 +398,30 @@ def run_m4_download(
                             region=roi_geom,
                             file_per_band=False,
                         )
-                        push_log(f"  |-- 完成: {os.path.basename(out_tif)}")
                     except Exception as e:
-                        push_log(f"  |-- 失败 [{img_id}]: {e}")
+                        push_log(f"  |-- 失败 [{img_id}]: {safe_error_summary(e)}")
+                        failed_exports.append(img_id)
+                        _prog(25 + int(75 * (i + 1) / max(n, 1)))
+                        continue
+                    if not _nonempty_file(out_tif):
+                        push_log(f"  |-- 失败 [{img_id}]: 导出后文件缺失或为空")
+                        failed_exports.append(img_id)
+                    else:
+                        push_log(f"  |-- 完成: {os.path.basename(out_tif)}")
+                        local_tifs.append(out_tif)
                 _prog(25 + int(75 * (i + 1) / max(n, 1)))
+
+            if failed_exports:
+                raise RuntimeError(
+                    f"本地下载未完成：{len(failed_exports)}/{n} 景未生成非空 GeoTIFF。"
+                )
 
         _prog(100)
         return {
             "image_count": image_count,
             "export_to": export_to,
             "local_out_dir": local_out_dir if export_to == "local" else None,
+            "local_tifs": local_tifs,
             "drive_folder": drive_folder if export_to == "drive" else None,
             "id_list": id_list,
             "roi_name": roi_name,

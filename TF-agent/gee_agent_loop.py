@@ -19,11 +19,16 @@ from __future__ import annotations
 
 import glob
 import json
+import ntpath
 import os
 import re
+import shutil
+import tempfile
 import uuid
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from agent_context_policy import safe_error_summary, safe_local_path_label, sanitize_external_text
 
 # ---- 时间线阶段映射（与 task_timeline.PHASES 一致，B11） ----
 GEE_TIMELINE_PHASES: Tuple[str, ...] = (
@@ -87,14 +92,16 @@ def new_plan_id() -> str:
 
 
 def rel_path(p: str) -> str:
-    """相对化路径（对工作目录），用于登记与用户回复，避免泄露无关绝对路径。"""
-    p = str(p or "")
-    if not p:
+    """Return a usable relative artifact path without echoing foreign paths."""
+    raw = str(p or "")
+    if not raw:
         return ""
+    if ntpath.splitdrive(raw)[0] or raw.startswith(("\\\\", "//")):
+        return safe_local_path_label(raw)
     try:
-        return os.path.relpath(p)
-    except ValueError:
-        return p
+        return os.path.relpath(raw)
+    except (OSError, ValueError):
+        return safe_local_path_label(raw)
 
 
 def _proxy_format_ok(url: Any) -> Tuple[bool, str]:
@@ -106,7 +113,7 @@ def _proxy_format_ok(url: Any) -> Tuple[bool, str]:
         return False, "代理必须以 http:// 或 https:// 开头"
     m = re.match(r"^https?://([^:/]+)(?::(\d{1,5}))?/?$", url)
     if not m:
-        return False, f"代理格式无效: {url!r}（应为 http://127.0.0.1:7892）"
+        return False, f"代理格式无效: {sanitize_external_text(url)!r}（应为 http://host:port）"
     port = m.group(2)
     if port and not (0 < int(port) < 65536):
         return False, f"代理端口非法: {port}"
@@ -163,23 +170,62 @@ def _load_task_ledger() -> Dict[str, Any]:
     try:
         with open(GEE_TASK_LEDGER_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        _preserve_corrupt_task_ledger()
+        raise ValueError("GEE 任务账本 JSON 无效；原文件已保留，已停止写入。") from exc
+    except OSError:
+        raise
+    if not isinstance(data, dict) or any(not isinstance(row, dict) for row in data.values()):
+        _preserve_corrupt_task_ledger()
+        raise ValueError("GEE 任务账本记录结构无效；原文件已保留，已停止写入。")
+    return data
+
+
+def _preserve_corrupt_task_ledger() -> Optional[str]:
+    path = GEE_TASK_LEDGER_PATH
+    if not os.path.isfile(path):
+        return None
+    stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    backup = f"{path}.corrupt-{stamp}"
+    suffix = 1
+    while os.path.exists(backup):
+        backup = f"{path}.corrupt-{stamp}-{suffix}"
+        suffix += 1
+    try:
+        shutil.copy2(path, backup)
+    except OSError:
+        return None
+    return backup
 
 
 def _save_task_ledger(ledger: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(GEE_TASK_LEDGER_PATH) or ".", exist_ok=True)
-    tmp = GEE_TASK_LEDGER_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(ledger, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, GEE_TASK_LEDGER_PATH)
+    fd, tmp = tempfile.mkstemp(
+        prefix=".gee_task_ledger_", suffix=".tmp",
+        dir=os.path.dirname(os.path.abspath(GEE_TASK_LEDGER_PATH)) or ".",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(ledger, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, GEE_TASK_LEDGER_PATH)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _ledger_upsert(task_id: str, **fields: Any) -> None:
     ledger = _load_task_ledger()
     row = dict(ledger.get(str(task_id)) or {})
-    row.update(fields)
+    clean_fields = dict(fields)
+    for key in ("error_message", "description"):
+        if key in clean_fields and clean_fields[key] is not None:
+            clean_fields[key] = sanitize_external_text(clean_fields[key])[:500]
+    row.update(clean_fields)
     row["task_id"] = str(task_id)
     row["last_checked_at"] = _now_str()
     ledger[str(task_id)] = row
@@ -199,7 +245,7 @@ def _poll_gee_task_status(gee_task_id: str) -> Dict[str, Any]:
     try:
         resp = ee.data.getTaskStatus([gee_task_id])
     except Exception as e:  # noqa: BLE001
-        return {"state": "UNKNOWN", "error_message": f"查询任务状态失败: {e}"}
+        return {"state": "UNKNOWN", "error_message": f"查询任务状态失败: {safe_error_summary(e)}"}
     if not resp or not isinstance(resp, list) or not resp:
         return {"state": "UNKNOWN", "error_message": "GEE 未返回任务状态"}
     item = resp[0] or {}
@@ -211,9 +257,111 @@ def _poll_gee_task_status(gee_task_id: str) -> Dict[str, Any]:
     }
 
 
+def reconcile_gee_task(
+    task_id: str,
+    *,
+    plan_id: Optional[str] = None,
+    poll_fn: Optional[Callable[[str], Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """恢复账本中的 GEE task_id，返回真实状态，不把未知状态当成功。
+
+    该函数只轮询并更新账本；不会自动下载、启动推理或登记资产。测试可注入
+    ``poll_fn``，生产调用默认使用 ``ee.data.getTaskStatus``。
+    """
+    task_key = str(task_id or "").strip()
+    if not task_key:
+        return {"ok": False, "status": "BLOCKED", "error": "缺少 task_id。", "tasks": []}
+    poll = poll_fn or _poll_gee_task_status
+    rows = []
+    for row in _load_task_ledger().values():
+        if str(row.get("task_id") or "") != task_key:
+            continue
+        if plan_id and str(row.get("plan_id") or "") != str(plan_id):
+            continue
+        gid = str(row.get("gee_task_id") or "").strip()
+        if not gid:
+            continue
+        state = poll(gid) or {"state": "UNKNOWN", "error_message": "未返回状态"}
+        normalized = str(state.get("state") or "UNKNOWN").upper()
+        _ledger_upsert(task_key, plan_id=row.get("plan_id"), gee_task_id=gid,
+                       status=normalized, error_message=state.get("error_message") or "")
+        rows.append({"gee_task_id": gid, "state": normalized,
+                     "error_message": str(state.get("error_message") or "")[:300]})
+    if not rows:
+        return {"ok": False, "status": "INTERRUPTED", "error": "账本中没有可恢复的 GEE task_id。", "tasks": []}
+    states = {row["state"] for row in rows}
+    if "UNKNOWN" in states:
+        overall = "UNKNOWN"
+    elif states.issubset({"COMPLETED"}):
+        overall = "COMPLETED"
+    elif states & {"FAILED", "CANCELLED"}:
+        overall = "FAILED"
+    else:
+        overall = "RUNNING"
+    return {"ok": overall == "COMPLETED", "status": overall, "tasks": rows}
+
+
 # =======================================================
 #  1. 计划构建（B3）
 # =======================================================
+def build_legacy_m4_plan(config: Optional[Dict[str, Any]] = None,
+                          *, task_id: str = "") -> Dict[str, Any]:
+    """Normalize the historical M4 config into the shared GEE plan schema.
+
+    The old sidebar/Agent payload used ``m4`` fields and a ROI shapefile path.
+    This adapter keeps that payload readable while ensuring execution enters
+    the same plan → confirm → execute → verify → register path as GEE.
+    """
+    cfg = dict(config or {})
+    task = str(task_id or cfg.get("task_id") or cfg.get("roi_name") or "").strip()
+    aoi = cfg.get("aoi")
+    if hasattr(aoi, "to_dict"):
+        try:
+            aoi = aoi.to_dict()
+        except Exception:  # noqa: BLE001
+            aoi = None
+    if not isinstance(aoi, dict) or not aoi.get("geometry"):
+        roi_path = str(cfg.get("roi_path") or "").strip()
+        if roi_path and os.path.isfile(roi_path):
+            try:
+                import geopandas as gpd
+                from aoi_context import aoi_from_bbox
+
+                gdf = gpd.read_file(roi_path)
+                if not gdf.empty:
+                    west, south, east, north = [float(v) for v in gdf.total_bounds]
+                    aoi = aoi_from_bbox(
+                        west, south, east, north,
+                        source="legacy_m4_roi_bbox", label=task or None,
+                    ).to_dict()
+            except Exception as exc:  # noqa: BLE001
+                aoi = None
+                cfg["_legacy_aoi_warning"] = f"旧 M4 ROI 无法转换为 AOI: {safe_error_summary(exc)}"
+    plan = build_gee_download_plan(
+        task_id=task,
+        aoi=aoi if isinstance(aoi, dict) else {},
+        start_date=str(cfg.get("start_date") or ""),
+        end_date=str(cfg.get("end_date") or ""),
+        collection=str(cfg.get("collection") or "COPERNICUS/S2_SR_HARMONIZED"),
+        bands=list(cfg.get("bands") or DEFAULT_BANDS),
+        index_bands=list(cfg.get("index_bands") or DEFAULT_INDEX_BANDS),
+        cloud_limit=cfg.get("cloud_limit", 60),
+        min_land_pct=cfg.get("min_land_pct", 5.0),
+        max_land_pct=cfg.get("max_land_pct", 95.0),
+        min_pixel_count=cfg.get("min_pixel_count", 1000),
+        scale=cfg.get("scale", 10),
+        export_to=str(cfg.get("export_to") or "local"),
+        drive_folder=str(cfg.get("drive_folder") or "GEE_Downloads"),
+        local_out_dir=str(cfg.get("local_out_dir") or ""),
+        gee_proxy_url=str(cfg.get("gee_proxy_url") or ""),
+        gee_project_id=str(cfg.get("gee_project_id") or ""),
+    )
+    warning = cfg.get("_legacy_aoi_warning")
+    if warning:
+        plan.setdefault("warnings", []).append(str(warning))
+    return plan
+
+
 def build_gee_download_plan(
     *,
     task_id: str,
@@ -328,7 +476,7 @@ def build_gee_download_plan(
                     f.write("ok")
                 os.remove(probe)
             except OSError as e:
-                blockers.append(f"输出目录不可写: {local_out_dir}（{e}）")
+                blockers.append(f"输出目录不可写: {rel_path(local_out_dir)}（{safe_error_summary(e)}）")
 
     # 日期合法性
     try:
@@ -426,7 +574,7 @@ def validate_gee_download_plan(
     try:
         import ee  # noqa: F401
     except Exception as e:  # noqa: BLE001
-        return False, [f"GEE Python 包不可用（{e}），请安装 ee 包。"]
+        return False, [f"GEE Python 包不可用（{safe_error_summary(e)}），请安装 ee 包。"]
 
     # 凭证文件
     if not _credentials_file_ok():
@@ -501,7 +649,7 @@ def validate_gee_download_plan(
                 push_log=lambda m: None,
             )
         except Exception as e:  # noqa: BLE001
-            blockers.append(f"GEE 初始化失败：{e}")
+            blockers.append(f"GEE 初始化失败：{safe_error_summary(e)}")
 
     # 合并 warnings（build 的 warnings + 本次新增）
     plan["warnings"] = list(dict.fromkeys(list(plan.get("warnings") or []) + warnings_extra))
@@ -585,6 +733,52 @@ def execute_gee_download(
 
     m4 = m4_engine_mod if m4_engine_mod is not None else _default_m4_engine()
 
+    # 进程重启后先恢复同一 plan 的远端 task_id，禁止再次提交重复导出。
+    if export_to == "drive":
+        existing = [
+            row for row in _load_task_ledger().values()
+            if row.get("plan_id") == plan_id and row.get("gee_task_id")
+        ]
+        if existing:
+            states = []
+            for row in existing:
+                gid = str(row.get("gee_task_id"))
+                state = _poll_gee_task_status(gid)
+                normalized = str(state.get("state") or "UNKNOWN").upper()
+                states.append((gid, normalized, str(state.get("error_message") or "")))
+                _ledger_upsert(task_id, plan_id=plan_id, gee_task_id=gid,
+                               status=normalized, error_message=state.get("error_message") or "")
+            if any(st == "UNKNOWN" for _, st, _ in states):
+                export_state = "UNKNOWN"
+                success = False
+                error = "无法确认已有 GEE 任务状态，未重新提交导出。"
+            elif any(st in {"FAILED", "CANCELLED"} for _, st, _ in states):
+                export_state = "FAILED"
+                success = False
+                error = "已有 GEE 任务失败或已取消；请重新生成计划后再确认。"
+            elif all(st == "COMPLETED" for _, st, _ in states):
+                export_state = "COMPLETED"
+                success = True
+                error = None
+            else:
+                export_state = "RUNNING"
+                success = True
+                error = None
+            local_tifs = [rel_path(f) for f in _list_local_tifs(local_out_dir)]
+            return {
+                "success": success, "task_id": task_id, "plan_id": plan_id,
+                "tool": TOOL_NAME, "status": "completed" if success else "failed",
+                "inputs": {"aoi_summary": plan.get("aoi_summary") or "", "export_to": export_to},
+                "parameters": {"cloud_limit": plan.get("cloud_limit"), "scale": plan.get("scale")},
+                "outputs": {"export_to": export_to, "local_out_dir": local_out_dir,
+                            "drive_folder": drive_folder, "gee_task_ids": [gid for gid, _, _ in states],
+                            "local_tifs": local_tifs},
+                "metrics": {"elapsed_seconds": round(time.time() - started, 2),
+                            "image_count": len(states), "scene_count": len(states)},
+                "export_state": export_state, "warnings": ["恢复已有 GEE task_id，未重复提交。"],
+                "error": error,
+            }
+
     # 复用现有 AOI 上下文构建 ROI 矢量（不重新实现 GEE 逻辑）
     roi_path, roi_name = _materialize_aoi_for_m4(plan, push_log)
     if not roi_path:
@@ -607,7 +801,7 @@ def execute_gee_download(
                                export_to="drive", created_at=_now_str())
                 push_log(f"[GEE] 任务已提交: {desc} (id={tid})")
             except Exception as e:  # noqa: BLE001
-                warnings.append(f"记录 GEE 任务失败: {e}")
+                warnings.append(f"记录 GEE 任务失败: {safe_error_summary(e)}")
 
         m4_result = m4.run_m4_download(
             roi_path=roi_path,
@@ -675,8 +869,39 @@ def execute_gee_download(
             else:
                 warnings.append("未捕获到 GEE 任务 ID（任务已提交但无法跟踪状态）。")
         else:
-            outputs["local_tifs"] = [rel_path(f) for f in _list_local_tifs(local_out_dir)]
+            # Prefer the exact scene filenames returned by M4.  Counting every
+            # ``*.tif`` in an output directory would let stale files from a
+            # previous plan satisfy the current scene count.
+            roi_name = str(m4_result.get("roi_name") or "").strip()
+            expected_paths = [
+                os.path.join(local_out_dir, f"{roi_name}_{scene_id}.tif")
+                for scene_id in id_list
+            ] if roi_name and id_list else []
+            reported_paths = m4_result.get("local_tifs")
+            if expected_paths:
+                candidate_paths = expected_paths
+            elif isinstance(reported_paths, list):
+                candidate_paths = [str(path) for path in reported_paths]
+            else:
+                candidate_paths = []
+            outputs["local_tifs"] = [
+                rel_path(path) for path in candidate_paths
+                if path and os.path.isfile(path) and os.path.getsize(path) > 0
+            ]
             scene_count = max(scene_count, len(outputs["local_tifs"]))
+            # ``m4_engine`` is expected to return only after every requested
+            # local export has produced a non-empty file.  Keep this boundary
+            # fail-closed as well: custom/legacy adapters must not turn a
+            # successful cloud query with zero local assets into a completed
+            # download result.
+            if image_count <= 0 or len(outputs["local_tifs"]) < image_count:
+                return _gee_failure(
+                    task_id,
+                    plan_id,
+                    f"本地影像下载未完成：期望至少 {image_count} 景，实际发现 {len(outputs['local_tifs'])} 个文件。",
+                    started=started,
+                    warnings=warnings,
+                )
 
         elapsed = round(time.time() - started, 2)
         pct(100)
@@ -717,7 +942,7 @@ def execute_gee_download(
             "error": None,
         }
     except Exception as e:  # noqa: BLE001
-        return _gee_failure(task_id, plan_id, f"GEE 下载执行异常: {e}",
+        return _gee_failure(task_id, plan_id, f"GEE 下载执行异常: {safe_error_summary(e)}",
                             started=started, warnings=warnings)
 
 
@@ -751,7 +976,7 @@ def _materialize_aoi_for_m4(plan: Dict[str, Any], push_log: Callable[[str], None
             }, f, ensure_ascii=False)
         return path, task_id
     except Exception as e:  # noqa: BLE001
-        push_log(f"[GEE] AOI 写入失败: {e}")
+        push_log(f"[GEE] AOI 写入失败: {safe_error_summary(e)}")
         return None, task_id
 
 
@@ -839,7 +1064,7 @@ def verify_gee_outputs(
                     _check(f"has_data:{fname}", bool(np.any(valid > 0)),
                            f"valid_pixels={int(np.count_nonzero(valid))}")
                 except Exception as e:  # noqa: BLE001
-                    _check(f"has_data:{fname}", False, f"读取采样失败: {e}")
+                    _check(f"has_data:{fname}", False, f"读取采样失败: {safe_error_summary(e)}")
             try:
                 mt = os.path.getmtime(tif)
                 _check(f"mtime:{fname}", mt >= started_at,
@@ -848,7 +1073,7 @@ def verify_gee_outputs(
                 _check(f"mtime:{fname}", False, "mtime 不可读")
             ok_files += 1
         except Exception as e:  # noqa: BLE001
-            _check(f"open:{os.path.basename(tif)}", False, f"打开失败: {e}")
+            _check(f"open:{os.path.basename(tif)}", False, f"打开失败: {safe_error_summary(e)}")
 
     ok = ok_files == len(local_tifs) and all(c["passed"] for c in checks)
     return {"ok": ok, "checks": checks, "local_tifs": local_tifs,
@@ -954,7 +1179,7 @@ def register_gee_dataset_asset(
         existing = dataset_assets.get_dataset(dataset_id)
         if existing and existing.get("plan_id") == plan_id:
             return dataset_id
-        raise ValueError(f"GEE 数据集登记失败: {e}") from e
+        raise ValueError(f"GEE 数据集登记失败: {safe_error_summary(e)}") from e
 
 
 # =======================================================
@@ -999,7 +1224,7 @@ def summarize_gee_result_for_chat(
 ) -> str:
     """基于真实工具结果生成 Copilot 回复（禁止编造指标 / 输出凭证）。"""
     if not result or result.get("success") is not True:
-        err = (result or {}).get("error") or "影像获取失败"
+        err = sanitize_external_text((result or {}).get("error") or "影像获取失败")[:240]
         return (
             "## 获取卫星影像 · 未完成\n\n"
             f"- 任务：`{(result or {}).get('task_id') or '—'}`\n"

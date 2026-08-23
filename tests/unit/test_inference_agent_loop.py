@@ -219,6 +219,11 @@ class FakePostEngine:
 #  1 / 2 / 5 / 6 / 越界 / shp_path：计划构建
 # ===============================================================
 class TestPlanBuild(unittest.TestCase):
+    def test_cross_platform_rel_path_does_not_echo_windows_path(self):
+        label = ial.rel_path(r"C:\Users\chl\private\result.tif")
+        self.assertIn("result.tif", label)
+        self.assertNotIn(r"C:\Users\chl", label)
+
     def test_01_legal_input_builds_ready_plan(self):
         with tempfile.TemporaryDirectory() as td:
             plan, root, final, mask, weight = _happy_plan(Path(td))
@@ -539,6 +544,20 @@ class TestExecuteFailure(unittest.TestCase):
             self.assertFalse(result["success"])
             self.assertIn("后处理异常", result["error"])
 
+    def test_12b_postprocess_true_without_artifacts_returns_failure(self):
+        """后处理返回 True 但未写出成果时，执行层不得伪报成功。"""
+        with tempfile.TemporaryDirectory() as td:
+            plan, *_ = _happy_plan(Path(td))
+            result = ial.execute_local_inference(
+                plan,
+                pre_engine_mod=FakePreEngine(),
+                post_engine_mod=FakePostEngine(skip_tif=True, skip_shp=True),
+            )
+            self.assertFalse(result["success"])
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("成果文件", result["error"])
+            self.assertFalse(result["outputs"])
+
     def test_stop_event_interrupts(self):
         import threading
         with tempfile.TemporaryDirectory() as td:
@@ -625,6 +644,14 @@ class TestVerifyAndRegister(unittest.TestCase):
             self.assertIsNotNone(found)
             self.assertEqual(found["asset_id"], asset_id)
 
+    def test_corrupt_shared_registry_is_preserved_and_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "registry.json"
+            path.write_text('{"broken": [', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                ial._load_registry(str(path))
+            self.assertTrue(list(Path(td).glob("registry.json.corrupt-*")))
+
     def test_16_failure_never_registers(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -638,11 +665,33 @@ class TestVerifyAndRegister(unittest.TestCase):
             self.assertIsNone(asset_id)
             self.assertFalse(reg_path.exists())
 
+    def test_registration_rechecks_verified_artifacts(self):
+        """A forged/stale verification result cannot commit missing outputs."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            plan = {"task_id": "task_a", "plan_id": "p" * 32}
+            result = {"success": True}
+            verification = {
+                "ok": True,
+                "final_tif": str(tmp / "missing_Final.tif"),
+                "final_shp": str(tmp / "missing_Final.shp"),
+            }
+            reg_path = tmp / "registry.json"
+
+            asset_id = ial.register_inference_asset(
+                plan, result, verification, registry_path=str(reg_path)
+            )
+
+            self.assertIsNone(asset_id)
+            self.assertFalse(reg_path.exists())
+
     def test_17_missing_map_only_warns_no_register(self):
         # 校验失败但最终不阻塞主流程：不登记、不伪报完成
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            plan, result = self._run_happy(tmp, post_kwargs={"skip_shp": True})
+            plan, result = self._run_happy(tmp)
+            # 模拟执行结束后地图资产被外部清理，验证层仍必须 fail-closed。
+            Path(result["outputs"]["final_shp"]).unlink()
             ver = ial.verify_inference_outputs(plan, result, started_at=time.time() - 60)
             self.assertFalse(ver["ok"])
             summary = ial.summarize_inference_result_for_chat(result, ver)
@@ -708,6 +757,15 @@ class TestSummaryAndContext(unittest.TestCase):
         self.assertIn("未完成", text)
         self.assertIn("模型加载失败", text)
         self.assertNotIn("已验证", text)
+
+    def test_18d_failure_summary_redacts_local_path(self):
+        text = ial.summarize_inference_result_for_chat({
+            "success": False,
+            "task_id": "task_a",
+            "error": "模型失败 /Users/chl/private/secret.tif",
+        }, None)
+        self.assertNotIn("/Users/", text)
+        self.assertNotIn("secret.tif", text)
 
     def test_18c_format_plan_truthful(self):
         with tempfile.TemporaryDirectory() as td:
@@ -831,6 +889,57 @@ class TestBridgeInferenceFlow(unittest.TestCase):
             )
             self.assertFalse(state["_inference_pending_plan"]["ready"])
             self.assertTrue(r.errors)
+
+
+class TestInferenceRecoveryClassification(unittest.TestCase):
+    def test_complete_final_is_reused_only_after_verification(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            task_dir = _make_task_dir(root, "task_a")
+            final = Path(td) / "final"; mask = Path(td) / "mask"
+            final.mkdir(); mask.mkdir()
+            tif = final / "task_a_Final_p0.05_c2.tif"; shp = final / "task_a_Final_p0.05_c2.shp"
+            tif.write_bytes(b"tif"); shp.write_bytes(b"shp")
+            plan = {"task_id": "task_a", "input_path": str(task_dir), "output_dir": str(final), "mask_dir": str(mask), "prob_threshold": 0.05, "count_threshold": 2}
+            result = ial.classify_inference_recovery(plan, verify_fn=lambda *args, **kwargs: {"ok": True})
+            self.assertEqual(result["action"], "COMPLETE")
+
+    def test_complete_masks_resume_post_process(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            task_dir = _make_task_dir(root, "task_a")
+            final = Path(td) / "final"; mask = Path(td) / "mask"; final.mkdir(); mask.mkdir()
+            for name in ("scene_001_mask.tif", "scene_002_mask.tif"):
+                (mask / name).write_bytes(b"mask")
+            plan = {"task_id": "task_a", "input_path": str(task_dir), "output_dir": str(final), "mask_dir": str(mask), "prob_threshold": 0.05, "count_threshold": 2}
+            self.assertEqual(ial.classify_inference_recovery(plan)["action"], "RESUME_POST_PROCESS")
+
+    def test_partial_masks_wait_for_confirmed_isolation_retry(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            task_dir = _make_task_dir(root, "task_a")
+            final = Path(td) / "final"; mask = Path(td) / "mask"; final.mkdir(); mask.mkdir()
+            (mask / "scene_001_mask.tif").write_bytes(b"mask")
+            (mask / "scene_002_mask.tif").touch()
+            plan = {"task_id": "task_a", "input_path": str(task_dir), "output_dir": str(final), "mask_dir": str(mask), "prob_threshold": 0.05, "count_threshold": 2}
+            result = ial.classify_inference_recovery(plan)
+            self.assertEqual(result["action"], "ISOLATE_AND_RETRY")
+            self.assertEqual(result["invalid_count"], 1)
+
+    def test_isolation_requires_confirmation_and_preserves_audit_copy(self):
+        with tempfile.TemporaryDirectory() as td:
+            mask = Path(td) / "mask"; final = Path(td) / "final"
+            mask.mkdir(); final.mkdir()
+            source = mask / "scene_001_mask.tif"
+            source.write_bytes(b"partial")
+            plan = {"plan_id": "plan/unsafe", "mask_dir": str(mask), "output_dir": str(final)}
+            waiting = ial.isolate_inference_checkpoints(plan)
+            self.assertEqual(waiting["status"], "WAITING_CONFIRMATION")
+            self.assertTrue(source.exists())
+            isolated = ial.isolate_inference_checkpoints(plan, confirmed=True)
+            self.assertTrue(isolated["ok"])
+            self.assertFalse(source.exists())
+            self.assertTrue((Path(isolated["quarantine_dir"]) / source.name).exists())
 
 
 if __name__ == "__main__":

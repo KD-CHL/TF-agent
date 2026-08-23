@@ -20,6 +20,8 @@ import datetime
 import json
 import os
 import re
+import shutil
+import tempfile
 from typing import Any, Dict, List, Optional
 
 _VALID_SOURCES = frozenset({"advisor", "open", "other"})
@@ -52,17 +54,55 @@ def load_registry() -> Dict[str, Dict[str, Any]]:
         try:
             with open(p, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except (json.JSONDecodeError, OSError):
-            return {}
+            if isinstance(data, dict):
+                if not all(isinstance(entry, dict) for entry in data.values()):
+                    _preserve_corrupt_registry(p)
+                    raise ValueError("数据集资产注册表记录结构无效；原文件已保留，已停止写入。")
+                return data
+            _preserve_corrupt_registry(p)
+            raise ValueError("数据集资产注册表顶层结构无效；原文件已保留，已停止写入。")
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            _preserve_corrupt_registry(p)
+            raise ValueError("数据集资产注册表 JSON 无效；原文件已保留，已停止写入。") from exc
+        except OSError:
+            # Permission/read failures are not an empty registry; propagate so
+            # callers cannot overwrite evidence under a false fallback.
+            raise
     return {}
+
+
+def _preserve_corrupt_registry(path: str) -> Optional[str]:
+    if not os.path.isfile(path):
+        return None
+    stamp = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    backup = f"{path}.corrupt-{stamp}"
+    suffix = 1
+    while os.path.exists(backup):
+        backup = f"{path}.corrupt-{stamp}-{suffix}"
+        suffix += 1
+    try:
+        shutil.copy2(path, backup)
+    except OSError:
+        return None
+    return backup
 
 
 def save_registry(data: Dict[str, Dict[str, Any]]) -> None:
     p = registry_path()
     os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    fd, tmp_path = tempfile.mkstemp(prefix=".dataset_registry_", suffix=".tmp", dir=os.path.dirname(os.path.abspath(p)) or ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, p)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _slug(s: str) -> str:
@@ -263,11 +303,13 @@ def build_dataset_catalog_for_agent() -> str:
     if not rows:
         return ""
 
+    from agent_context_policy import describe_local_path, sanitize_external_text
+
     lines = [
         "【数据集资产库 · 已登记且文件存在的条目】",
         "",
         "使用规则（必读）：",
-        "1) 每条有稳定 id 与 primary_path；禁止编造未在下列出现的路径。",
+        "1) 每条有稳定 id；执行层在本地解析文件，模型不得编造或回声本地路径。",
         "2) coverage_scale=national（如师姐全国潮滩 SHP）：与某任务 Final TIF 对比时，评价仅在「预测图栅格范围」内统计；",
         "   真值通过栅格化与预测对齐，不是把全国矢量整体当成浙江一张图。",
         "3) coverage_scale=scene 的 TIF：表示单景/局部范围；是否与某 task 重叠需看地理范围或后续补 bounds，不要默认全国可比。",
@@ -282,12 +324,12 @@ def build_dataset_catalog_for_agent() -> str:
         lines.append(f"  title={r.get('title')} | source={r.get('source')} | year={r.get('year')} | coverage_scale={r.get('coverage_scale')}")
         lines.append(f"  geographic_scope={r.get('geographic_scope')!r} | format={r.get('format')}")
         _rp = r.get("_resolved_path") or resolve_stored_primary_path(str(r.get("primary_path", "")))
-        lines.append(f"  primary_path={_rp}")
+        lines.append(f"  file={describe_local_path(_rp)}")
         lines.append(f"  related_task_hints: {hint_s}")
         if pair:
             lines.append(f"  pairing_note: {pair}")
         lines.append("")
-    return "\n".join(lines).rstrip()
+    return sanitize_external_text("\n".join(lines).rstrip())
 
 
 def register_advisor_china_tidal_flat_year(

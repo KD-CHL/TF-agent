@@ -117,11 +117,36 @@ def test_no_abs_path_in_assets(_tmp_report_dir):
     assert res.success is True
 
 
+def test_posix_path_and_spatial_metadata_are_redacted():
+    """报告文本不得持久化 POSIX 路径或精确空间字段。"""
+    text = rg._sanitize_text("failed /Users/chl/private/result.tif bbox=[120,30,120.1,30.1]")
+    assert "/Users/" not in text
+    assert "result.tif" not in text
+    assert "bbox=" not in text
+
+
+def test_report_text_escapes_markup_before_reportlab_rendering():
+    text = rg._sanitize_text("<b>用户输入</b> & 结果")
+    assert "<b>" not in text
+    assert "&lt;b&gt;用户输入&lt;/b&gt; &amp; 结果" == text
+
+
 def test_empty_timeline_warning(_tmp_report_dir):
     """时间线为空 → warning，报告仍生成。"""
     res = rg.generate_task_report(_task_ctx(), timeline=None)
     assert res.success is True
     assert any("时间线为空" in w for w in res.warnings)
+
+
+def test_generation_error_is_sanitized(_tmp_report_dir, monkeypatch):
+    def fail_render(*_args, **_kwargs):
+        raise RuntimeError("failed /Users/chl/private/report.pdf token=sk-report-secret")
+
+    monkeypatch.setattr(rg, "_render_pdf", fail_render)
+    res = rg.generate_task_report(_task_ctx(), timeline=_timeline())
+    assert res.success is False
+    assert "/Users/" not in res.error
+    assert "sk-report-secret" not in res.error
 
 
 def test_result_structure(_tmp_report_dir):

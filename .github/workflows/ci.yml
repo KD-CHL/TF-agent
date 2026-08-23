@@ -14,6 +14,10 @@ jobs:
   unit-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
     defaults:
       run:
         working-directory: TF-agent
@@ -22,20 +26,39 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
           cache: pip
-          cache-dependency-path: TF-agent/requirements.txt
+          cache-dependency-path: |
+            TF-agent/requirements.txt
+            TF-agent/requirements-test.txt
 
       - name: Install test deps (CPU torch + GIS wheels)
         run: |
           pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install numpy rasterio geopandas scipy scikit-image shapely streamlit \
-            python-dotenv chromadb langchain-openai langchain-core langgraph pytest
+            python-dotenv chromadb langchain-openai langchain-core langgraph \
+            fastapi uvicorn httpx aiohttp Pillow reportlab sentence-transformers
+          pip install -r requirements-test.txt
 
       - name: Run unit tests
         run: |
-          python -m pytest ../tests/unit -q --tb=short -p no:cacheprovider
+            python -m pytest \
+            ../tests/smoke/test_app_boot.py \
+            ../tests/smoke/test_streamlit_apptest.py \
+            ../tests/unit/test_agent_commands.py \
+            ../tests/unit/test_p0_hardening.py \
+            ../tests/unit/test_workflow_orchestrator.py \
+            ../tests/unit/test_agent_task_timeline.py \
+            ../tests/unit/test_acceptance_matrix.py \
+            ../tests/unit/test_gateway_auth.py \
+            ../tests/unit/test_local_api_auth.py \
+            -q --tb=short -p no:cacheprovider
+
+      - name: Run acceptance matrix (offline only)
+        run: |
+          python ../tests/acceptance/run_acceptance_matrix.py \
+            --offline-only --report acceptance_matrix.json
 
       - name: Upload pytest report on failure
         if: failure()
@@ -45,3 +68,36 @@ jobs:
           path: |
             TF-agent/.pytest_cache
             tests/unit/__pycache__
+            tests/smoke/__pycache__
+
+      - name: Upload acceptance matrix
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-matrix-${{ matrix.python-version }}
+          path: TF-agent/acceptance_matrix.json
+
+  windows-path-contract:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
+    defaults:
+      run:
+        working-directory: TF-agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: TF-agent/requirements-test.txt
+      - name: Install portable contract dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-test.txt pydantic
+      - name: Run Windows path and persistence contracts
+        run: |
+          python -m pytest ../tests/unit/test_agent_context_policy.py ../tests/unit/test_execution_request_contract.py ../tests/unit/test_job_recovery.py -q --tb=short -p no:cacheprovider

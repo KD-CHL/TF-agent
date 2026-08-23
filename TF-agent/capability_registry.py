@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -28,7 +29,10 @@ _CHEAP_TTL_SEC = 10.0
 _EXPENSIVE_TTL_SEC = 60.0
 
 _SENSITIVE_KEY_SUBSTRINGS = ("token", "secret", "password", "api_key", "ion")
-_SENSITIVE_VALUE_SUBSTRINGS = ("Z:/", "C:\\", "/home/", "token=", "key=")
+_SENSITIVE_VALUE_SUBSTRINGS = ("token=", "key=")
+_ABSOLUTE_PATH_RE = re.compile(
+    r"(?:^|[\s(=])(?:[A-Za-z]:[\\/]|\\\\|/(?:Users|home|private|tmp|var|opt|Volumes|mnt|srv|workspace|app|data)/)"
+)
 
 
 @dataclass
@@ -42,6 +46,7 @@ class CapabilityStatus:
     warnings: List[str] = field(default_factory=list)
     evidence: Dict[str, Any] = field(default_factory=dict)  # 校验证据（布尔/版本，不存 token/路径值）
     recommended_actions: List[str] = field(default_factory=list)
+    validation_level: str = "static"  # static=依赖/路径探测；runtime=真实任务验证
     checked_at: str = ""
     expires_at: str = ""
 
@@ -77,6 +82,23 @@ def _env_key_present(key: str) -> bool:
         return False
 
 
+def _safe_error_summary(error: BaseException, *, limit: int = 240) -> str:
+    """Return a bounded, path/credential-free check failure summary."""
+    text = str(error or "").strip()
+    text = re.sub(
+        r"(?:[A-Za-z]:[\\/]|\\\\|/(?:Users|home|private|tmp|var|opt|Volumes|mnt|srv|workspace|app|data)/)[^\s,;，；)）]+",
+        "<local-path>",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*[^\s,;，；]+",
+        "<redacted>",
+        text,
+    )
+    text = re.sub(r"(?i)(https?://)([^/@\s]+):([^/@\s]+)@", r"\1<redacted>@", text)
+    return text[:limit] or type(error).__name__
+
+
 def _sanitize_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]:
     """剔除可能含敏感值的键（token/key/secret）与绝对路径字符串值。"""
     clean: Dict[str, Any] = {}
@@ -86,6 +108,8 @@ def _sanitize_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]:
             continue
         if isinstance(v, str):
             if any(s in v for s in _SENSITIVE_VALUE_SUBSTRINGS):
+                continue
+            if _ABSOLUTE_PATH_RE.search(v):
                 continue
         clean[k] = v
     return clean
@@ -108,6 +132,7 @@ class CapabilityRegistry:
         self._checks: Dict[str, Tuple[str, Callable[[Dict[str, Any]], CapabilityStatus], str]] = {}
         self._cache: Dict[str, CapabilityStatus] = {}
         self._cached_at: Dict[str, float] = {}
+        self._runtime_verified: set[str] = set()
         self._register_defaults()
 
     # ---- 注册 ----
@@ -172,7 +197,7 @@ class CapabilityRegistry:
                 capability_id=capability_id,
                 label=label,
                 status=UNKNOWN,
-                summary=f"能力检查异常: {e}",
+                summary=f"能力检查异常: {_safe_error_summary(e)}",
                 checked_at=_now_str(),
                 expires_at=_now_str(),
             )
@@ -185,6 +210,7 @@ class CapabilityRegistry:
                 "%Y-%m-%d %H:%M:%S", time.localtime(now + ttl)
             )
         st.evidence = _sanitize_evidence(st.evidence)
+        st.validation_level = "runtime" if capability_id in self._runtime_verified else "static"
         self._cache[capability_id] = st
         self._cached_at[capability_id] = now
         return st
@@ -205,6 +231,16 @@ class CapabilityRegistry:
     def invalidate(self, capability_id: str) -> None:
         self._cache.pop(capability_id, None)
         self._cached_at.pop(capability_id, None)
+
+    def mark_runtime_verified(self, capability_id: str) -> None:
+        """由真实执行闭环在验证通过后调用，不允许 Agent prompt 自行提升状态。"""
+        if capability_id in self._checks:
+            self._runtime_verified.add(capability_id)
+            self.invalidate(capability_id)
+
+    def clear_runtime_verification(self) -> None:
+        self._runtime_verified.clear()
+        self.bump()
 
     # ---- 白名单快照（注入 Copilot / 展示） ----
 
@@ -291,14 +327,14 @@ class CapabilityRegistry:
         )
 
     def _check_gee_download(self, ctx: Dict[str, Any]) -> CapabilityStatus:
-        reqs = ["GEE 项目配置（环境/凭据）", "gee 包可导入"]
-        has_gee = _module_importable("gee")
-        if not has_gee:
+        reqs = ["GEE 项目配置（环境/凭据）", "ee 包可导入"]
+        has_ee = _module_importable("ee")
+        if not has_ee:
             return CapabilityStatus(
                 capability_id="gee_download", label="GEE 遥感下载", status=BLOCKED,
                 summary="影像获取依赖不可用",
-                requirements=reqs, blockers=["gee 包不可导入"],
-                recommended_actions=["安装 gee 包"],
+                requirements=reqs, blockers=["ee 包不可导入"],
+                recommended_actions=["安装 earthengine-api（提供 ee 包）"],
             )
         # 项目解析：env → 凭据文件 → credentials JSON（与 m4_engine._resolve_ee_project 同语义）
         project = None
@@ -345,42 +381,59 @@ class CapabilityRegistry:
             capability_id="gee_download", label="GEE 遥感下载", status=CONDITIONAL,
             summary="影像获取已配置，需项目与网络代理可用",
             requirements=reqs,
-            evidence={"gee_project_configured": True, "gee_importable": True},
+            evidence={"gee_project_configured": True, "ee_importable": True},
             warnings=["下载需 GEE 认证与网络可达"],
         )
 
     def _check_e1_evaluation(self, ctx: Dict[str, Any]) -> CapabilityStatus:
-        model_path = ctx.get("model_path")
-        reqs = ["E1 评估模型存在"]
-        if not model_path or not _path_ok(model_path):
+        reqs = ["e1_engine 可导入", "E1 数据集根目录", "参考产品已配置"]
+        if not _module_importable("e1_engine"):
             return CapabilityStatus(
                 capability_id="e1_quality_evaluation", label="E1 质量评估", status=BLOCKED,
-                summary="精度评价模型不可用",
-                requirements=reqs, blockers=["模型文件缺失"],
-                recommended_actions=["配置模型文件"],
+                summary="精度评价引擎不可用",
+                requirements=reqs, blockers=["e1_engine 不可导入"],
+                recommended_actions=["检查 E1 引擎与研究脚本依赖"],
+            )
+        data_root = str(ctx.get("e1_data_root") or "")
+        reference = str(ctx.get("e1_reference") or "")
+        if not data_root or not _path_ok(data_root) or not reference:
+            return CapabilityStatus(
+                capability_id="e1_quality_evaluation", label="E1 质量评估", status=CONDITIONAL,
+                summary="精度评价引擎可用，但尚未配置数据集或参考产品",
+                requirements=reqs, blockers=["缺少 E1 数据集根目录或 reference"],
+                recommended_actions=["配置 E1_DATA_ROOT 与参考产品后再执行"],
+                evidence={"engine_importable": True, "dataset_configured": bool(data_root), "reference_configured": bool(reference)},
             )
         return CapabilityStatus(
             capability_id="e1_quality_evaluation", label="E1 质量评估", status=AVAILABLE,
-            summary="精度评价可用",
+            summary="精度评价前置条件已配置",
             requirements=reqs,
-            evidence={"model_present": True},
+            evidence={"engine_importable": True, "dataset_configured": True, "reference_configured": True},
         )
 
     def _check_m5_detection(self, ctx: Dict[str, Any]) -> CapabilityStatus:
-        model_path = ctx.get("model_path")
-        reqs = ["M5 变化检测模型存在"]
-        if not model_path or not _path_ok(model_path):
+        reqs = ["m5_engine 可导入", "同区域历史基线或已登记成果"]
+        if not _module_importable("m5_engine"):
             return CapabilityStatus(
                 capability_id="m5_change_detection", label="M5 时空变化检测", status=BLOCKED,
-                summary="变化分析模型不可用",
-                requirements=reqs, blockers=["模型文件缺失"],
-                recommended_actions=["配置模型文件"],
+                summary="变化分析引擎不可用",
+                requirements=reqs, blockers=["m5_engine 不可导入"],
+                recommended_actions=["检查 M5 引擎与空间依赖"],
+            )
+        baseline = str(ctx.get("m5_baseline_shp") or "")
+        if not baseline or not _path_ok(baseline):
+            return CapabilityStatus(
+                capability_id="m5_change_detection", label="M5 时空变化检测", status=CONDITIONAL,
+                summary="变化分析引擎可用，需运行时解析同区域历史基线",
+                requirements=reqs, blockers=["当前未提供可验证基线"],
+                recommended_actions=["配置历史基线 SHP 或先登记历史成果"],
+                evidence={"engine_importable": True, "baseline_configured": bool(baseline)},
             )
         return CapabilityStatus(
             capability_id="m5_change_detection", label="M5 时空变化检测", status=AVAILABLE,
-            summary="变化分析可用",
+            summary="变化分析前置条件已配置",
             requirements=reqs,
-            evidence={"model_present": True},
+            evidence={"engine_importable": True, "baseline_configured": True},
         )
 
     def _check_autotune(self, ctx: Dict[str, Any]) -> CapabilityStatus:
@@ -463,6 +516,43 @@ def _find_chinese_font() -> Optional[str]:
         if os.path.exists(p):
             return os.path.basename(p)
     return None
+
+
+def build_context(
+    *,
+    app_dir: Optional[str] = None,
+    model_path: Any = "",
+    task: Any = "",
+    knowledge_db_dir: Optional[str] = None,
+    autotune_script: Optional[str] = None,
+    **extra: Any,
+) -> Dict[str, Any]:
+    """构造 UI、Agent 与 Workflow 共用的能力检查上下文。
+
+    返回值仅供本地检查使用；快照层仍只暴露状态和摘要，不向模型回声路径。
+    """
+    root = os.path.abspath(str(app_dir or os.path.dirname(__file__)))
+    default_kb_dir = os.path.normpath(os.path.join(root, "..", "rs_knowledge_db"))
+    try:
+        # Keep capability checks on the same resolver used by Agent queries
+        # and the ingestion CLI; the fallback preserves the historical repo
+        # layout when no environment override is configured.
+        from knowledge_store import knowledge_db_path
+
+        resolved_kb_dir = knowledge_db_path(default_kb_dir)
+    except Exception:  # noqa: BLE001
+        resolved_kb_dir = default_kb_dir
+    context: Dict[str, Any] = {
+        "model_path": model_path or "",
+        "autotune_script": autotune_script or os.path.join(root, "auto_tune.py"),
+        "knowledge_db_dir": knowledge_db_dir or resolved_kb_dir,
+        "e1_data_root": extra.pop("e1_data_root", None) or os.environ.get("E1_DATA_ROOT"),
+        "e1_reference": extra.pop("e1_reference", None) or os.environ.get("E1_REFERENCE", "师姐_2020"),
+        "m5_baseline_shp": extra.pop("m5_baseline_shp", None) or os.environ.get("M5_BASELINE_SHP"),
+        "task": task or "",
+    }
+    context.update(extra)
+    return context
 
 
 def default_registry(context: Optional[Dict[str, Any]] = None) -> CapabilityRegistry:

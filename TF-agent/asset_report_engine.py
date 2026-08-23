@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
+from agent_context_policy import redact_spatial_metadata, safe_error_summary, sanitize_external_text
 
 # ---- 可选依赖探测（缺失时报告生成失败并给出明确 warning，而非栈崩溃）----
 _HAS_RASTERIO = importlib.util.find_spec("rasterio") is not None
@@ -79,6 +80,8 @@ def _sanitize_text(text: Any) -> str:
     low = s.lower()
     if any(sub in low for sub in _SENSITIVE_VALUE_SUBSTRINGS):
         return "[已过滤]"
+    s = redact_spatial_metadata(sanitize_external_text(s))
+    s = re.sub(r"(?i)\bsk-[A-Za-z0-9_-]+", "<redacted>", s)
     return s[:400]
 
 
@@ -90,7 +93,15 @@ def _sanitize_key(name: str) -> bool:
 def _safe_basename(path: Any) -> str:
     """仅返回 basename，绝不泄露本地绝对路径。"""
     p = str(path or "")
-    return os.path.basename(p.replace("\\", "/")) or p[:80]
+    return os.path.basename(p.replace("\\", "/")) or "<local-path>"
+
+
+def _nonempty_file(path: Any) -> bool:
+    """Return true only for an existing artifact with non-zero size."""
+    try:
+        return bool(path) and os.path.isfile(str(path)) and os.path.getsize(str(path)) > 0
+    except OSError:
+        return False
 
 
 def _safe_filename(part: str) -> str:
@@ -104,15 +115,9 @@ def _safe_filename(part: str) -> str:
 
 # ---- 资产发现 ----
 def _load_asset_registry(registry_path: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
-    p = registry_path or _default_registry_path()
-    if not os.path.isfile(p):
-        return {}
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    from workflow_orchestrator import load_assets_registry
+
+    return load_assets_registry(registry_path or _default_registry_path())
 
 
 def _is_final_tif(path: str) -> bool:
@@ -127,7 +132,7 @@ def get_eligible_assets(
     out: Dict[str, Dict[str, Any]] = {}
     for key, row in _load_asset_registry(registry_path).items():
         path = str(row.get("file_path") or "")
-        if row.get("task") == task and _is_final_tif(path) and os.path.isfile(path):
+        if row.get("task") == task and _is_final_tif(path) and _nonempty_file(path):
             out[key] = dict(row)
     return dict(
         sorted(out.items(), key=lambda kv: str(kv[1].get("created_at") or ""), reverse=True)
@@ -259,7 +264,7 @@ def _compare_reference(tif_path: str, ref: Optional[Dict[str, Any]]) -> Optional
                 dtype="uint8",
             ).astype(bool)
     except Exception as exc:
-        return {"error": str(exc), "reference_title": ref.get("title") or ref.get("id")}
+        return {"error": safe_error_summary(exc), "reference_title": ref.get("title") or ref.get("id")}
 
     tp = int(np.logical_and(pred, ref_mask).sum())
     fp = int(np.logical_and(pred, ~ref_mask).sum())
@@ -616,5 +621,5 @@ def generate_asset_report(
         )
     except Exception as e:
         return AssetReportResult(
-            success=False, task_id=task_id, error=str(e), warnings=warnings,
+            success=False, task_id=task_id, error=safe_error_summary(e), warnings=warnings,
         )

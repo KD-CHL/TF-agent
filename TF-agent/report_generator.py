@@ -12,12 +12,20 @@ Phase E: 任务 PDF 报告最小接入（仅 A–D 全绿后启用）。
 from __future__ import annotations
 
 import hashlib
+from html import escape as html_escape
 import importlib.util
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+from agent_context_policy import (
+    redact_spatial_metadata,
+    safe_error_summary,
+    sanitize_external_text,
+)
 
 _SENSITIVE_KEY_SUBSTRINGS = ("token", "secret", "password", "api_key", "ion", "key")
 _SENSITIVE_VALUE_SUBSTRINGS = ("Z:/", "C:\\", "/home/", "token=", "key=", "sk-")
@@ -39,11 +47,18 @@ class ReportResult:
 
 def _sanitize_text(text: Any) -> str:
     """去除敏感值（token/绝对路径），并限制长度。"""
-    s = str(text)
-    low = s.lower()
+    raw = str(text or "")
+    low = raw.lower()
     if any(sub in low for sub in _SENSITIVE_VALUE_SUBSTRINGS):
         return "[已过滤]"
-    return s[:400]
+    s = redact_spatial_metadata(sanitize_external_text(raw))
+    # ``sk-`` is a provider key prefix even when the surrounding field name is
+    # absent; redact it before report text is persisted.
+    s = re.sub(r"(?i)\bsk-[A-Za-z0-9_-]+", "<redacted>", s)
+    # ReportLab Paragraph treats ``<...>`` and ``&`` as markup.  Escape after
+    # all security redaction so task names, errors and timeline messages cannot
+    # break PDF generation or inject unintended formatting.
+    return html_escape(s, quote=False)[:400]
 
 
 def _sanitize_key(name: str) -> bool:
@@ -57,7 +72,10 @@ def _relative_path(p: str, base_dir: Optional[str] = None) -> str:
     if not p:
         return ""
     p = p.replace("\\", "/")
-    if ":" in p and not p.startswith("http"):  # 形如 Z:/... 的绝对路径
+    is_windows_abs = bool(re.match(r"^[A-Za-z]:/", p))
+    is_unc = p.startswith("//")
+    is_posix_abs = p.startswith("/") and not p.startswith("//")
+    if (is_windows_abs or is_unc or is_posix_abs) and not p.startswith(("http://", "https://")):
         if base_dir:
             try:
                 rel = os.path.relpath(p, base_dir).replace("\\", "/")
@@ -65,7 +83,7 @@ def _relative_path(p: str, base_dir: Optional[str] = None) -> str:
                     return rel
             except Exception:
                 pass
-        return os.path.basename(p)
+        return os.path.basename(p) or "<local-path>"
     return p
 
 
@@ -364,5 +382,5 @@ def generate_task_report(
         )
     except Exception as e:
         return ReportResult(
-            success=False, task_id=task_id, error=str(e), warnings=warnings,
+            success=False, task_id=task_id, error=safe_error_summary(e), warnings=warnings,
         )

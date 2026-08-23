@@ -37,6 +37,7 @@ import os
 import sys
 import tempfile
 import time
+from pathlib import Path
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -175,6 +176,26 @@ def _run_local(tmp, task="tv", scene_count=2, **tif_kw):
 class TestPlanBuild(unittest.TestCase):
     """B3 计划构建"""
 
+    def test_legacy_m4_is_normalized_to_shared_gee_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = gal.build_legacy_m4_plan(
+                {
+                    "roi_name": "legacy_roi",
+                    "aoi": _make_aoi_dict(),
+                    "start_date": "2023-01-01",
+                    "end_date": "2023-01-15",
+                    "export_to": "local",
+                    "local_out_dir": os.path.join(tmp, "downloads"),
+                    "bands": ["B4", "B3", "B2"],
+                },
+                task_id="legacy_task",
+            )
+
+            self.assertTrue(plan["ready"], plan["blockers"])
+            self.assertEqual(plan["schema"], "gee_download_plan_v1")
+            self.assertEqual(plan["task_id"], "legacy_task")
+            self.assertTrue(plan["plan_id"])
+
     def test_01_valid_plan_default_bands_rgb_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             plan = _happy_plan(tmp)
@@ -261,6 +282,11 @@ class TestPlanBuild(unittest.TestCase):
 
 class TestValidate(unittest.TestCase):
     """B4 执行前校验"""
+
+    def test_invalid_proxy_error_does_not_echo_credentials(self):
+        ok, error = gal._proxy_format_ok("http://user:secret@host:bad")
+        self.assertFalse(ok)
+        self.assertNotIn("user:secret", error)
 
     def test_05_ee_not_importable_blocks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -442,6 +468,100 @@ class TestExecute(unittest.TestCase):
             for f in result["outputs"]["local_tifs"]:
                 self.assertTrue(os.path.isfile(f))
 
+    def test_local_success_with_missing_files_is_fail_closed(self):
+        """M4 返回成功但没有本地文件时不能进入完成状态。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = _happy_plan(tmp, task="t14-missing", export_to="local")
+
+            class _MissingLocalM4:
+                def run_m4_download(self, **kw):
+                    return {
+                        "image_count": 1,
+                        "export_to": "local",
+                        "local_out_dir": kw.get("local_out_dir"),
+                        "drive_folder": None,
+                        "id_list": ["scene-missing"],
+                        "roi_name": kw.get("roi_name", "task"),
+                    }
+
+            result = gal.execute_gee_download(
+                plan, m4_engine_mod=_MissingLocalM4(), push_log=lambda m: None
+            )
+            self.assertFalse(result["success"])
+            self.assertEqual(result["export_state"], "FAILED")
+            self.assertIn("本地", result["error"] or "")
+
+    def test_local_stale_file_cannot_satisfy_new_scene_count(self):
+        """旧目录中的 GeoTIFF 不能冒充本轮请求的下载结果。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = _happy_plan(tmp, task="t14-stale", export_to="local")
+            stale = os.path.join(plan["local_out_dir"], "old-scene.tif")
+            Path(stale).write_bytes(b"stale asset")
+
+            class _MissingLocalM4:
+                def run_m4_download(self, **kw):
+                    return {
+                        "image_count": 1,
+                        "export_to": "local",
+                        "local_out_dir": kw.get("local_out_dir"),
+                        "drive_folder": None,
+                        "id_list": ["scene-current"],
+                        "roi_name": kw.get("roi_name", "task"),
+                    }
+
+            result = gal.execute_gee_download(
+                plan, m4_engine_mod=_MissingLocalM4(), push_log=lambda m: None
+            )
+            self.assertFalse(result["success"])
+            self.assertEqual(result["export_state"], "FAILED")
+
+    def test_m4_local_adapter_rejects_empty_export(self):
+        """旧兼容 M4 入口也必须验证 geemap 是否真的写出文件。"""
+        import contextlib
+        import m4_engine
+
+        class _Image:
+            def select(self, *_args, **_kwargs):
+                return self
+
+        class _Collection:
+            def filterBounds(self, *_args): return self
+            def filterDate(self, *_args): return self
+            def filter(self, *_args): return self
+            def map(self, *_args): return self
+            def linkCollection(self, *_args): return self
+            def aggregate_array(self, *_args): return self
+            def getInfo(self): return ["scene-1"]
+            def first(self): return _Image()
+
+        fake_ee = SimpleNamespace(
+            ImageCollection=lambda *_args: _Collection(),
+            Filter=SimpleNamespace(
+                eq=lambda *_args: None,
+                lt=lambda *_args: None,
+                gt=lambda *_args: None,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "out")
+            with mock.patch.object(m4_engine, "ee", fake_ee), \
+                    mock.patch.object(m4_engine, "ensure_ee_initialized"), \
+                    mock.patch.object(m4_engine, "gee_network_context", return_value=contextlib.nullcontext()), \
+                    mock.patch.object(m4_engine, "_load_roi_geometry", return_value=SimpleNamespace(
+                        getInfo=lambda: {"coordinates": []}
+                    )), \
+                    mock.patch.object(m4_engine.geemap, "ee_export_image", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "本地下载未完成"):
+                    m4_engine.run_m4_download(
+                        roi_path="fake.geojson",
+                        roi_name="task",
+                        start_date="2023-01-01",
+                        end_date="2023-01-02",
+                        export_to="local",
+                        local_out_dir=out_dir,
+                        push_log=lambda _msg: None,
+                    )
+
     def test_execute_plan_id_isolation(self):
         with tempfile.TemporaryDirectory() as tmp:
             plan_a = _happy_plan(tmp, task="tA", export_to="local")
@@ -564,6 +684,15 @@ class TestSummarizeAndCapability(unittest.TestCase):
             self.assertIn("失败", text)
             self.assertIn("BOOM", text)
 
+    def test_summarize_failure_redacts_local_path(self):
+        text = gal.summarize_gee_result_for_chat({
+            "success": False,
+            "task_id": "x",
+            "error": "失败 /Users/chl/private/secret.tif",
+        })
+        self.assertNotIn("/Users/", text)
+        self.assertNotIn("secret.tif", text)
+
     def test_19_gee_capability_uses_multi_source_project(self):
         # 语义对齐：capability 的 project 解析与 m4_engine._resolve_ee_project 一致
         with mock.patch.object(gal, "_resolve_ee_project_any", return_value="env-project"):
@@ -662,7 +791,20 @@ class TestB12Integration(unittest.TestCase):
             })
             self.assertFalse(state.get("pending_task"))
             self.assertTrue(any("确认" in e for e in res2.errors))
-            # confirm_gee → run_gee_download 通过（bridge 侧）
+            # 阻断计划不可确认执行；随后用合法 AOI 验证 bridge 确认闭环。
+            res3 = apply_system_command(state, {
+                "pending_action": {"type": "confirm_gee", "plan_id": plan["plan_id"],
+                                   "task": "p1", "confirmed": True},
+            })
+            self.assertFalse(state.get("pending_task"))
+            self.assertTrue(any("执行条件" in e for e in res3.errors))
+            res_valid = apply_system_command(state, {
+                "pending_action": {"type": "propose_gee", "task": "p1",
+                                   "aoi": aoi_from_bbox(119.0, 25.5, 120.0, 26.0).geometry,
+                                   "start_date": "2023-01-01", "end_date": "2023-01-31"},
+            })
+            self.assertFalse(res_valid.errors)
+            plan = state.get("_gee_pending_plan")
             res3 = apply_system_command(state, {
                 "pending_action": {"type": "confirm_gee", "plan_id": plan["plan_id"],
                                    "task": "p1", "confirmed": True},
@@ -681,6 +823,19 @@ class TestB12Integration(unittest.TestCase):
 class TestLedgerPersistence(unittest.TestCase):
     """B7 最小持久化"""
 
+    def test_corrupt_ledger_is_preserved_and_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            orig = gal.GEE_TASK_LEDGER_PATH
+            try:
+                gal.GEE_TASK_LEDGER_PATH = os.path.join(tmp, "gee_task_ledger.json")
+                with open(gal.GEE_TASK_LEDGER_PATH, "w", encoding="utf-8") as handle:
+                    handle.write('{"task1": [')
+                with self.assertRaises(ValueError):
+                    gal._load_task_ledger()
+                self.assertTrue(list(Path(tmp).glob("gee_task_ledger.json.corrupt-*")))
+            finally:
+                gal.GEE_TASK_LEDGER_PATH = orig
+
     def test_ledger_roundtrip_and_restore(self):
         with tempfile.TemporaryDirectory() as tmp:
             orig = gal.GEE_TASK_LEDGER_PATH
@@ -697,6 +852,49 @@ class TestLedgerPersistence(unittest.TestCase):
                 self.assertTrue(restored["last_checked_at"])
             finally:
                 gal.GEE_TASK_LEDGER_PATH = orig
+
+    def test_ledger_error_fields_are_sanitized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            orig = gal.GEE_TASK_LEDGER_PATH
+            try:
+                gal.GEE_TASK_LEDGER_PATH = os.path.join(tmp, "gee_task_ledger.json")
+                gal._ledger_upsert(
+                    "task1",
+                    error_message="failed /Users/chl/private/task.tif token=sk-secret",
+                    description="download /Volumes/External/result.tif",
+                )
+                row = gal._ledger_get("task1")
+                self.assertNotIn("/Users/", row["error_message"])
+                self.assertNotIn("sk-secret", row["error_message"])
+                self.assertNotIn("/Volumes/", row["description"])
+            finally:
+                gal.GEE_TASK_LEDGER_PATH = orig
+
+
+class TestLedgerRecovery(unittest.TestCase):
+    def test_reconcile_completed_remote_task_is_truthful(self):
+        with mock.patch.object(gal, "_load_task_ledger", return_value={
+            "task1": {"task_id": "task1", "plan_id": "plan1", "gee_task_id": "remote-1", "status": "RUNNING"}
+        }), mock.patch.object(gal, "_ledger_upsert") as upsert:
+            result = gal.reconcile_gee_task(
+                "task1", plan_id="plan1",
+                poll_fn=lambda task_id: {"id": task_id, "state": "COMPLETED"},
+            )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "COMPLETED")
+        self.assertEqual(result["tasks"][0]["gee_task_id"], "remote-1")
+        upsert.assert_called_once()
+
+    def test_reconcile_unknown_remote_task_never_reports_success(self):
+        with mock.patch.object(gal, "_load_task_ledger", return_value={
+            "task1": {"task_id": "task1", "plan_id": "plan1", "gee_task_id": "remote-1", "status": "RUNNING"}
+        }), mock.patch.object(gal, "_ledger_upsert"):
+            result = gal.reconcile_gee_task(
+                "task1", plan_id="plan1",
+                poll_fn=lambda task_id: {"id": task_id, "state": "UNKNOWN", "error_message": "offline"},
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "UNKNOWN")
 
 
 if __name__ == "__main__":

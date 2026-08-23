@@ -18,6 +18,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from agent_context_policy import redact_spatial_metadata, sanitize_external_text
+
 # 阶段与状态枚举（与设计文档 5.1 一致）
 # INFERENCE / POST_PROCESS 为本地潮滩推理闭环细化阶段；
 # M5/E1 等既有闭环继续使用通用 EXECUTE，向后兼容。
@@ -67,6 +69,41 @@ _TRANSITIONS: Dict[str, frozenset] = {
 # 敏感键 / 敏感值（与 capability_registry 同策略）
 _SENSITIVE_KEY_SUBSTRINGS = ("token", "secret", "password", "api_key", "ion", "key")
 _SENSITIVE_VALUE_SUBSTRINGS = ("Z:/", "C:\\", "/home/", "token=", "key=", "sk-")
+_SPATIAL_KEY_SUBSTRINGS = (
+    "bbox", "bounds", "centroid", "geometry", "map_center", "coordinates",
+    "resolution", "transform", "crs",
+)
+
+
+def timeline_ledger_path(path: Optional[str] = None) -> str:
+    """Return the configured timeline ledger path.
+
+    The default remains ``TF-agent/data/timeline_ledger.json`` for backwards
+    compatibility.  Deployments and isolated acceptance runs can override it
+    with ``CSTF_TIMELINE_LEDGER_PATH`` so separate processes do not share
+    stale task history accidentally.
+    """
+    configured = path or os.environ.get("CSTF_TIMELINE_LEDGER_PATH")
+    if configured:
+        return os.path.abspath(os.path.expanduser(str(configured)))
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "data", "timeline_ledger.json"
+    )
+
+
+def _sanitize_timeline_text(value: Any) -> str:
+    """Sanitize persisted timeline text, including precise spatial fields."""
+    return redact_spatial_metadata(sanitize_external_text(value))[:500]
+
+
+def _sanitize_detail_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _sanitize_timeline_text(value)
+    if isinstance(value, dict):
+        return _sanitize_details(value)
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_detail_value(item) for item in list(value)[:100]]
+    return value
 
 
 def _now_str(now_fn=None) -> str:
@@ -81,11 +118,18 @@ def _sanitize_details(details: Dict[str, Any]) -> Dict[str, Any]:
         kl = str(k).lower()
         if any(s in kl for s in _SENSITIVE_KEY_SUBSTRINGS):
             continue
+        if any(s in kl for s in _SPATIAL_KEY_SUBSTRINGS):
+            out[k] = "<spatial-redacted>"
+            continue
         if isinstance(v, str):
             vl = v.lower()
             if any(s.lower() in vl for s in _SENSITIVE_VALUE_SUBSTRINGS):
                 continue
-        out[k] = v
+            out[k] = _sanitize_detail_value(v)
+        elif isinstance(v, (dict, list, tuple)):
+            out[k] = _sanitize_detail_value(v)
+        else:
+            out[k] = v
     return out
 
 
@@ -125,6 +169,9 @@ class TimelineEvent:
             raise ValueError(f"非法状态: {self.status}")
         if self.progress is not None and not (0 <= int(self.progress) <= 100):
             raise ValueError(f"progress 越界: {self.progress}")
+        self.message = _sanitize_timeline_text(self.message)
+        if self.error is not None:
+            self.error = _sanitize_timeline_text(self.error)
         self.artifacts = _relative_artifacts(self.artifacts or [])
         self.details = _sanitize_details(self.details or {})
 
@@ -209,9 +256,9 @@ class TimelineStore:
                     return False, ev
                 ev.progress = int(progress)
             if message is not None:
-                ev.message = message
+                ev.message = _sanitize_timeline_text(message)
             if error is not None:
-                ev.error = error
+                ev.error = _sanitize_timeline_text(error)
             ev.updated_at = _now_str(self._now_fn)
             return True, ev
         return False, None

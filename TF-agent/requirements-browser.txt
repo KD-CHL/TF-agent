@@ -1,0 +1,2 @@
+# Optional browser acceptance dependencies; not installed by the offline CI job.
+playwright==1.62.0

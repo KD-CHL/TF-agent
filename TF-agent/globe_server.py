@@ -35,55 +35,77 @@ _MAP_STATE: dict = {
     "aoi_seq": 0,          # 已处理的 AOI 消息最大序号
     "aoi_pending": [],     # 待消费 AOI 消息 [{seq, kind, geometry, source, label, ts}]
 }
+_MAP_STATES: dict[str, dict] = {"default": _MAP_STATE}
+_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._:-]{1,96}$")
 
 
-def map_protocol_state() -> dict:
+def _channel_key(channel_id: Optional[str]) -> str:
+    value = str(channel_id or "default").strip()
+    return value if _CHANNEL_RE.fullmatch(value) else "default"
+
+
+def _new_map_state() -> dict:
+    return {
+        "ready_ts": None,
+        "ready_count": 0,
+        "ack": None,
+        "ack_ts": None,
+        "aoi_seq": 0,
+        "aoi_pending": [],
+    }
+
+
+def _map_state(channel_id: Optional[str] = None) -> dict:
+    key = _channel_key(channel_id)
+    state = _MAP_STATES.get(key)
+    if state is None:
+        state = _new_map_state()
+        _MAP_STATES[key] = state
+    return state
+
+
+def map_protocol_state(channel_id: Optional[str] = None) -> dict:
     """读取地图协议状态（READY 时间 / 最近一次 FLY_ACK / AOI 序号）。"""
     with _lock:
-        return dict(_MAP_STATE)
+        return dict(_map_state(channel_id))
 
 
 def reset_map_protocol_state() -> None:
     with _lock:
-        _MAP_STATE.update(
-            {
-                "ready_ts": None,
-                "ready_count": 0,
-                "ack": None,
-                "ack_ts": None,
-                "aoi_seq": 0,
-                "aoi_pending": [],
-            }
-        )
+        _MAP_STATES.clear()
+        _MAP_STATES["default"] = _MAP_STATE
+        _MAP_STATE.clear()
+        _MAP_STATE.update(_new_map_state())
 
 
-def wait_map_ack(command_id: str, timeout: float = 1.5) -> Optional[dict]:
+def wait_map_ack(command_id: str, timeout: float = 1.5, *, channel_id: Optional[str] = None) -> Optional[dict]:
     """轮询等待指定 command_id 的 FLY_ACK；超时返回 None。"""
     deadline = time.time() + float(timeout)
     while time.time() < deadline:
         with _lock:
-            ack = _MAP_STATE.get("ack")
+            ack = _map_state(channel_id).get("ack")
             if ack and ack.get("command_id") == command_id:
                 return dict(ack)
         time.sleep(0.1)
     return None
 
 
-def push_aoi_message(msg: dict) -> int:
+def push_aoi_message(msg: dict, *, channel_id: Optional[str] = None) -> int:
     """Cesium iframe → Python：追加 AOI 消息，返回新序号。"""
     with _lock:
-        _MAP_STATE["aoi_seq"] = int(_MAP_STATE.get("aoi_seq") or 0) + 1
-        seq = _MAP_STATE["aoi_seq"]
-        pending = list(_MAP_STATE.get("aoi_pending") or [])
+        state = _map_state(channel_id)
+        state["aoi_seq"] = int(state.get("aoi_seq") or 0) + 1
+        seq = state["aoi_seq"]
+        pending = list(state.get("aoi_pending") or [])
         pending.append(dict(msg, seq=seq, ts=time.time()))
-        _MAP_STATE["aoi_pending"] = pending[-50:]  # 上限 50 条
+        state["aoi_pending"] = pending[-50:]  # 上限 50 条
         return seq
 
 
-def take_aoi_pending(since_seq: int = 0) -> dict:
+def take_aoi_pending(since_seq: int = 0, *, channel_id: Optional[str] = None) -> dict:
     """消费序号 > since_seq 的 AOI 消息。返回 {messages, last_seq}。"""
     with _lock:
-        pending = list(_MAP_STATE.get("aoi_pending") or [])
+        pending = list(_map_state(channel_id).get("aoi_pending") or [])
     fresh = [m for m in pending if int(m.get("seq") or 0) > int(since_seq)]
     last_seq = max((int(m.get("seq") or 0) for m in pending), default=int(since_seq))
     return {"messages": fresh, "last_seq": last_seq}
@@ -293,6 +315,10 @@ class _GlobeHandler(BaseHTTPRequestHandler):
         raw = self.path or "/"
         path = raw.split("?", 1)[0]
         query = raw.split("?", 1)[1] if "?" in raw else ""
+        from urllib.parse import parse_qs
+
+        query_params = parse_qs(query, keep_blank_values=True)
+        channel_id = _channel_key((query_params.get("channel_id") or ["default"])[0])
         cache_key = ""
         if query:
             for part in query.split("&"):
@@ -353,8 +379,9 @@ class _GlobeHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/map/ready":
             with _lock:
-                _MAP_STATE["ready_ts"] = time.time()
-                _MAP_STATE["ready_count"] = int(_MAP_STATE.get("ready_count") or 0) + 1
+                state = _map_state(channel_id)
+                state["ready_ts"] = time.time()
+                state["ready_count"] = int(state.get("ready_count") or 0) + 1
             self._send(200, b"ok", "text/plain; charset=utf-8")
             return
         if path == "/api/map/ack":
@@ -366,18 +393,24 @@ class _GlobeHandler(BaseHTTPRequestHandler):
                     k, v = part.split("=", 1)
                     q[k] = urllib.parse.unquote(v)
             with _lock:
-                _MAP_STATE["ack"] = {
+                state = _map_state(channel_id)
+                state["ack"] = {
                     "command_id": q.get("command_id", ""),
                     "ok": q.get("ok") == "1",
                     "ts": time.time(),
                 }
-                _MAP_STATE["ack_ts"] = time.time()
+                state["ack_ts"] = time.time()
             self._send(200, b"ok", "text/plain; charset=utf-8")
             return
         self._send(404, b"not found", "text/plain; charset=utf-8")
 
     def do_POST(self) -> None:
-        path = (self.path or "/").split("?", 1)[0]
+        raw_path = self.path or "/"
+        path = raw_path.split("?", 1)[0]
+        from urllib.parse import parse_qs
+
+        query_params = parse_qs(raw_path.split("?", 1)[1], keep_blank_values=True) if "?" in raw_path else {}
+        channel_id = _channel_key((query_params.get("channel_id") or ["default"])[0])
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except (TypeError, ValueError):
@@ -404,7 +437,8 @@ class _GlobeHandler(BaseHTTPRequestHandler):
                     "geometry": geometry,
                     "source": source,
                     "label": label if isinstance(label, str) else None,
-                }
+                },
+                channel_id=channel_id,
             )
             self._send(200, b'{"ok":true}', "application/json; charset=utf-8")
             return

@@ -4,6 +4,8 @@
 import os
 import sys
 import unittest
+from pathlib import Path
+from unittest import mock
 
 _TF_AGENT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "TF-agent"))
 if _TF_AGENT not in sys.path:
@@ -43,6 +45,15 @@ def _registry_with_fake_files(tmp, now_fn=None, **extra_ctx):
 
 
 class TestRegistrySetup(unittest.TestCase):
+    def test_shared_context_builder_keeps_ui_and_agent_inputs_aligned(self):
+        with mock.patch("knowledge_store.knowledge_db_path", return_value="/canonical/rs_knowledge_db") as path_fn:
+            ctx = cr.build_context(app_dir="/opt/tf-agent", model_path="/models/a.pth", task="p1")
+        path_fn.assert_called_once()
+        self.assertEqual(ctx["model_path"], "/models/a.pth")
+        self.assertEqual(ctx["task"], "p1")
+        self.assertEqual(ctx["autotune_script"], "/opt/tf-agent/auto_tune.py")
+        self.assertEqual(ctx["knowledge_db_dir"], "/canonical/rs_knowledge_db")
+
     def test_all_nine_capabilities_registered(self):
         reg = cr.CapabilityRegistry(context={})
         ids = set(reg.ids())
@@ -81,6 +92,14 @@ class TestStatusDetermination(unittest.TestCase):
         st = reg.check("gee_download")
         self.assertEqual(st.status, cr.UNAVAILABLE)
 
+    def test_gee_probe_uses_real_ee_module_name(self):
+        with mock.patch.dict(os.environ, {"EE_PROJECT": "proj-test"}, clear=False):
+            with mock.patch.object(cr, "_module_importable", side_effect=lambda name: name == "ee") as probe:
+                st = cr.CapabilityRegistry(context={}).check("gee_download")
+        self.assertEqual(st.status, cr.CONDITIONAL)
+        probe.assert_any_call("ee")
+        self.assertFalse(any(call.args == ("gee",) for call in probe.call_args_list))
+
     def test_conditional_when_pdf_font_missing_with_fallback(self):
         reg = cr.CapabilityRegistry(context={})
         st = reg.check("pdf_report")
@@ -88,6 +107,30 @@ class TestStatusDetermination(unittest.TestCase):
         # 缺中文字体时应有降级提示
         if st.status == cr.CONDITIONAL:
             self.assertTrue(st.warnings or st.blockers or st.recommended_actions)
+
+    def test_e1_does_not_use_unrelated_dl_model_as_readiness(self):
+        with mock.patch.object(cr, "_module_importable", side_effect=lambda name: name == "e1_engine"):
+            st = cr.CapabilityRegistry(context={"model_path": "/tmp/unrelated.pth"}).check("e1_quality_evaluation")
+        self.assertEqual(st.status, cr.CONDITIONAL)
+        self.assertIn("数据集", st.summary)
+
+    def test_m5_does_not_report_available_from_unrelated_dl_model(self):
+        with mock.patch.object(cr, "_module_importable", side_effect=lambda name: name == "m5_engine"):
+            st = cr.CapabilityRegistry(context={"model_path": "/tmp/unrelated.pth"}).check("m5_change_detection")
+        self.assertEqual(st.status, cr.CONDITIONAL)
+        self.assertIn("基线", st.summary)
+
+    def test_runtime_verification_is_distinct_from_static_probe(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            reg = _registry_with_fake_files(__import__("pathlib").Path(td))
+            static = reg.check("deep_learning_inference")
+            assert static.validation_level == "static"
+            reg.mark_runtime_verified("deep_learning_inference")
+            runtime = reg.check("deep_learning_inference")
+            assert runtime.validation_level == "runtime"
+            reg.clear_runtime_verification()
+            assert reg.check("deep_learning_inference").validation_level == "static"
 
     def test_unknown_when_check_raises(self):
         def boom(ctx):
@@ -229,6 +272,34 @@ class TestSafety(unittest.TestCase):
                     if isinstance(v, str):
                         self.assertNotIn("Z:/", v)
 
+    def test_evidence_sanitizes_posix_windows_and_unc_paths(self):
+        reg = cr.CapabilityRegistry(context={})
+        reg.register(
+            "path_cap",
+            "路径检查",
+            "cheap",
+            lambda ctx: cr.CapabilityStatus(
+                capability_id="path_cap",
+                label="路径检查",
+                status=cr.AVAILABLE,
+                summary="ok",
+                evidence={
+                    "mac": "/Users/chl/private/key.json",
+                    "posix": "/tmp/work/result.tif",
+                    "win": "C:\\Users\\chl\\secret.pth",
+                    "unc": "\\\\server\\share\\secret.tif",
+                    "ok": "scene_count=3",
+                },
+            ),
+        )
+        evidence = reg.check("path_cap").evidence
+        self.assertEqual(evidence, {"ok": "scene_count=3"})
+
+    def test_app_full_refresh_uses_bump(self):
+        app_source = Path(Path(__file__).parents[2] / "TF-agent" / "app.py").read_text(encoding="utf-8")
+        self.assertNotIn("_cap_reg.invalidate()", app_source)
+        self.assertGreaterEqual(app_source.count("_cap_reg.bump()"), 2)
+
     def test_summary_whitelist_only(self):
         reg = cr.CapabilityRegistry(context={})
         snap = reg.snapshot_for_agent()
@@ -244,13 +315,19 @@ class TestSafety(unittest.TestCase):
 
     def test_unknown_summary_has_no_traceback(self):
         def boom(ctx):
-            raise ValueError("kaboom")
+            raise ValueError(
+                "kaboom /Users/chl/private/model.pth token=sk-secret "
+                "https://user:password@example.invalid/api"
+            )
 
         reg = cr.CapabilityRegistry(context={})
         reg.register("boom_cap", "爆炸", "cheap", boom)
         st = reg.check("boom_cap")
         self.assertNotIn("Traceback", st.summary)
         self.assertNotIn("File \"", st.summary)
+        self.assertNotIn("/Users/", st.summary)
+        self.assertNotIn("sk-secret", st.summary)
+        self.assertNotIn("user:password@", st.summary)
 
     def test_agent_cannot_mutate_registry_via_snapshot(self):
         reg = cr.CapabilityRegistry(context={})

@@ -10,6 +10,8 @@ import os
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 _TF_AGENT = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "TF-agent")
@@ -98,6 +100,10 @@ class WorkflowOrchestratorTestBase(unittest.TestCase):
         return wo.build_analysis_workflow(**defaults)
 
     def _run(self, wf, ctx=None):
+        if not wf.get("confirmed"):
+            state = {wo.STATE_WORKFLOW_PENDING_PLAN: wf}
+            ok, err = wo.confirm_workflow(state, wf["workflow_id"])
+            self.assertTrue(ok, err)
         return wo.run_analysis_workflow(wf, exec_ctx=ctx or _all_ok_ctx())
 
     def _confirm(self, wf):
@@ -106,6 +112,191 @@ class WorkflowOrchestratorTestBase(unittest.TestCase):
         ok, err = wo.confirm_workflow(state, wf["workflow_id"])
         self.assertTrue(ok, err)
         return state
+
+    def test_corrupt_asset_registry_is_preserved_and_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "assets_registry.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write('{"bad": [')
+            with self.assertRaises(ValueError):
+                wo.load_assets_registry(path)
+            self.assertTrue(os.path.exists(path))
+            self.assertTrue(list(__import__("pathlib").Path(td).glob("assets_registry.json.corrupt-*")))
+
+    def test_invalid_asset_record_is_preserved_and_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "assets_registry.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"bad": {"file_path": []}}, handle)
+            with self.assertRaises(ValueError):
+                wo.load_assets_registry(path)
+            self.assertTrue(list(__import__("pathlib").Path(td).glob("assets_registry.json.corrupt-*")))
+
+
+def test_workflow_result_timeline_status_preserves_warnings():
+    assert wo.workflow_result_timeline_status(wo.WF_SUCCEEDED) == "SUCCEEDED"
+    assert wo.workflow_result_timeline_status(wo.WF_COMPLETED_WITH_WARNINGS) == "WARNING"
+    assert wo.workflow_result_timeline_status(wo.WF_FAILED) == "FAILED"
+
+
+def test_pdf_step_rejects_report_when_asset_registration_fails(monkeypatch, tmp_path):
+    """A generated PDF is not a successful workflow result until registered."""
+    import asset_report_engine as are
+
+    report_path = tmp_path / "report.pdf"
+    report_path.write_bytes(b"pdf")
+    result = SimpleNamespace(
+        success=True,
+        report_path=str(report_path),
+        sections=["基本信息"],
+        warnings=[],
+        error="",
+    )
+    monkeypatch.setattr(are, "generate_asset_report", lambda **_kwargs: result)
+    monkeypatch.setattr(wo, "_register_report_asset", lambda *_args, **_kwargs: None)
+    step = {"step_id": "pdf_report", "tool": wo.TOOL_PDF_REPORT}
+    workflow = {"task_id": "24zhejiang", "context": {}}
+
+    outcome = wo._run_report_step(
+        step,
+        workflow,
+        exec_ctx={},
+        push_log=lambda _message: None,
+        stop_event=None,
+    )
+
+    assert outcome["success"] is False
+    assert outcome["status"] == wo.STEP_FAILED
+    assert "登记失败" in outcome["error"]
+
+
+def test_report_asset_registration_rejects_empty_file(tmp_path):
+    """空报告不能进入成果注册表，即使路径本身存在。"""
+    report_path = tmp_path / "empty-report.pdf"
+    report_path.touch()
+    registry_path = tmp_path / "assets_registry.json"
+
+    asset_id = wo._register_report_asset(
+        "24zhejiang", str(report_path), exec_ctx={"registry_path": str(registry_path)}
+    )
+
+    assert asset_id is None
+    assert not registry_path.exists()
+
+
+def test_e1_asset_registration_rejects_empty_report(tmp_path):
+    report_path = tmp_path / "empty-e1.json"
+    report_path.touch()
+    registry_path = tmp_path / "assets_registry.json"
+
+    asset_id = wo._register_e1_workflow_asset(
+        "24zhejiang", {"report_path": str(report_path)},
+        exec_ctx={"registry_path": str(registry_path)},
+    )
+
+    assert asset_id is None
+    assert not registry_path.exists()
+
+
+def test_m5_asset_registration_rejects_empty_report(tmp_path):
+    report_path = tmp_path / "empty-m5.json"
+    report_path.touch()
+    registry_path = tmp_path / "assets_registry.json"
+
+    asset_id = wo._register_m5_workflow_asset(
+        "24zhejiang", {"report_path": str(report_path)},
+        exec_ctx={"registry_path": str(registry_path)},
+    )
+
+    assert asset_id is None
+    assert not registry_path.exists()
+
+
+def test_prediction_asset_selection_rejects_empty_file(tmp_path):
+    empty = tmp_path / "task_Final.tif"
+    empty.touch()
+
+    selected = wo._find_prediction_asset(
+        {"task_id": "24zhejiang"},
+        {"asset": {"task": "24zhejiang", "file_path": str(empty)}},
+    )
+
+    assert selected is None
+
+
+def test_engine_adapter_fails_when_registration_returns_none():
+    step = {"step_id": "e1_quality", "tool": wo.TOOL_E1_QUALITY}
+    workflow = {"workflow_id": "wf-registration-gate"}
+
+    outcome = wo._run_engine_adapter(
+        step,
+        workflow,
+        {"plan_id": "plan-1"},
+        run_fn=lambda *_args: {"success": True, "report": {"report_path": "x"}},
+        verify_fn=lambda _raw: {"ok": True, "checks": []},
+        register_fn=lambda *_args: None,
+        asset_type=wo.ASSET_E1,
+        exec_ctx={},
+        push_log=lambda _message: None,
+        stop_event=None,
+    )
+
+    assert outcome["success"] is False
+    assert outcome["status"] == wo.STEP_FAILED
+    assert "登记" in outcome["error"]
+    assert step["status"] == wo.STEP_FAILED
+
+
+def test_engine_adapter_fails_closed_when_registration_raises():
+    step = {"step_id": "e1_quality", "tool": wo.TOOL_E1_QUALITY}
+    workflow = {"workflow_id": "wf-registration-exception"}
+
+    def register(_plan, _raw, _verification):
+        raise ValueError("registry write failed /Users/private/report.json")
+
+    outcome = wo._run_engine_adapter(
+        step,
+        workflow,
+        {"plan_id": "plan-1"},
+        run_fn=lambda *_args: {"success": True},
+        verify_fn=lambda _raw: {"ok": True, "checks": []},
+        register_fn=register,
+        asset_type=wo.ASSET_E1,
+        exec_ctx={},
+        push_log=lambda _message: None,
+        stop_event=None,
+    )
+
+    assert outcome["success"] is False
+    assert outcome["status"] == wo.STEP_FAILED
+    assert "登记" in outcome["error"]
+    assert "/Users/" not in outcome["error"]
+
+
+def test_child_adapter_fails_closed_when_registration_raises():
+    step = {"step_id": "local_inference", "tool": wo.TOOL_LOCAL_INFERENCE}
+    workflow = {"workflow_id": "wf-child-registration-exception"}
+
+    def register(_plan, _raw, _verification):
+        raise ValueError("registry write failed /Users/private/report.json")
+
+    outcome = wo._run_with_child_confirmation(
+        step,
+        workflow,
+        {"ready": True, "plan_id": "plan-1"},
+        execute_fn=lambda *_args: {"success": True},
+        verify_fn=lambda *_args: {"ok": True, "checks": []},
+        register_fn=register,
+        asset_type=wo.ASSET_PREDICTION,
+        exec_ctx={},
+        push_log=lambda _message: None,
+        stop_event=None,
+    )
+
+    assert outcome["success"] is False
+    assert outcome["status"] == wo.STEP_FAILED
+    assert "登记" in outcome["error"]
+    assert "/Users/" not in outcome["error"]
 
 
 # ---------------------------------------------------------------
@@ -133,7 +324,10 @@ class TestBuildWorkflow(WorkflowOrchestratorTestBase):
         self.assertEqual(by_id["e1_quality"]["depends_on"], ["local_inference"])
         self.assertEqual(by_id["m5_change"]["depends_on"], ["local_inference"])
         self.assertEqual(
-            by_id["pdf_report"]["depends_on"], ["local_inference", "e1_quality", "m5_change"]
+            by_id["pdf_report"]["depends_on"], ["local_inference"]
+        )
+        self.assertEqual(
+            by_id["pdf_report"]["optional_depends_on"], ["e1_quality", "m5_change"]
         )
 
     def test_build_required_flags(self):
@@ -213,6 +407,29 @@ class TestBuildWorkflow(WorkflowOrchestratorTestBase):
         self.assertFalse(ok)
         self.assertTrue(any("影像根目录" in b for b in blockers))
 
+    def test_validate_blockers_missing_required_workflow_inputs(self):
+        wf = self._build(root_dir="", final_root="", mask_root="", model_path="")
+        ok, blockers, _ = wo.validate_analysis_workflow(wf)
+        self.assertFalse(ok)
+        self.assertTrue(any("缺少影像根目录" in b for b in blockers))
+        self.assertTrue(any("缺少成果根目录" in b for b in blockers))
+        self.assertTrue(any("缺少掩膜根目录" in b for b in blockers))
+        self.assertTrue(any("缺少模型权重" in b for b in blockers))
+
+    def test_validate_blockers_do_not_echo_windows_paths(self):
+        wf = self._build(
+            root_dir=r"C:\Users\chl\input",
+            final_root=r"C:\Users\chl\final",
+            mask_root=r"\\server\share\mask",
+            model_path=r"E:\models\cdnet.pth",
+        )
+        ok, blockers, _ = wo.validate_analysis_workflow(wf)
+        self.assertFalse(ok)
+        text = "\n".join(blockers)
+        self.assertNotIn(r"C:\Users\chl", text)
+        self.assertNotIn(r"\\server\share", text)
+        self.assertIn("input", text)
+
 
 # ---------------------------------------------------------------
 #  2. 父级确认门闩
@@ -288,6 +505,38 @@ class TestConfirmWorkflow(WorkflowOrchestratorTestBase):
 #  3. DAG 执行（override 执行器）
 # ---------------------------------------------------------------
 class TestRunWorkflow(WorkflowOrchestratorTestBase):
+    def test_optional_failure_does_not_block_pdf(self):
+        wf = self._build(user_intent={"need_e1": None, "need_m5": False})
+        by_id = {s["step_id"]: s for s in wf["steps"]}
+        # 让自动 E1 进入执行，保持其可选语义；M5 明确跳过。
+        by_id["e1_quality"]["condition"] = None
+
+        def _fail_optional_e1(step, workflow, exec_ctx):
+            if step["step_id"] == "e1_quality":
+                return _fail_executor(step, workflow, exec_ctx)
+            return _ok_executor(step, workflow, exec_ctx)
+
+        result = self._run(wf, {**_all_ok_ctx(), "e1_executor": _fail_optional_e1})
+        self.assertEqual(result["status"], wo.WF_COMPLETED_WITH_WARNINGS)
+        self.assertEqual(by_id["e1_quality"]["status"], wo.STEP_FAILED)
+        self.assertEqual(by_id["m5_change"]["status"], wo.STEP_SKIPPED)
+        self.assertEqual(by_id["pdf_report"]["status"], wo.STEP_SUCCEEDED)
+        self.assertIn("模拟失败 e1_quality", "\n".join(result["warnings"]))
+        self.assertIn("成果报告", result["summary"])
+
+    def test_required_e1_failure_blocks_pdf_and_fails_workflow(self):
+        wf = self._build(user_intent={"need_e1": True, "need_m5": False})
+
+        def _fail_required_e1(step, workflow, exec_ctx):
+            if step["step_id"] == "e1_quality":
+                return _fail_executor(step, workflow, exec_ctx)
+            return _ok_executor(step, workflow, exec_ctx)
+
+        result = self._run(wf, {**_all_ok_ctx(), "e1_executor": _fail_required_e1})
+        by_id = {s["step_id"]: s for s in wf["steps"]}
+        self.assertEqual(result["status"], wo.WF_FAILED)
+        self.assertEqual(by_id["e1_quality"]["status"], wo.STEP_FAILED)
+        self.assertEqual(by_id["pdf_report"]["status"], wo.STEP_BLOCKED)
     def test_full_dag_asset_chaining(self):
         wf = self._build(user_intent={"need_e1": True, "need_m5": True})
         result = self._run(wf)
@@ -339,6 +588,20 @@ class TestRunWorkflow(WorkflowOrchestratorTestBase):
         by_id["pdf_report"]["status"] = wo.STEP_SUCCEEDED
         self.assertEqual(wo._evaluate_workflow_status(wf), wo.WF_COMPLETED_WITH_WARNINGS)
 
+    def test_optional_blocked_step_keeps_warnings(self):
+        """可选步骤被依赖阻断时也不能把 Workflow 伪报为全成功。"""
+        wf = self._build(user_intent={"need_e1": False, "need_m5": False})
+        by_id = {s["step_id"]: s for s in wf["steps"]}
+        for step in wf["steps"]:
+            step["status"] = wo.STEP_SUCCEEDED
+        by_id["e1_quality"]["required"] = False
+        by_id["e1_quality"]["status"] = wo.STEP_BLOCKED
+        result = wo._finalize_result(wf, status=wo._evaluate_workflow_status(wf))
+
+        assert result["status"] == wo.WF_COMPLETED_WITH_WARNINGS
+        assert any("可选步骤" in warning and "精度评价" in warning
+                   for warning in result["warnings"])
+
     def test_required_optional_mix_all_succeeded(self):
         wf = self._build()
         by_id = {s["step_id"]: s for s in wf["steps"]}
@@ -375,6 +638,7 @@ class TestRunWorkflow(WorkflowOrchestratorTestBase):
     def test_stop_event_cancels(self):
         import threading
         wf = self._build(user_intent={"need_e1": True, "need_m5": True})
+        self._confirm(wf)
         ev = threading.Event()
         ev.set()
 
@@ -460,11 +724,35 @@ class TestLedger(WorkflowOrchestratorTestBase):
         wo._ledger_upsert(wf, status=wo.WF_RUNNING)
         self.assertEqual(wo.load_workflow_ledger(), {})
 
+    def test_corrupt_ledger_is_preserved_and_rejected(self):
+        path = wo.WORKFLOW_LEDGER_PATH
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write('{"wf_bad": [')
+        with self.assertRaises(ValueError):
+            wo.load_workflow_ledger(path)
+        self.assertTrue(os.path.exists(path))
+        self.assertTrue(list(__import__("pathlib").Path(self._data_dir).glob(
+            "workflow_ledger.json.corrupt-*")))
+
+    def test_invalid_ledger_record_is_preserved_and_rejected(self):
+        path = wo.WORKFLOW_LEDGER_PATH
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"wf_bad": []}, handle)
+        with self.assertRaises(ValueError):
+            wo.load_workflow_ledger(path)
+        self.assertTrue(list(__import__("pathlib").Path(self._data_dir).glob(
+            "workflow_ledger.json.corrupt-*")))
+
 
 # ---------------------------------------------------------------
 #  6. 血缘（lineage）
 # ---------------------------------------------------------------
 class TestLineage(WorkflowOrchestratorTestBase):
+    def test_git_head_resolution_does_not_spawn_subprocess(self):
+        with patch("subprocess.run", side_effect=AssertionError("git subprocess is forbidden")):
+            commit = wo._git_head_or_unknown()
+        self.assertRegex(commit, r"^(?:[0-9a-f]{7}|unknown)$")
+
     def test_record_and_get_lineage(self):
         wo.record_asset_lineage(
             "ds_1", asset_type="dataset", workflow_id="wf_1", derived_from=[]
@@ -504,6 +792,15 @@ class TestLineage(WorkflowOrchestratorTestBase):
         info = wo.get_asset_lineage("nope")
         self.assertFalse(info["found"])
         self.assertEqual(info["ancestors"], [])
+
+    def test_corrupt_lineage_is_preserved_and_rejected(self):
+        path = os.path.join(self._data_dir, "workflow_lineage.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write('{"asset_bad": [')
+        with self.assertRaises(ValueError):
+            wo.get_asset_lineage("asset_bad")
+        self.assertTrue(list(__import__("pathlib").Path(self._data_dir).glob(
+            "workflow_lineage.json.corrupt-*")))
 
     def test_enrich_asset_metadata(self):
         out = wo.enrich_asset_metadata(
@@ -546,6 +843,11 @@ class TestSummarize(WorkflowOrchestratorTestBase):
         filtered = wo._sensitive_filtered("下载失败: token=abc123")
         self.assertEqual(filtered, "<redacted>")
         self.assertNotIn("abc123", filtered)
+
+    def test_path_in_step_error_is_redacted_in_summary(self):
+        filtered = wo._sensitive_filtered("下载失败: /Users/chl/private/result.tif")
+        self.assertNotIn("/Users/", filtered)
+        self.assertNotIn("result.tif", filtered)
 
     def test_format_plan_for_user(self):
         wf = self._build(user_intent={"need_e1": True, "need_m5": True})

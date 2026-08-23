@@ -14,11 +14,20 @@ from typing import Any, Dict, List, Optional
 
 import e1_engine
 import m5_engine
+from agent_context_policy import safe_error_summary
 
 _E1_INTENT_RE = re.compile(
     r"(多源一致|一致性诊断|\be1\b|E1|和师姐比|对比开源|分歧图|多产品热力)",
     re.IGNORECASE,
 )
+
+
+def _nonempty_file(path: object) -> bool:
+    """Return true only for a readable path with at least one byte."""
+    try:
+        return bool(path) and os.path.isfile(str(path)) and os.path.getsize(str(path)) > 0
+    except OSError:
+        return False
 _CONFIRM_RE = re.compile(
     r"^(确认|同意|好的?|可以|执行|开始|开始执行|确认执行|确认计划|就这样|ok|OK)[\s!！。．.]*$",
     re.IGNORECASE,
@@ -93,7 +102,7 @@ def build_e1_preflight(
         try:
             available_datasets = list(e1_engine.list_e1_datasets(data_root) or [])
         except Exception as exc:
-            warnings.append(f"列举 E1 数据集失败（执行时将再试）：{exc}")
+            warnings.append(f"列举 E1 数据集失败（执行时将再试）：{safe_error_summary(exc)}")
 
     if available_datasets and reference not in available_datasets:
         warnings.append(
@@ -177,7 +186,7 @@ def pick_e1_map_path(report: Optional[Dict[str, Any]]) -> Optional[str]:
     mp = report.get("multi_product_heatmap") or {}
     for key in ("any_disagreement_tif", "agreement_count_tif"):
         p = mp.get(key)
-        if p and os.path.isfile(str(p)):
+        if _nonempty_file(p):
             return os.path.normpath(str(p))
     comps = report.get("comparisons") or {}
     for _pair, metrics in comps.items():
@@ -186,7 +195,7 @@ def pick_e1_map_path(report: Optional[Dict[str, Any]]) -> Optional[str]:
         maps = (metrics.get("causal_analysis") or {}).get("disagreement_maps") or {}
         for key in ("heatmap", "class", "consensus"):
             p = maps.get(key)
-            if p and os.path.isfile(str(p)):
+            if _nonempty_file(p):
                 return os.path.normpath(str(p))
     return None
 
@@ -214,7 +223,7 @@ def verify_e1_outputs(report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     report_path = report.get("report_path")
     _check(
         "report_json_on_disk",
-        bool(report_path and os.path.isfile(str(report_path))),
+        _nonempty_file(report_path),
         str(report_path or ""),
     )
 
@@ -245,8 +254,13 @@ def summarize_e1_report_for_chat(
             "精度评价未生成有效结果。"
             "请检查当期成果、数据集根目录与参考产品后重试。"
         )
+    verification_state = (
+        "已验证" if verification and verification.get("ok") is True
+        else "校验未完全通过" if verification is not None
+        else "待校验"
+    )
     lines = [
-        "## 潮滩精度评价结果（已验证）",
+        f"## 潮滩精度评价结果（{verification_state}）",
         "",
         f"- 任务 / ROI：`{report.get('roi_name') or '—'}`",
         f"- 参考产品：`{report.get('reference') or '—'}`",

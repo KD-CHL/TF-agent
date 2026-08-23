@@ -17,6 +17,14 @@ _M5_INTENT_RE = re.compile(
     r"(变化检测|时空变化|m5|M5|异动|萎缩|淤积|告警检测|对比基线|两期对比)",
     re.IGNORECASE,
 )
+
+
+def _nonempty_file(path: object) -> bool:
+    """Return true only for a readable path with at least one byte."""
+    try:
+        return bool(path) and os.path.isfile(str(path)) and os.path.getsize(str(path)) > 0
+    except OSError:
+        return False
 _CONFIRM_RE = re.compile(
     r"^(确认|同意|好的?|可以|执行|开始|开始执行|确认执行|确认计划|就这样|ok|OK)[\s!！。．.]*$",
     re.IGNORECASE,
@@ -242,7 +250,7 @@ def verify_m5_outputs(report: Optional[Dict[str, Any]], workspace_dir: Optional[
         report_path = m5_engine.m5_report_path(workspace_dir, report["target_roi"])
     _check(
         "report_json_on_disk",
-        bool(report_path and os.path.isfile(str(report_path))),
+        _nonempty_file(report_path),
         str(report_path or ""),
     )
 
@@ -252,8 +260,8 @@ def verify_m5_outputs(report: Optional[Dict[str, Any]], workspace_dir: Optional[
     spatial = report.get("spatial_outputs") or {}
     loss = spatial.get("loss_shapefile_path")
     silt = spatial.get("siltation_shapefile_path")
-    loss_ok = bool(loss) and str(loss) != "None" and os.path.isfile(str(loss))
-    silt_ok = bool(silt) and str(silt) != "None" and os.path.isfile(str(silt))
+    loss_ok = bool(loss) and str(loss) != "None" and _nonempty_file(loss)
+    silt_ok = bool(silt) and str(silt) != "None" and _nonempty_file(silt)
     # 差异面可为空（无显著变化），不算失败；仅记录
     checks.append(
         {
@@ -285,10 +293,10 @@ def pick_m5_map_path(report: Optional[Dict[str, Any]]) -> Optional[str]:
     spatial = report.get("spatial_outputs") or {}
     for key in ("loss_shapefile_path", "siltation_shapefile_path"):
         p = spatial.get(key)
-        if p and str(p) != "None" and os.path.isfile(str(p)):
+        if p and str(p) != "None" and _nonempty_file(p):
             return os.path.normpath(str(p))
     cur = report.get("current_shp")
-    if cur and os.path.isfile(str(cur)):
+    if cur and _nonempty_file(cur):
         return os.path.normpath(str(cur))
     return None
 
@@ -308,8 +316,13 @@ def summarize_m5_report_for_chat(
     ae = qm.get("area_evolution") or {}
     ct = qm.get("centroid_trajectory") or {}
     lvl = report.get("alert_level", "—")
+    verification_state = (
+        "已验证" if verification and verification.get("ok") is True
+        else "校验未完全通过" if verification is not None
+        else "待校验"
+    )
     lines = [
-        "## 潮滩变化分析结果（已验证）",
+        f"## 潮滩变化分析结果（{verification_state}）",
         "",
         f"- 任务：`{report.get('target_roi') or '—'}`",
         f"- 基线：`{report.get('baseline_task') or os.path.basename(str(report.get('baseline_shp') or '')) or '—'}`",

@@ -44,12 +44,13 @@ TF-agent/
 推荐：
 
 - Python `3.10`
-- Conda 环境名：`yynet`
+- Conda 环境名：`tf-agent`
 
 ```powershell
-conda activate gwx
+conda activate tf-agent
 cd TF-agent
 python -m pip install -r requirements.txt
+python -m pip install -r requirements-test.txt
 ```
 
 ---
@@ -59,18 +60,31 @@ python -m pip install -r requirements.txt
 在 `TF-agent/.env` 中配置（可复制 `.env.example`）：
 
 ```env
-# 必填：百炼 Key
+# 可选：百炼 Copilot Key；未配置时手动地图/任务仍可启动
 DASHSCOPE_API_KEY=你的Key
 
 # 模型
 QWEN_CHAT_MODEL=qwen-vl-plus
 QWEN_OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 
+# 可选：本地 OpenAI-compatible 后端（未声明 tools 时只提供纯文本问答）
+# CSTF_LLM_BACKEND=local
+# CSTF_LLM_BASE_URL=http://127.0.0.1:8000/v1
+# CSTF_LLM_API_KEY=local
+
 # TIFF 对话输入策略
 YYNET_TIFF_MODE=auto
-YYNET_ATTACH_GEO_META=1
+# 默认不发送精确空间元数据；仅在用户明确授权后由会话临时开启
+YYNET_ATTACH_GEO_META=0
 YYNET_TIFF_AUTO_PNG_MB=12
 YYNET_VLM_MAX_SIDE=2048
+
+# 知识库（可选；与 Agent 查询和维护 CLI 共用）
+CHROMA_RS_DB_PATH=./rs_knowledge_db
+CSTF_KB_EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
+
+# 后台任务账本（进程重启会将未完成任务标记为 INTERRUPTED）
+CSTF_JOB_DB_PATH=./data/jobs.sqlite3
 
 # 代理（建议清空，避免 Connection error）
 HTTP_PROXY=
@@ -95,7 +109,7 @@ KMP_DUPLICATE_LIB_OK=TRUE
 ## 5. 启动方式
 
 ```powershell
-conda activate gwx
+conda activate tf-agent
 cd TF-agent
 python -m streamlit run app.py --server.port 8501
 ```
@@ -119,6 +133,9 @@ python -m streamlit run app.py --server.port 8501
 ## 7. 聊天与图片分析（当前实现）
 
 - 用户与智能体消息样式已区分（便于识别）
+- Agent Dock 默认进入“对话”视图；“历史”视图独立显示最近 8 条非空会话，可直接切换历史会话
+- Agent Dock 支持“收起/展开”，并提供“对话区宽度”滑块，可在 24%–48% 间调整工作台右侧栏比例
+- “新会话”和“清空会话”只在历史视图中显示，避免挤压当前对话
 - 上传图片后输入框自动激活（无需再点）
 - 发送后聊天记录会回显用户上传图片
 - 仅上传图片不输入文本时，会自动使用默认提示词并给出提醒
@@ -129,9 +146,17 @@ python -m streamlit run app.py --server.port 8501
 
 ---
 
-## 8. GeoTIFF 元信息（对话可见）
+## 8. GeoTIFF 元信息与外部模型授权
 
-系统会向模型附带（可通过 `YYNET_ATTACH_GEO_META` 控制）：
+默认不向外部模型发送精确空间范围、绝对路径或原始文件。当前对话 UI 不提供影像外发或精确空间元数据勾选项；两类授权均固定为关闭，避免历史会话状态意外扩大数据边界。未授权时只提供脱敏的本地上下文和文件名，不影响本地推理。
+
+`YYNET_ATTACH_GEO_META=0` 仍是默认安全值；如果未来需要重新开放外部数据授权，应单独设计、评审并补充可撤销的授权入口。
+
+会话历史也遵循同一边界：未授权时，重新拼入外部模型的历史消息会移除标注的 `bbox`、`centroid` 和 `map_center`；SQLite 持久化记录不会保存这些精确空间字段。该授权只对当前会话生效。
+
+知识库检索返回的来源和正文在回填模型上下文前会再次移除本地路径、凭据和精确空间字段，并限制单条文档与总上下文长度；直接调用 `chat_with_vlm()` 也执行同样的文本边界检查。
+
+若未来重新开放显式授权，允许字段清单将包括：
 
 - `bands`
 - `size`
@@ -147,9 +172,49 @@ python -m streamlit run app.py --server.port 8501
 
 ---
 
-## 9. 常见问题（重点）
+## 9. 知识库维护（离线/幂等）
 
-### 9.1 上传 TIFF 报 `Connection error` 或 400
+知识库输入采用 UTF-8 JSONL，每行至少包含 `document_id` 和 `content`，推荐同时提供 `source`、`title`、`published_at` 和 `checksum`；checksum 始终由正文 SHA-256 计算，若显式提供则必须与正文匹配：
+
+```json
+{"document_id":"paper-001","source":"论文或数据来源","title":"潮滩变化研究","published_at":"2024-01-01","content":"正文内容"}
+```
+
+先做不写盘的校验：
+
+```bash
+python scripts/build_knowledge_base.py docs.jsonl --dry-run
+```
+
+验收或多集合部署时可显式固定 embedding 模型和 collection，避免依赖当前 shell 环境：
+
+```bash
+python scripts/build_knowledge_base.py docs.jsonl --dry-run \
+  --embedding-model local/bge-cache --collection remote_sensing_papers
+```
+
+实际构建或增量更新（同一 `document_id` 且 checksum 未变化时不会重复向量化）：
+
+```bash
+CHROMA_RS_DB_PATH=./rs_knowledge_db \
+python scripts/build_knowledge_base.py docs.jsonl
+```
+
+首次非 dry-run 可能需要下载 `CSTF_KB_EMBEDDING_MODEL`。离线环境请预先将模型缓存到本机，并在无网验证时固定本地模型目录；CLI 不会在聊天请求中隐式写入知识库。manifest 位于知识库目录下，用于幂等更新和删除失效文档；发现损坏记录会保留 `.corrupt-*` 证据并停止增量写入。当前 `tf-agent` 环境已用临时 Chroma 库完成 1 条文档的真实 embedding 入库烟测。
+
+---
+
+## 10. 后台任务恢复
+
+重型任务的 job 元数据写入 `CSTF_JOB_DB_PATH` 指定的 SQLite 账本。页面刷新不会丢失任务记录；若进程重启时仍有 `QUEUED`/`RUNNING` 任务，启动时会保留账本并将其标记为 `INTERRUPTED`，不会伪造成功或自动重复执行。请在时间线中核对输入和产物后重新确认重跑。
+
+侧栏与 Agent 入口对推理、指数法、GEE、M5/E1、Workflow、AutoTune 和报告生成统一采用“计划 → 确认 → 执行 → 验证 → 登记 → 回复”语义。AutoTune 和报告按钮不会在首次点击时直接启动后台工作；确认前可取消，参数变化后旧计划会失效。报告只有在文件存在、非空校验通过且报告资产登记成功后才报告成功；GEE/M4 本地下载还要求每个请求场景实际生成非空 GeoTIFF，云端筛选成功但本地文件缺失时直接失败；M5/E1 输出校验失败时会明确标记为未完全通过，不登记或加载成果。
+
+---
+
+## 11. 常见问题（重点）
+
+### 11.1 上传 TIFF 报 `Connection error` 或 400
 
 常见原因：
 
@@ -163,7 +228,7 @@ python -m streamlit run app.py --server.port 8501
 2. 使用 `YYNET_TIFF_MODE=auto` 或 `png`。
 3. 检查 `.env` 中 `DASHSCOPE_API_KEY` 与模型名。
 
-### 9.2 为什么有些 TIFF 会被说“全黑/无效像素”
+### 11.2 为什么有些 TIFF 会被说“全黑/无效像素”
 
 这通常是数据本身有效像素极少或全为 `NaN/Inf`。  
 可看 `finite_pixel_ratio`：
@@ -171,7 +236,7 @@ python -m streamlit run app.py --server.port 8501
 - 接近 `0`：数据几乎不可解译
 - 较大：可正常分析
 
-### 9.3 VS Code 一直提示“同步更改”
+### 11.3 VS Code 一直提示“同步更改”
 
 这通常表示本地 `ahead` 远端。先看：
 
@@ -185,7 +250,7 @@ git -C YYnet status --short --branch
 git -C YYnet push -u origin main
 ```
 
-### 9.4 `push` 报 `Recv failure: Connection was reset`
+### 11.4 `push` 报 `Recv failure: Connection was reset`
 
 优先排查代理：
 
@@ -198,15 +263,15 @@ git -c http.proxy= -c https.proxy= -C YYnet push -u origin main
 
 ---
 
-## 10. 开发建议
+## 12. 开发建议
 
 - 将路径硬编码进一步收敛到 `.env` 或配置文件
 - 为 `pre_engine/post_engine` 增加最小测试集
-- 为 `assets_registry.json` 增加 schema 校验
+- `assets_registry.json` 已由 `asset_registry_schema.py` 做兼容历史格式的结构校验；读取会过滤坏记录，写入会拒绝非法字段类型。
 
 ---
 
-## 11. 安全说明
+## 13. 安全说明
 
 - `.env` 含密钥，禁止提交到公共仓库
 - 建议 `.gitignore` 包含：
@@ -217,4 +282,3 @@ _chat_upload_tmp/
 streamlit.out.log
 streamlit.err.log
 ```
-

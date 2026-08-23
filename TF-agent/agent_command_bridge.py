@@ -6,11 +6,14 @@ Agent ↔ Streamlit 双轨网桥：JSON 指令解析、差量合流、pending �
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
+
+from agent_context_policy import redact_spatial_metadata, safe_error_summary, sanitize_external_text
 
 _JSON_BLOCK_RE = re.compile(
     r"\[SYSTEM_COMMAND_JSON\]\s*(\{.*?\})\s*\[/SYSTEM_COMMAND_JSON\]",
@@ -241,6 +244,18 @@ def parse_system_command(text: str) -> Optional[Dict[str, Any]]:
     return cmd or None
 
 
+def _validate_command(command: Any) -> Dict[str, Any]:
+    """调用统一 Schema；错误只保留用户可理解的安全摘要。"""
+    from agent_command_schema import validate_system_command
+
+    validated = validate_system_command(command)
+    sidebar = validated.get("sidebar_states") or {}
+    unknown_sidebar = set(sidebar) - (set(SIDEBAR_KEY_MAP) | {"workspace_tab"})
+    if unknown_sidebar:
+        raise ValueError("系统命令校验失败（sidebar_states 含未知字段）。")
+    return validated
+
+
 _RE_MAP_COORDS_NSEW = re.compile(
     r"([-\d.]+)\s*[°º]?\s*[Nn北]\s*[,，/]\s*([-\d.]+)\s*[°º]?\s*[Ee东]",
 )
@@ -331,6 +346,8 @@ def _coerce_float(val: Any, lo: float, hi: float) -> Optional[float]:
         return None
     try:
         f = float(val)
+        if not math.isfinite(f):
+            return None
         return float(min(hi, max(lo, f)))
     except (TypeError, ValueError):
         return None
@@ -353,7 +370,10 @@ def _coerce_date_str(val: Any) -> Optional[str]:
         return val.isoformat()
     s = str(val).strip()
     if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
-        return s
+        try:
+            return date.fromisoformat(s).isoformat()
+        except ValueError:
+            return None
     return None
 
 
@@ -466,7 +486,7 @@ def _apply_sidebar_delta(state: Dict[str, Any], sidebar: Dict[str, Any], result:
         # 否则 http://127.0.0.1:7890 会被 Windows normpath 破坏为 http:\\127.0.0.1:7890。
         s = str(raw).strip().strip('"').strip("'")
         if s:
-            if json_key.endswith("_dir") or json_key.endswith("_path") or json_key.endswith("_shp") or json_key in (
+            if json_key.endswith("_dir") or json_key.endswith("_path") or json_key.endswith("_shp") or json_key.endswith("_root") or json_key in (
                 "selected_task",
                 "m4_roi_name",
                 "m4_drive_folder",
@@ -497,29 +517,37 @@ def build_agent_sidebar_context(state: Dict[str, Any]) -> str:
     """生成注入 Agent System Prompt 的侧栏快照（帮助理解「按侧栏默认」与省略参数）。"""
     init_ui_session_defaults(state)
     s = _snapshot_sidebar(state)
+    from agent_context_policy import describe_local_path, sanitize_external_text, spatial_consent
 
     def _fmt_date(v: Any) -> str:
         if hasattr(v, "isoformat"):
             return v.isoformat()
         return str(v) if v else "—"
 
+    map_center = state.get("map_center")
+    if spatial_consent(state) and map_center:
+        map_context = f"- 地图中心: {map_center} zoom={state.get('map_zoom', '—')}"
+    elif map_center:
+        map_context = "- 地图状态: 已设置（精确坐标未获授权，不注入外部模型上下文）"
+    else:
+        map_context = "- 地图状态: 未设置"
     lines = [
         "【当前侧栏状态快照】",
         "用户说「按侧栏/默认/当前设置/别改参数」时：只改其明确提到的项，其余省略；",
         "用户说「跑一下/开始/启动」且未给 prob/cnt/task 时：优先用下方快照中的值。",
         f"- 工作台: {'潮滩智能提取' if s.get('ui_workflow') == '潮滩推理' else ('获取卫星影像' if s.get('ui_workflow') == 'GEE 数据下载' else s.get('ui_workflow', '—'))}",
         f"- 目标任务: {s.get('ui_selected_task') or '（未选）'}",
-        f"- 原始影像目录: {s.get('ui_root_dir', '—')}",
+        f"- 原始影像目录: {describe_local_path(s.get('ui_root_dir'))}",
         f"- 推理方式: {s.get('ui_inference_mode', '—')} (run_mode={'index' if s.get('ui_inference_mode') == '指数法' else 'dl'})",
         f"- AutoTune 开关: {s.get('ui_adaptive_mode', False)}",
         f"- 概率阈值 prob_th: {s.get('ui_prob_th', '—')}",
         f"- 频次阈值 min_cnt: {s.get('ui_min_cnt', '—')}",
         f"- 强制重跑 force_rerun: {s.get('ui_force_rerun', False)}",
-        f"- M5: {'开' if s.get('ui_m5_enabled') else '关'} | 基线: {s.get('ui_m5_baseline_shp') or '自动'}",
+        f"- M5: {'开' if s.get('ui_m5_enabled') else '关'} | 基线: {describe_local_path(s.get('ui_m5_baseline_shp')) if s.get('ui_m5_baseline_shp') else '自动'}",
         f"- E1: {'开' if s.get('ui_e1_enabled') else '关'} | 参考: {s.get('ui_e1_reference', '—')}",
         f"- M4 云量: {s.get('ui_m4_cloud_limit', '—')}% | 日期: {_fmt_date(s.get('ui_m4_start_date'))} ~ {_fmt_date(s.get('ui_m4_end_date'))}",
         f"- M4 ROI: {s.get('ui_m4_roi_name') or '—'} | 导出: {s.get('ui_m4_export_to', '—')}",
-        f"- 地图中心: {state.get('map_center', '—')} zoom={state.get('map_zoom', '—')}",
+        map_context,
         f"- 任务运行中: {bool(state.get('is_running'))}",
     ]
     try:
@@ -570,7 +598,7 @@ def build_agent_sidebar_context(state: Dict[str, Any]) -> str:
         )
     except Exception:
         pass
-    return "\n".join(lines)
+    return sanitize_external_text("\n".join(lines))
 
 
 def propose_e1_plan(state: Dict[str, Any], action: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], List[str]]:
@@ -736,6 +764,11 @@ def propose_inference_plan(state: Dict[str, Any], action: Optional[Dict[str, Any
         device_policy=str(action.get("device_policy") or "auto"),
         shp_path=str(state.get("ui_shp_path") or ""),
     )
+    plan["force_rerun"] = bool(
+        action.get("force_rerun")
+        if action.get("force_rerun") is not None
+        else state.get("ui_force_rerun", False)
+    )
     state["_inference_pending_plan"] = plan
     state["_inference_plan_confirmed"] = set()
     errors = list(plan.get("blockers") or []) if not plan.get("ready") else []
@@ -785,7 +818,7 @@ def propose_gee_plan(state: Dict[str, Any], action: Optional[Dict[str, Any]] = N
             aoi_dict = ctx.to_dict()
             aoi_warnings = list(ctx.warnings or [])
         except Exception as e:  # noqa: BLE001
-            aoi_warnings.append(f"AOI 解析失败: {e}")
+            aoi_warnings.append(f"AOI 解析失败: {safe_error_summary(e)}")
     elif action.get("aoi_id"):
         aoi_dict = {"aoi_id": str(action["aoi_id"]), "valid": True}
     elif state.get("_active_aoi"):
@@ -802,7 +835,7 @@ def propose_gee_plan(state: Dict[str, Any], action: Optional[Dict[str, Any]] = N
                 aoi_dict = ctx.to_dict()
                 aoi_warnings.append("AOI 来自矢量文件外接矩形（bbox），非精确面。")
         except Exception as e:  # noqa: BLE001
-            aoi_warnings.append(f"读取 AOI 矢量失败: {e}")
+            aoi_warnings.append(f"读取 AOI 矢量失败: {safe_error_summary(e)}")
     if not aoi_dict or not aoi_dict.get("valid"):
         aoi_warnings.append("未解析到有效 AOI（请先在三维地图绘制 AOI 或配置 ROI 矢量）。")
 
@@ -880,6 +913,31 @@ def is_gee_plan_confirmed(state: Dict[str, Any], plan_id: Optional[str]) -> bool
     return gee_agent_loop.is_gee_plan_confirmed(state, plan_id)
 
 
+def _safe_workflow_message(message: Any) -> str:
+    """保留 blocker 语义，隐藏本地绝对路径和异常内部细节。"""
+    return redact_spatial_metadata(sanitize_external_text(message))[:500]
+
+
+def _workflow_capability_statuses(
+    state: Dict[str, Any], task: str
+) -> Dict[str, str]:
+    """使用统一能力注册表返回 Workflow 所需的只读状态映射。"""
+    import capability_registry
+
+    registry = state.get("_capability_reg")
+    if registry is None or not callable(getattr(registry, "statuses", None)):
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        context = capability_registry.build_context(
+            app_dir=app_dir,
+            model_path=state.get("ui_model_path") or "",
+            task=task or "",
+        )
+        registry = capability_registry.default_registry(context=context)
+        state["_capability_reg"] = registry
+    statuses = registry.statuses()
+    return {str(capability_id): str(status) for capability_id, status in statuses.items()}
+
+
 def propose_workflow_plan(state: Dict[str, Any], action: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], List[str]]:
     """生成端到端「潮滩分析 Workflow」计划（AOI→GEE→推理→E1/M5→PDF）。
 
@@ -951,7 +1009,7 @@ def propose_workflow_plan(state: Dict[str, Any], action: Optional[Dict[str, Any]
             aoi_dict = ctx.to_dict()
             aoi_warnings = list(ctx.warnings or [])
         except Exception as e:  # noqa: BLE001
-            aoi_warnings.append(f"AOI 解析失败: {e}")
+            aoi_warnings.append(f"AOI 解析失败: {safe_error_summary(e)}")
     elif action.get("aoi_id"):
         aoi_dict = {"aoi_id": str(action["aoi_id"]), "valid": True}
     elif state.get("_active_aoi"):
@@ -968,7 +1026,7 @@ def propose_workflow_plan(state: Dict[str, Any], action: Optional[Dict[str, Any]
                 aoi_dict = ctx.to_dict()
                 aoi_warnings.append("AOI 来自矢量文件外接矩形（bbox），非精确面。")
         except Exception as e:  # noqa: BLE001
-            aoi_warnings.append(f"读取 AOI 矢量失败: {e}")
+            aoi_warnings.append(f"读取 AOI 矢量失败: {safe_error_summary(e)}")
     if not aoi_dict or not aoi_dict.get("valid"):
         errors.append("未解析到有效 AOI（请先在三维地图绘制 AOI 或配置 ROI 矢量）。")
 
@@ -997,9 +1055,9 @@ def propose_workflow_plan(state: Dict[str, Any], action: Optional[Dict[str, Any]
             gee_project_id=str(action.get("gee_project_id") or state.get("ui_m4_gee_project") or ""),
         )
     except Exception as e:  # noqa: BLE001
-        errors.append(f"Workflow 构建失败: {e}")
+        errors.append(f"Workflow 构建失败: {safe_error_summary(e)}")
         wf = {"workflow_id": "wf_error", "status": "PENDING", "steps": [],
-              "warnings": [], "blockers": [f"Workflow 构建失败: {e}"]}
+              "warnings": [], "blockers": [f"Workflow 构建失败: {safe_error_summary(e)}"]}
 
     for w in aoi_warnings:
         if w not in wf["warnings"]:
@@ -1007,21 +1065,34 @@ def propose_workflow_plan(state: Dict[str, Any], action: Optional[Dict[str, Any]
 
     # 全局校验（只读磁盘现状）
     try:
-        import capability_registry
-        import assets_registry as _ar
         import dataset_assets as _da
+
+        capabilities = _workflow_capability_statuses(state, task)
         ok, blockers, warnings = wo.validate_analysis_workflow(
             wf,
-            capabilities=capability_registry.load_capabilities(),
-            registry=_ar.load_assets_registry(),
+            capabilities=capabilities,
+            registry=wo.load_assets_registry(),
             dataset_registry=_da.load_registry(),
         )
-        wf["blockers"] = list(blockers)
-        wf["warnings"] = list(set(wf.get("warnings") or []) | set(warnings))
-        if blockers and not errors:
-            errors = list(blockers)
-    except Exception as e:  # noqa: BLE001
-        pass
+        existing_blockers = list(wf.get("blockers") or [])
+        wf["blockers"] = list(dict.fromkeys(
+            _safe_workflow_message(item) for item in existing_blockers + list(blockers)
+        ))
+        existing_warnings = list(wf.get("warnings") or [])
+        wf["warnings"] = list(dict.fromkeys(
+            _safe_workflow_message(item) for item in existing_warnings + list(warnings)
+        ))
+        for blocker in wf["blockers"]:
+            if blocker not in errors:
+                errors.append(blocker)
+    except Exception as exc:  # noqa: BLE001
+        safe_error = f"Workflow 全局校验失败（{type(exc).__name__}）：能力或资产注册表接口不可用。"
+        safe_error = _safe_workflow_message(safe_error)
+        wf.setdefault("blockers", [])
+        if safe_error not in wf["blockers"]:
+            wf["blockers"].append(safe_error)
+        if safe_error not in errors:
+            errors.append(safe_error)
 
     state["_workflow_pending_plan"] = wf
     state[wo.STATE_WORKFLOW_PLAN_CONFIRMED] = set()  # 新计划 → 重置确认
@@ -1071,6 +1142,7 @@ def build_pending_task(state: Dict[str, Any], action: Dict[str, Any]) -> Tuple[O
         aoi_use = aoi if aoi and os.path.isfile(aoi) else None
         return None, {
             "task": task,
+            "mode": "autotune",
             "reference_id": ref,
             "objective": obj,
             "task_aoi_shp": aoi_use,
@@ -1224,7 +1296,7 @@ def build_pending_task(state: Dict[str, Any], action: Dict[str, Any]) -> Tuple[O
             "plan_id": plan["plan_id"],
             "inference_plan": plan,
             "points_shp": None,
-            "force_rerun": False,
+            "force_rerun": bool(plan.get("force_rerun", False)),
         }, None, errors
 
     if atype == "run_gee_download":
@@ -1323,6 +1395,10 @@ def build_pending_task(state: Dict[str, Any], action: Dict[str, Any]) -> Tuple[O
 
 def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> ApplyResult:
     """差量合流：仅更新 JSON 中非 null 字段；可选触发 pending 动作。"""
+    try:
+        command = _validate_command(command)
+    except ValueError as exc:
+        return ApplyResult(applied=False, errors=[sanitize_external_text(exc)])
     result = ApplyResult(applied=True)
     init_ui_session_defaults(state)
 
@@ -1361,7 +1437,7 @@ def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> Appl
                 # 不递增 _globe_rev / 不清 iframe 缓存：仅相机变化时复用已加载地球页
                 result.map_updated = True
             except (TypeError, ValueError) as e:
-                result.errors.append(f"map 参数无效: {e}")
+                result.errors.append(f"map 参数无效: {safe_error_summary(e)}")
 
     sb = command.get("sidebar_states")
     if isinstance(sb, dict):
@@ -1511,6 +1587,10 @@ def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> Appl
 
         pt, at, errs = build_pending_task(state, action)
         result.errors.extend(errs)
+        # 直接 run_workflow 被全局预检阻断时，不应继续向调用方暴露可执行动作类型。
+        # 否则 UI 可能误以为动作已进入执行阶段，绕过“计划可执行性”反馈。
+        if atype == "run_workflow" and pt is None and errs:
+            result.action_type = None
         # 重型工具确认门闩：run_pipeline/run_inference/run_m4/run_gee_download/run_autotune
         # 未确认时，仅记录待确认请求（供 UI 弹出确认），绝不写入 pending_task/pending_autotune。
         # 手动侧栏按钮直接写 session_state 的路径不受影响。
@@ -1529,6 +1609,12 @@ def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> Appl
         elif is_heavy:
             state.pop("_pending_heavy_confirm", None)
         if pt and not errs:
+            from execution_request import attach_execution_request
+
+            pt = attach_execution_request(
+                pt,
+                confirmation_source=str(action.get("confirmation_source") or "agent"),
+            )
             state["pending_task"] = pt
             state["is_running"] = True
             state["stop_requested"] = False
@@ -1542,6 +1628,12 @@ def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> Appl
             if pt.get("mode") == "gee":
                 state.pop("_gee_pending_plan", None)
         elif at and not errs:
+            from execution_request import attach_execution_request
+
+            at = attach_execution_request(
+                at,
+                confirmation_source=str(action.get("confirmation_source") or "agent"),
+            )
             state["pending_autotune"] = at
             state["is_running"] = True
             state["stop_requested"] = False
@@ -1550,15 +1642,20 @@ def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> Appl
     return result
 
 
-def queue_agent_command(state: Dict[str, Any], command: Dict[str, Any]) -> None:
+def queue_agent_command(state: Dict[str, Any], command: Dict[str, Any]) -> bool:
     """将指令入队，待下一轮 rerun 在侧栏 widget 实例化之前合流（避免 Streamlit key 冲突）。"""
     if not command:
-        return
+        return False
+    try:
+        command = _validate_command(command)
+    except ValueError:
+        return False
     pending = state.get(PENDING_AGENT_COMMANDS_KEY)
     if not isinstance(pending, list):
         pending = []
     pending.append(command)
     state[PENDING_AGENT_COMMANDS_KEY] = pending
+    return True
 
 
 def flush_pending_agent_commands(state: Dict[str, Any]) -> ApplyResult:
@@ -1579,12 +1676,11 @@ def flush_pending_agent_commands(state: Dict[str, Any]) -> ApplyResult:
         except Exception as e:  # noqa: BLE001
             # 单条指令异常绝不能拖垮整个 Streamlit 脚本（否则前端出现
             # 「未找到错误 / removeChild」级联报错）
-            import traceback
-
             merged.errors.append(
-                f"Agent 指令处理异常（{str(cmd.get('type') or cmd.get('pending_action') or 'unknown')[:60]}）: {e}"
+                f"Agent 指令处理异常（{str(cmd.get('type') or cmd.get('pending_action') or 'unknown')[:60]}）: "
+                f"{safe_error_summary(e)}"
             )
-            print(f"[agent_command_bridge] flush 指令异常: {e}\n{traceback.format_exc()}")
+            print(f"[agent_command_bridge] flush 指令异常: {safe_error_summary(e)}")
             continue
         merged.map_updated = merged.map_updated or one.map_updated
         merged.sidebar_keys_updated.extend(one.sidebar_keys_updated)
@@ -1625,6 +1721,10 @@ def process_agent_reply(state: Dict[str, Any], reply: str) -> Tuple[ApplyResult,
     clean = _strip_json_block(reply)
     if not cmd:
         return ApplyResult(applied=False), reply
+    try:
+        cmd = _validate_command(cmd)
+    except ValueError as exc:
+        return ApplyResult(applied=False, errors=[sanitize_external_text(exc)]), clean
     queue_agent_command(state, cmd)
     result = _preview_apply_result(cmd)
     result.clean_reply_hint = clean

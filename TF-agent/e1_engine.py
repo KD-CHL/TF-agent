@@ -13,6 +13,7 @@ import sys
 from typing import Callable, Dict, List, Optional
 
 import geopandas as gpd
+from agent_context_policy import safe_error_summary
 
 _JB_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "research", "jb"))
 if _JB_DIR not in sys.path:
@@ -90,7 +91,7 @@ def resolve_task_roi_path(
         logger(f"[E1] 任务 ROI: {out_path}")
         return out_path
     except Exception as exc:
-        logger(f"[E1] 解析任务 ROI 失败，使用全国默认范围: {exc}")
+        logger(f"[E1] 解析任务 ROI 失败，使用全国默认范围: {safe_error_summary(exc)}")
         return None
 
 
@@ -149,5 +150,5 @@ def run_e1_after_synthesis(
         logger(f"[E1] 报告已保存: {result['report_path']}")
         return result
     except Exception as exc:
-        logger(f"[E1] 多源一致性诊断失败: {exc}")
+        logger(f"[E1] 多源一致性诊断失败: {safe_error_summary(exc)}")
         return None

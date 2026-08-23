@@ -13,6 +13,7 @@ import datetime  # ✅ 新增：用于显示时间
 
 # 假设模型文件名为 YYnet.py
 from YYnet import CDNet
+from agent_context_policy import safe_error_summary
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -29,7 +30,7 @@ def compute_stats_and_mask(src):
 
     try:
         thumb = src.read([1, 2, 3], out_shape=(3, target_h, target_w)).transpose(1, 2, 0)
-    except:
+    except Exception:
         return None, None, None
 
     thumb = np.nan_to_num(thumb, nan=0.0, posinf=1.0, neginf=0.0)
@@ -187,7 +188,7 @@ class SmartStitcher:
                 self.gpu_res = torch.zeros((H, W), dtype=torch.float32, device=device)
                 self.gpu_wgt = torch.zeros((H, W), dtype=torch.float32, device=device)
                 self.mode = "gpu"
-            except:
+            except Exception:
                 pass
         if self.mode != "gpu":
             self.cpu_res = np.zeros((H, W), dtype=np.float32)
@@ -310,7 +311,7 @@ def process_geotiff(model, tiff_path, output_path, device, current_idx=0, total_
         return True # 返回 True 代表顺利完成一张图
 
     except Exception as e:
-        print(f"❌ 失败: {e}")
+        print(f"❌ 失败: {safe_error_summary(e)}")
         import traceback
         traceback.print_exc()
         return False
@@ -386,7 +387,7 @@ def main():
                     print("\n🛑 用户手动停止")
                     return
                 except Exception as e:
-                    print(f"❌ 错误: {e}")
+                    print(f"❌ 错误: {safe_error_summary(e)}")
 
                 processed.add(tif)
 

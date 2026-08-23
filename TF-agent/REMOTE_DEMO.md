@@ -1,6 +1,6 @@
 # 导师跨校区远程试用指南
 
-你的电脑作为**唯一服务器**：VPN、GEE、模型权重、本地数据都在你这台机器上跑。导师在另一个校区只需用浏览器打开你提供的链接，**不需要自己开 VPN**。
+你的电脑作为**唯一服务器**：VPN、GEE、模型权重、本地数据都在你这台机器上跑。导师在另一个校区只需用浏览器打开你提供的链接，**不需要自己开 VPN**。公开入口默认启用 Gateway 登录，不再把 ngrok 地址当作秘密。
 
 ## 架构
 
@@ -21,6 +21,7 @@
 1. 安装 [ngrok](https://ngrok.com/) 并登录（免费账号即可演示）。
 2. 本机 Clash/VPN **保持开启**，侧栏 GEE 代理端口与 Clash 一致（默认 `7892`）。
 3. 确认本机单独打开 `http://localhost:8501` 时系统功能正常。
+4. 在项目根目录被忽略的 `.env` 中设置高熵 `CSTF_GATEWAY_ACCESS_TOKEN`；不要写入 `.env.example`、脚本、URL 或聊天记录。
 
 ## 每次演示前（推荐：单端口网关 + 一条 ngrok，支持远程 3D 地球）
 
@@ -72,6 +73,8 @@ cd e:\Code\GEE\TF-agent
 python cstf_gateway.py
 ```
 
+Gateway 默认只监听 `127.0.0.1`。设置 `CSTF_PUBLIC_URL` 或绑定到非 loopback 地址时，缺少 `CSTF_GATEWAY_ACCESS_TOKEN` 会拒绝启动。
+
 或：`.\scripts\start_gateway.ps1`
 
 ### 终端 3：一条 ngrok 转发网关
@@ -109,7 +112,7 @@ https://abc123.ngrok-free.app
 | 你的电脑 | 必须开机、联网、VPN 开着，三个终端都不要关 |
 | 休眠 | 合盖会断服务，演示时关闭休眠 |
 | 人数 | 建议同时 1～2 人，多了会占你上行带宽和 GPU |
-| 安全 | 链接相当于远程操作你的电脑，只发给导师，演示完关闭 ngrok |
+| 安全 | 访问令牌通过登录表单 POST body 提交；Cookie 为 HttpOnly/SameSite=Strict，令牌不放 URL。演示完撤销/轮换令牌并关闭 ngrok |
 | 费用 | GEE 下载、Copilot API 都走你的账号配额 |
 
 ## 自检
@@ -121,7 +124,7 @@ curl http://127.0.0.1:8765/health
 # 应返回 ok
 
 curl https://你的地球-ngrok地址.ngrok-free.app/health
-# 应返回 ok
+# 未登录应返回 401；浏览器先打开 /__auth/login，登录成功后再访问主页面
 ```
 
 若主页面能开但地球是黑的：检查 `CSTF_GLOBE_PUBLIC_URL` 是否与终端 3 的 ngrok 地址一致，并重启 Streamlit。
@@ -139,3 +142,16 @@ A：可换 [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/
 
 **Q：想长期给导师用？**  
 A：建议实验室固定一台服务器 + 云盘同步权重，或租一台带 GPU 的云主机部署，比长期开 ngrok 更稳。
+
+## 认证自检
+
+```powershell
+# 只检查响应状态，不把令牌写入命令历史；真实令牌从被忽略的 .env 注入
+curl -I https://你的网关地址/
+# 期望未登录为 401
+
+# 浏览器登录入口（令牌在页面表单 body 中提交）
+start https://你的网关地址/__auth/login
+```
+
+登出使用页面会话；轮换 `.env` 中的 `CSTF_GATEWAY_ACCESS_TOKEN` 并重启 Gateway 后，旧会话立即失效。不要通过 query string、`localStorage`、Cookie 或日志传递访问令牌。

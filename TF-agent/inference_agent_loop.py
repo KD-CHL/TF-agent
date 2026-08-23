@@ -16,12 +16,17 @@ from __future__ import annotations
 
 import glob
 import json
+import ntpath
 import os
 import re
+import shutil
 import subprocess
+import time
 import uuid
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from agent_context_policy import safe_error_summary, safe_local_path_label, sanitize_external_text
 
 # ---- 时间线阶段映射（与 task_timeline.PHASES 一致） ----
 INFERENCE_TIMELINE_PHASES: Tuple[str, ...] = (
@@ -67,19 +72,31 @@ def _now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _nonempty_file(path: object) -> bool:
+    """Return true only for a readable artifact with at least one byte."""
+    try:
+        return bool(path) and os.path.isfile(str(path)) and os.path.getsize(str(path)) > 0
+    except OSError:
+        return False
+
+
 def new_plan_id() -> str:
     return uuid.uuid4().hex
 
 
 def rel_path(p: str) -> str:
-    """相对化路径（对工作目录），用于登记与用户回复，避免泄露无关绝对路径。"""
-    p = str(p or "")
-    if not p:
+    """Return a usable relative artifact path without echoing foreign paths."""
+    raw = str(p or "")
+    if not raw:
         return ""
+    # Windows drive/UNC paths can be passed through a POSIX test host; those
+    # are never usable there and must become a basename-only label.
+    if ntpath.splitdrive(raw)[0] or raw.startswith(("\\\\", "//")):
+        return safe_local_path_label(raw)
     try:
-        return os.path.relpath(p)
-    except ValueError:
-        return p
+        return os.path.relpath(raw)
+    except (OSError, ValueError):
+        return safe_local_path_label(raw)
 
 
 def basename_or_none(p: Optional[str]) -> str:
@@ -125,7 +142,7 @@ def resolve_weight_path(weight_id: Optional[str], model_path: Optional[str]) -> 
                     else:
                         warnings.append(f"权重注册表条目 {weight_id} 的路径无效，忽略。")
         except Exception as e:  # noqa: BLE001
-            warnings.append(f"权重注册表读取失败（{e}），回退侧栏配置。")
+            warnings.append(f"权重注册表读取失败（{safe_error_summary(e)}），回退侧栏配置。")
 
     mp = str(model_path or "").strip().strip('"').strip("'")
     if weight_path is None:
@@ -192,11 +209,11 @@ def build_inference_plan(
     if not task_id:
         blockers.append("未指定目标任务（task_id）。")
     if not root_dir or not os.path.isdir(root_dir):
-        blockers.append(f"原始影像根目录不存在: {root_dir or '（空）'}")
+        blockers.append(f"原始影像根目录不存在: {rel_path(root_dir) or '（空）'}")
     if not final_root or not os.path.isdir(final_root):
-        blockers.append(f"成果输出根目录不存在: {final_root or '（空）'}")
+        blockers.append(f"成果输出根目录不存在: {rel_path(final_root) or '（空）'}")
     if not mask_root or not os.path.isdir(mask_root):
-        blockers.append(f"预测掩膜根目录不存在: {mask_root or '（空）'}")
+        blockers.append(f"预测掩膜根目录不存在: {rel_path(mask_root) or '（空）'}")
 
     try:
         prob = float(prob_threshold)
@@ -373,7 +390,7 @@ def validate_inference_plan(
     # ---- 输入 ----
     input_dir = plan.get("input_path") or ""
     if not input_dir or not os.path.isdir(input_dir):
-        blockers.append(f"输入目录不存在: {input_dir or '（空）'}")
+        blockers.append(f"输入目录不存在: {rel_path(input_dir) or '（空）'}")
     else:
         tifs = _list_raw_tifs(input_dir)
         if not tifs:
@@ -403,7 +420,7 @@ def validate_inference_plan(
                             f"{os.path.basename(first)}"
                         )
             except Exception as e:  # noqa: BLE001
-                blockers.append(f"影像不可读取: {os.path.basename(first)}（{e}）")
+                blockers.append(f"影像不可读取: {os.path.basename(first)}（{safe_error_summary(e)}）")
 
     # ---- 输出目录可写 ----
     for dname, d in (("mask_dir", plan.get("mask_dir")), ("output_dir", plan.get("output_dir"))):
@@ -418,7 +435,7 @@ def validate_inference_plan(
                 f.write("ok")
             os.remove(probe)
         except OSError as e:
-            blockers.append(f"{dname} 不可写: {d}（{e}）")
+                blockers.append(f"{dname} 不可写: {rel_path(d)}（{safe_error_summary(e)}）")
 
     # ---- 权重 ----
     weight_path = plan.get("weight_path") or ""
@@ -453,12 +470,12 @@ def validate_inference_plan(
                         try:
                             model.load_state_dict(state, strict=True)
                         except Exception as e:  # noqa: BLE001
-                            blockers.append(f"权重与 CDNet 结构不匹配: {e}")
+                            blockers.append(f"权重与 CDNet 结构不匹配: {safe_error_summary(e)}")
                         del model
                     except Exception as e:  # noqa: BLE001
-                        blockers.append(f"权重结构校验失败: {e}")
+                        blockers.append(f"权重结构校验失败: {safe_error_summary(e)}")
             except Exception as e:  # noqa: BLE001
-                blockers.append(f"权重加载失败（weights_only=True）: {e}")
+                blockers.append(f"权重加载失败（weights_only=True）: {safe_error_summary(e)}")
 
     # ---- 设备 ----
     try:
@@ -598,7 +615,7 @@ def execute_local_inference(
                 "parameters": {"prob_threshold": prob, "count_threshold": cnt},
                 "outputs": {}, "metrics": {"elapsed_seconds": round(time.time() - started, 2),
                                            "processed_tiles": 0, "tif_count": total},
-                "warnings": [], "error": f"模型加载失败: {e}",
+                "warnings": [], "error": f"模型加载失败: {safe_error_summary(e)}",
             }
         pct(10)
 
@@ -664,7 +681,7 @@ def execute_local_inference(
                     "parameters": {"prob_threshold": prob, "count_threshold": cnt},
                     "outputs": {}, "metrics": {"elapsed_seconds": round(time.time() - started, 2),
                                                "processed_tiles": success_count, "tif_count": total},
-                    "warnings": warnings, "error": f"单景推理异常: {fname}（{e}）",
+                    "warnings": warnings, "error": f"单景推理异常: {fname}（{safe_error_summary(e)}）",
                 }
 
         if check_stop():
@@ -710,7 +727,7 @@ def execute_local_inference(
                 "parameters": {"prob_threshold": prob, "count_threshold": cnt},
                 "outputs": {}, "metrics": {"elapsed_seconds": round(time.time() - started, 2),
                                            "processed_tiles": success_count, "tif_count": total},
-                "warnings": warnings, "error": f"后处理异常: {e}",
+            "warnings": warnings, "error": f"后处理异常: {safe_error_summary(e)}",
             }
         if not ok:
             err = "后处理被用户中断。" if check_stop() else "后处理失败（未生成成果）。"
@@ -723,6 +740,30 @@ def execute_local_inference(
                 "outputs": {}, "metrics": {"elapsed_seconds": round(time.time() - started, 2),
                                            "processed_tiles": success_count, "tif_count": total},
                 "warnings": warnings, "error": err,
+            }
+
+        # 后处理适配器返回 True 只是表示调用路径未抛错，不能替代对真实
+        # 磁盘产物的存在性检查。否则适配器“空成功”会被上层当成可登记成果。
+        artifact_paths = {
+            "Final TIF": final_tif,
+            "Final SHP": final_shp,
+        }
+        missing_artifacts = [
+            label for label, path in artifact_paths.items()
+            if not path or not os.path.isfile(path) or os.path.getsize(path) <= 0
+        ]
+        if missing_artifacts:
+            return {
+                "success": False, "task_id": task_id, "plan_id": plan_id,
+                "tool": TOOL_NAME, "status": "failed",
+                "inputs": {"input_path": rel_path(input_dir), "model_id": MODEL_ID,
+                           "weight_id": plan.get("weight_id"), "device": device},
+                "parameters": {"prob_threshold": prob, "count_threshold": cnt},
+                "outputs": {},
+                "metrics": {"elapsed_seconds": round(time.time() - started, 2),
+                            "processed_tiles": success_count, "tif_count": total},
+                "warnings": warnings,
+                "error": "后处理返回成功但成果文件缺失或为空: " + "、".join(missing_artifacts),
             }
 
         pct(92)
@@ -766,7 +807,7 @@ def execute_local_inference(
             "parameters": {"prob_threshold": prob, "count_threshold": cnt},
             "outputs": {}, "metrics": {"elapsed_seconds": round(time.time() - started, 2),
                                        "processed_tiles": 0, "tif_count": 0},
-            "warnings": warnings, "error": f"推理执行异常: {e}",
+            "warnings": warnings, "error": f"推理执行异常: {safe_error_summary(e)}",
         }
 
 
@@ -844,7 +885,7 @@ def verify_inference_outputs(
                             valid = valid[valid != nodata]
                         _check("final_tif_has_data", bool(np.any(valid > 0)), f"valid_pixels={int(np.count_nonzero(valid))}")
                     except Exception as e:  # noqa: BLE001
-                        _check("final_tif_has_data", False, f"读取采样失败: {e}")
+                        _check("final_tif_has_data", False, f"读取采样失败: {safe_error_summary(e)}")
                 tb = src.bounds
                 # 与输入范围合理关系：与任一输入 tif 有交集
                 input_dir = plan.get("input_path") or ""
@@ -863,7 +904,7 @@ def verify_inference_outputs(
                             continue
                 _check("final_tif_overlaps_input", ratio > 0.0, f"max_iou={ratio:.3f}")
         except Exception as e:  # noqa: BLE001
-            _check("final_tif_open", False, f"打开失败: {e}")
+            _check("final_tif_open", False, f"打开失败: {safe_error_summary(e)}")
 
         try:
             mt = _os.path.getmtime(final_tif)
@@ -915,7 +956,7 @@ def verify_inference_outputs(
                 except Exception:  # noqa: BLE001
                     pass
         except Exception as e:  # noqa: BLE001
-            _check("final_shp_readable", False, f"读取失败: {e}")
+                    _check("final_shp_readable", False, f"读取失败: {safe_error_summary(e)}")
 
     return {
         "ok": ok,
@@ -925,25 +966,120 @@ def verify_inference_outputs(
     }
 
 
+def classify_inference_recovery(
+    plan: Dict[str, Any],
+    result: Optional[Dict[str, Any]] = None,
+    *,
+    verify_fn: Optional[Callable[..., Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """根据已存在检查点决定恢复动作；只分类，不覆盖或删除文件。
+
+    返回 action：``COMPLETE``（完整 Final 已验证）、``RESUME_POST_PROCESS``
+    （mask 完整但 Final 缺失）、``ISOLATE_AND_RETRY``（有部分/无效 mask）或
+    ``INTERRUPTED_WAIT_CONFIRMATION``（无可信检查点）。
+    """
+    plan = dict(plan or {})
+    result = dict(result or {})
+    output_dir = str(plan.get("output_dir") or "")
+    mask_dir = str(plan.get("mask_dir") or "")
+    task_id = str(plan.get("task_id") or "")
+    prob = float(plan.get("prob_threshold") or 0.05)
+    cnt = int(plan.get("count_threshold") or 2)
+    stem = f"{task_id}_Final_p{prob:.2f}_c{cnt}"
+    outputs = result.get("outputs") if isinstance(result.get("outputs"), dict) else {}
+    final_tif = str(outputs.get("final_tif") or os.path.join(output_dir, stem + ".tif"))
+    final_shp = str(outputs.get("final_shp") or os.path.join(output_dir, stem + ".shp"))
+    final_exists = all(os.path.isfile(path) and os.path.getsize(path) > 0 for path in (final_tif, final_shp))
+    if final_exists:
+        checker = verify_fn or verify_inference_outputs
+        checked = checker(
+            plan,
+            {"outputs": {"final_tif": final_tif, "final_shp": final_shp}},
+            started_at=0,
+        )
+        if checked.get("ok") is True:
+            return {"action": "COMPLETE", "reason": "verified_final_exists", "verification": checked}
+
+    masks = []
+    if os.path.isdir(mask_dir):
+        masks = sorted(
+            os.path.join(mask_dir, name)
+            for name in os.listdir(mask_dir)
+            if name.lower().endswith((".tif", ".tiff")) and "_mask" in name
+        )
+    valid_masks = [path for path in masks if os.path.getsize(path) > 0]
+    expected_inputs = len(_list_raw_tifs(str(plan.get("input_path") or "")))
+    if expected_inputs > 0 and len(valid_masks) == expected_inputs:
+        return {"action": "RESUME_POST_PROCESS", "reason": "all_masks_present_final_missing", "mask_count": len(valid_masks)}
+    if masks:
+        return {"action": "ISOLATE_AND_RETRY", "reason": "partial_or_invalid_masks", "mask_count": len(valid_masks), "invalid_count": len(masks) - len(valid_masks)}
+    return {"action": "INTERRUPTED_WAIT_CONFIRMATION", "reason": "no_trusted_checkpoint"}
+
+
+def isolate_inference_checkpoints(
+    plan: Dict[str, Any],
+    *,
+    confirmed: bool = False,
+    quarantine_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """将部分/无效 mask 移入隔离目录；未确认时绝不修改文件。"""
+    if not confirmed:
+        return {"ok": False, "status": "WAITING_CONFIRMATION", "reason": "用户尚未确认隔离并重跑"}
+    plan = dict(plan or {})
+    mask_dir = os.path.abspath(str(plan.get("mask_dir") or ""))
+    if not mask_dir or not os.path.isdir(mask_dir):
+        return {"ok": False, "status": "NO_CHECKPOINTS", "reason": "mask 目录不存在"}
+    candidates = [
+        os.path.join(mask_dir, name)
+        for name in os.listdir(mask_dir)
+        if name.lower().endswith((".tif", ".tiff")) and "_mask" in name
+    ]
+    if not candidates:
+        return {"ok": False, "status": "NO_CHECKPOINTS", "reason": "没有可隔离的 mask"}
+    target_root = os.path.abspath(
+        quarantine_dir
+        or os.path.join(str(plan.get("output_dir") or mask_dir), ".recovery_quarantine")
+    )
+    os.makedirs(target_root, exist_ok=True)
+    run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(plan.get("plan_id") or "recovery"))[:80]
+    target_dir = os.path.join(target_root, f"{run_id}-{int(time.time())}")
+    os.makedirs(target_dir, exist_ok=False)
+    moved: List[str] = []
+    try:
+        for source in candidates:
+            destination = os.path.join(target_dir, os.path.basename(source))
+            shutil.move(source, destination)
+            moved.append(os.path.basename(source))
+    except OSError as exc:
+        # 发生部分移动时保留已移动文件，返回明确状态；不伪造“全部隔离成功”。
+        return {
+            "ok": False,
+            "status": "PARTIAL_ISOLATION",
+            "reason": safe_error_summary(exc),
+            "moved": moved,
+            "quarantine_dir": target_dir,
+        }
+    return {
+        "ok": True,
+        "status": "ISOLATED",
+        "moved": moved,
+        "quarantine_dir": target_dir,
+    }
+
+
 # =======================================================
 #  6. 资产登记（§2.8 / 用户规格 §八）
 # =======================================================
 def _load_registry(registry_path: Optional[str] = None) -> Dict[str, Any]:
-    path = registry_path or ASSET_REGISTRY_PATH
-    if os.path.isfile(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data if isinstance(data, dict) else {}
-        except Exception:  # noqa: BLE001
-            return {}
-    return {}
+    from workflow_orchestrator import load_assets_registry
+
+    return load_assets_registry(registry_path or ASSET_REGISTRY_PATH)
 
 
 def _save_registry(registry: Dict[str, Any], registry_path: Optional[str] = None) -> None:
-    path = registry_path or ASSET_REGISTRY_PATH
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(registry, f, ensure_ascii=False, indent=2)
+    from workflow_orchestrator import save_assets_registry
+
+    save_assets_registry(registry, registry_path or ASSET_REGISTRY_PATH)
 
 
 def register_inference_asset(
@@ -962,6 +1098,13 @@ def register_inference_asset(
     if not verification or verification.get("ok") is not True:
         return None
     if not result or result.get("success") is not True:
+        return None
+
+    # Re-check the commit boundary instead of trusting a caller-provided
+    # verification dictionary that may be stale or forged after cleanup.
+    if not _nonempty_file(verification.get("final_tif")) or not _nonempty_file(
+        verification.get("final_shp")
+    ):
         return None
 
     task_id = str(plan.get("task_id") or "")
@@ -1091,7 +1234,7 @@ def summarize_inference_result_for_chat(
 ) -> str:
     """基于真实工具结果生成 Copilot 回复（禁止编造指标）。"""
     if not result or result.get("success") is not True:
-        err = (result or {}).get("error") or "提取失败"
+        err = sanitize_external_text((result or {}).get("error") or "提取失败")[:240]
         return (
             "## 潮滩智能提取 · 未完成\n\n"
             f"- 任务：`{(result or {}).get('task_id') or '—'}`\n"
