@@ -4676,7 +4676,9 @@ with col_map:
                             st.warning("地图跳转参数无效：" + "; ".join(_fly_errs or []))
                         else:
                             # READY 握手：等 Cesium 就绪后发；等待窗口超 3s 仍未就绪则带警告发送
-                            _mp_state = _globe_srv.map_protocol_state()
+                            _mp_state = _globe_srv.map_protocol_state(
+                                channel_id=st.session_state.get("_map_channel_id")
+                            )
                             _ready_ok = bool(_mp_state.get("ready_ts"))
                             if not _ready_ok:
                                 _wait_started = st.session_state.get("_map_ready_wait_started")
@@ -4720,19 +4722,39 @@ with col_map:
     }});
     return sent;
   }};
-  if (!send()) {{
-    let n = 0;
-    const t = setInterval(() => {{
-      if (send() || ++n > 40) clearInterval(t);
-    }}, 120);
-  }}
+  // 每次定位都会注入一个很短的隐藏组件。若上一轮定位的延迟重试
+  // 仍在 parent window 中排队，它们可能在本轮定位之后再次把相机拉回旧位置。
+  // 将定时器挂在 parent 上并在新命令开始时统一取消，保证“最后一次定位”胜出。
+  try {{
+    const oldTimers = Array.isArray(win.__cstfFlyRetryTimers)
+      ? win.__cstfFlyRetryTimers : [];
+    oldTimers.forEach((timerId) => win.clearTimeout(timerId));
+    win.__cstfFlyRetryTimers = [];
+  }} catch (e) {{}}
+  // The iframe element can exist before Cesium installs its message listener.
+  // Retry at a few increasing delays; avoid restarting the camera flight
+  // continuously while the viewer is animating.
+  const retryDelays = [150, 400, 900, 1800, 3200, 5000];
+  send();
+  retryDelays.forEach((delay) => {{
+    try {{
+      const timerId = win.setTimeout(send, delay);
+      win.__cstfFlyRetryTimers.push(timerId);
+    }} catch (e) {{
+      setTimeout(send, delay);
+    }}
+  }});
 }})();
 </script>
                             """,
                                 height=0,
                             )
                             # 短等待 FLY_ACK（最多 ~1.2s），成功则 toast；未确认不阻塞
-                            _ack = _globe_srv.wait_map_ack(_fly_payload.get("command_id", ""), timeout=1.2)
+                            _ack = _globe_srv.wait_map_ack(
+                                _fly_payload.get("command_id", ""),
+                                timeout=1.2,
+                                channel_id=st.session_state.get("_map_channel_id"),
+                            )
                             if _ack:
                                 st.session_state["_map_ready_wait_started"] = None
                                 if _ack.get("ok"):
