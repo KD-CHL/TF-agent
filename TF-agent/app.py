@@ -4911,12 +4911,28 @@ with col_map:
     }});
     return sent;
   }};
-  if (!send()) {{
-    let n = 0;
-    const t = setInterval(() => {{
-      if (send() || ++n > 40) clearInterval(t);
-    }}, 120);
-  }}
+  // 每次定位都会注入一个很短的隐藏组件。若上一轮定位的延迟重试
+  // 仍在 parent window 中排队，它们可能在本轮定位之后再次把相机拉回旧位置。
+  // 将定时器挂在 parent 上并在新命令开始时统一取消，保证“最后一次定位”胜出。
+  try {{
+    const oldTimers = Array.isArray(win.__cstfFlyRetryTimers)
+      ? win.__cstfFlyRetryTimers : [];
+    oldTimers.forEach((timerId) => win.clearTimeout(timerId));
+    win.__cstfFlyRetryTimers = [];
+  }} catch (e) {{}}
+  // The iframe element can exist before Cesium installs its message listener.
+  // Retry at a few increasing delays; avoid restarting the camera flight
+  // continuously while the viewer is animating.
+  const retryDelays = [150, 400, 900, 1800, 3200, 5000];
+  send();
+  retryDelays.forEach((delay) => {{
+    try {{
+      const timerId = win.setTimeout(send, delay);
+      win.__cstfFlyRetryTimers.push(timerId);
+    }} catch (e) {{
+      setTimeout(send, delay);
+    }}
+  }});
 }})();
 </script>
                             """,

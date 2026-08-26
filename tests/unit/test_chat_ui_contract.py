@@ -349,6 +349,12 @@ class TestChatUiContract(unittest.TestCase):
         self.assertIn('iframe[title*="streamlit_folium"]', self.source)
         self.assertIn("const mapFrame = getPrimaryMapFrame(mapCol);", self.source)
 
+    def test_map_fly_retries_cancel_previous_command(self):
+        """连续定位时，旧命令的延迟重试不能覆盖新定位。"""
+        self.assertIn("__cstfFlyRetryTimers", self.source)
+        self.assertIn("oldTimers.forEach((timerId) => win.clearTimeout(timerId));", self.source)
+        self.assertIn("win.__cstfFlyRetryTimers.push(timerId);", self.source)
+
     def test_alerts_are_dismissible_and_do_not_reflow_workbench(self):
         """错误/警告通知浮动显示并支持关闭，避免挤压地图与 Agent。"""
         self.assertIn("cstf-dismissible-alert", self.source)
