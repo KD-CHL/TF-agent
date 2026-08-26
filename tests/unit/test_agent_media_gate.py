@@ -18,7 +18,7 @@ import agent  # noqa: E402
 def test_chat_with_vlm_rejects_image_without_explicit_media_consent(monkeypatch):
     called = False
 
-    def _unexpected_executor():
+    def _unexpected_executor(**_kwargs):
         nonlocal called
         called = True
         raise AssertionError("backend must not be reached without media consent")
@@ -73,7 +73,7 @@ def test_chat_model_context_redacts_direct_caller_text(monkeypatch):
             captured.update(payload)
             return {"messages": [SimpleNamespace(type="ai", content="收到")]}
 
-    monkeypatch.setattr(agent, "_get_agent_executor", lambda: _Executor())
+    monkeypatch.setattr(agent, "_get_agent_executor", lambda **_kwargs: _Executor())
     reply = agent.chat_with_vlm(
         "请分析 /Users/chl/private/result.tif bbox=[120,30,121,31]",
         [{"role": "user", "content": "历史 /Users/chl/private/old.tif"}],
@@ -98,7 +98,7 @@ def test_authorized_image_context_also_redacts_user_text(monkeypatch, tmp_path):
 
     image = tmp_path / "preview.png"
     image.write_bytes(b"placeholder")
-    monkeypatch.setattr(agent, "_get_agent_executor", lambda: _Executor())
+    monkeypatch.setattr(agent, "_get_agent_executor", lambda **_kwargs: _Executor())
     monkeypatch.setattr(agent, "_build_image_data_url", lambda *_args, **_kwargs: "data:image/png;base64,AA==")
     reply = agent.chat_with_vlm(
         "请分析 /Users/chl/private/result.tif token=sk-image-secret",
@@ -125,7 +125,7 @@ def test_authorized_multiple_images_share_one_multimodal_user_message(monkeypatc
     second = tmp_path / "second.webp"
     first.write_bytes(b"first")
     second.write_bytes(b"second")
-    monkeypatch.setattr(agent, "_get_agent_executor", lambda: _Executor())
+    monkeypatch.setattr(agent, "_get_agent_executor", lambda **_kwargs: _Executor())
     monkeypatch.setattr(
         agent,
         "_build_image_data_url",
@@ -159,7 +159,7 @@ def test_image_metadata_bounds_crs_and_resolution_require_spatial_consent(monkey
 
     image = tmp_path / "preview.tif"
     image.write_bytes(b"placeholder")
-    monkeypatch.setattr(agent, "_get_agent_executor", lambda: _Executor())
+    monkeypatch.setattr(agent, "_get_agent_executor", lambda **_kwargs: _Executor())
     monkeypatch.setattr(agent, "_build_image_data_url", lambda *_args, **_kwargs: "data:image/tiff;base64,AA==")
     monkeypatch.setattr(
         agent,
@@ -216,6 +216,50 @@ def test_system_prompt_has_no_absolute_path_example():
     assert "/Users/" not in agent.system_prompt_base
 
 
+def test_vl_backend_defaults_text_control_to_qwen_plus(monkeypatch):
+    monkeypatch.delenv("CSTF_TOOL_MODEL", raising=False)
+    monkeypatch.delenv("QWEN_TOOL_MODEL", raising=False)
+    visual = agent.LLMBackendConfig(
+        provider="dashscope",
+        model="qwen-vl-plus",
+        base_url="https://example.invalid/v1",
+        api_key="unit-key",
+        capabilities=frozenset({"text", "tools", "vision"}),
+    )
+    tool_config = agent._derive_tool_backend_config(visual)
+    assert tool_config.model == "qwen-plus"
+    assert tool_config.capabilities == frozenset({"text", "tools"})
+
+
+def test_chat_routes_text_and_images_to_separate_executors(monkeypatch):
+    routed = []
+
+    class _Executor:
+        def invoke(self, _payload):
+            return {"messages": [SimpleNamespace(type="ai", content="收到")]}
+
+    def _executor(**kwargs):
+        routed.append(bool(kwargs.get("require_vision")))
+        return _Executor()
+
+    monkeypatch.setattr(agent, "_get_agent_executor", _executor)
+    assert agent.chat_with_vlm("定位到太湖", []) == "收到"
+
+    image = Path(__file__)
+    monkeypatch.setattr(
+        agent,
+        "_build_image_data_url",
+        lambda *_args, **_kwargs: "data:image/png;base64,AA==",
+    )
+    assert agent.chat_with_vlm(
+        "请分析影像",
+        [],
+        image_path=str(image),
+        allow_external_media=True,
+    ) == "收到"
+    assert routed == [False, True]
+
+
 def test_external_geotiff_is_always_converted_to_metadata_free_png(monkeypatch, tmp_path):
     captured = []
 
@@ -226,7 +270,7 @@ def test_external_geotiff_is_always_converted_to_metadata_free_png(monkeypatch, 
 
     image = tmp_path / "spatial.tif"
     image.write_bytes(b"placeholder")
-    monkeypatch.setattr(agent, "_get_agent_executor", lambda: _Executor())
+    monkeypatch.setattr(agent, "_get_agent_executor", lambda **_kwargs: _Executor())
     calls = []
 
     def _data_url(path, *, force_png_for_tiff=False):
