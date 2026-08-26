@@ -215,21 +215,38 @@ def test_streamlit_root_and_copilot_are_visible_in_browser():
                             f"toolbar={globe_frame.locator('#aoiToolbar').count()}"
                         )
                 globe_frame.get_by_role("button", name="当前视图").click()
-                assert globe_frame.get_by_text("AOI 已发送，等待确认…", exact=True).is_visible()
-                # 用真实 canvas 鼠标拖拽验证矩形 AOI；坐标取点由 Cesium
-                # camera.pickEllipsoid 完成，不注入业务状态或伪造服务响应。
+                assert globe_frame.get_by_text("AOI 已选定，已同步", exact=True).is_visible()
                 canvas = globe_frame.locator("#cesiumContainer canvas").first
                 canvas.wait_for(state="visible", timeout=15000)
                 canvas_box = canvas.bounding_box()
                 assert canvas_box is not None
+
+                # 点击工具按钮只能进入绘制模式，不能把按钮点击本身误当成地图选择。
+                globe_frame.get_by_role("button", name="清除").click()
+                globe_frame.get_by_role("button", name="点选").click()
+                assert globe_frame.get_by_text("点选模式：点击地图选择一点", exact=True).is_visible()
+                assert "active" in (globe_frame.locator("#aoiBtnClick").get_attribute("class") or "")
+                page.mouse.click(canvas_box["x"] + canvas_box["width"] * 0.48,
+                                 canvas_box["y"] + canvas_box["height"] * 0.48)
+                assert globe_frame.get_by_text("AOI 已选定，已同步", exact=True).is_visible()
+
+                # 用真实 canvas 鼠标验证矩形 AOI：单击不得提交，只有超过最小距离的
+                # 按下/拖拽/松开才提交。坐标取点由 Cesium camera.pickEllipsoid 完成。
+                globe_frame.get_by_role("button", name="清除").click()
                 globe_frame.get_by_role("button", name="矩形").click()
+                assert globe_frame.get_by_text("矩形模式：按住鼠标拖拽框选", exact=True).is_visible()
+                page.mouse.click(canvas_box["x"] + canvas_box["width"] * 0.45,
+                                 canvas_box["y"] + canvas_box["height"] * 0.45)
+                assert globe_frame.get_by_text("矩形模式：请按住鼠标拖拽框选", exact=True).is_visible()
+                assert "active" in (globe_frame.locator("#aoiBtnRect").get_attribute("class") or "")
                 page.mouse.move(canvas_box["x"] + canvas_box["width"] * 0.35,
                                 canvas_box["y"] + canvas_box["height"] * 0.35)
                 page.mouse.down()
                 page.mouse.move(canvas_box["x"] + canvas_box["width"] * 0.55,
                                 canvas_box["y"] + canvas_box["height"] * 0.55)
                 page.mouse.up()
-                assert globe_frame.get_by_text("AOI 已发送，等待确认…", exact=True).is_visible()
+                assert globe_frame.get_by_text("AOI 已选定，已同步", exact=True).is_visible()
+                assert "active" not in (globe_frame.locator("#aoiBtnRect").get_attribute("class") or "")
                 globe_frame.get_by_role("button", name="多边形").click()
                 polygon_points = (
                     (canvas_box["x"] + canvas_box["width"] * 0.38,
@@ -242,7 +259,7 @@ def test_streamlit_root_and_copilot_are_visible_in_browser():
                 for point in polygon_points:
                     page.mouse.click(point[0], point[1])
                 page.mouse.click(polygon_points[0][0], polygon_points[0][1], button="right")
-                assert globe_frame.get_by_text("AOI 已发送，等待确认…", exact=True).is_visible()
+                assert globe_frame.get_by_text("AOI 已选定，已同步", exact=True).is_visible()
 
                 fly_message = {
                     "type": "CSTF_FLY",
