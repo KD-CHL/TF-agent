@@ -277,22 +277,31 @@ class ConversationStore:
             out.append(item)
         return out
 
-    def list_threads(self, limit: int = 50, *, include_empty: bool = True) -> List[Dict[str, Any]]:
-        """Return recent sessions with a bounded, already-redacted preview.
+    def list_threads(self, limit: Optional[int] = 50, *, include_empty: bool = True) -> List[Dict[str, Any]]:
+        """Return recent sessions with an already-redacted preview.
+
+        ``limit=None`` intentionally disables the query-level count limit for
+        navigation views.  The UI can then keep every visible session while
+        constraining only the viewport with an internal scrollbar.
 
         The session list is a navigation projection only: it exposes no raw
         message payload, attachment bytes, or execution command text.  The
         preview is read from the sanitized ``messages.content`` column and is
         truncated again for the UI boundary.
         """
-        try:
-            safe_limit = int(limit)
-        except (TypeError, ValueError):
-            safe_limit = 50
-        safe_limit = max(1, min(safe_limit, 100))
+        if limit is None:
+            safe_limit = None
+        else:
+            try:
+                safe_limit = int(limit)
+            except (TypeError, ValueError):
+                safe_limit = 50
+            safe_limit = max(1, min(safe_limit, 100))
         _nonempty_filter = "" if include_empty else (
             "HAVING SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END) > 0"
         )
+        _limit_clause = "" if safe_limit is None else "LIMIT ?"
+        _query_params = () if safe_limit is None else (safe_limit,)
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 f"""
@@ -313,9 +322,9 @@ class ConversationStore:
                 GROUP BY s.thread_id, s.created_at, s.last_seen
                 {_nonempty_filter}
                 ORDER BY s.last_seen DESC, s.thread_id DESC
-                LIMIT ?
+                {_limit_clause}
                 """,
-                (safe_limit,),
+                _query_params,
             ).fetchall()
         out = []
         for row in rows:

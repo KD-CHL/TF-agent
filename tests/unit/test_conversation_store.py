@@ -131,6 +131,17 @@ class TestConversationStore(unittest.TestCase):
             self.assertEqual(len(store.list_threads(limit=2)), 2)
             self.assertEqual(len(store.list_threads(limit=0)), 1)
 
+    def test_list_threads_can_return_all_visible_sessions_without_display_limit(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = ConversationStore(os.path.join(td, "sessions.sqlite3"), max_sessions=20)
+            for index in range(12):
+                thread_id = store.create_thread(f"thread-{index}")
+                store.append_message(thread_id, "user", f"prompt-{index}")
+
+            rows = store.list_threads(limit=None, include_empty=False)
+
+            self.assertEqual(len(rows), 12)
+
     def test_list_threads_preview_prefers_user_message_over_greeting(self):
         with tempfile.TemporaryDirectory() as td:
             store = ConversationStore(os.path.join(td, "sessions.sqlite3"))
