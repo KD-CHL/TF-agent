@@ -3344,6 +3344,18 @@ st.markdown("""
         max-height: 100% !important;
         overflow-y: auto !important;
         overflow-x: hidden !important;
+        /* Keep the frame on the fixed scroll viewport; the inner block moves
+           with scrollTop and must not carry the visible border. */
+        border: 1px solid rgba(250, 250, 250, 0.2) !important;
+        border-radius: 8px !important;
+        box-sizing: border-box !important;
+        background: #0d131d !important;
+    }
+    div[data-testid="stColumn"]:has(.cstf-agent-view-history) [data-testid="stLayoutWrapper"]:has(.cstf-history-list-marker) > [data-testid="stVerticalBlock"] {
+        border: 0 !important;
+        border-radius: 0 !important;
+        background: transparent !important;
+        box-shadow: none !important;
     }
     div[data-testid="stColumn"]:has(.cstf-agent-view-history) [data-testid="stLayoutWrapper"]:has(.cstf-history-list-marker) > [data-testid="stVerticalBlock"] {
         min-height: 0 !important;

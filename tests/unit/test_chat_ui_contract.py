@@ -62,6 +62,23 @@ class TestChatUiContract(unittest.TestCase):
         self.assertIn('[data-testid="stLayoutWrapper"]:has(.cstf-history-list-marker)', self.source)
         self.assertIn("overflow-y: auto !important;", self.source)
 
+    def test_history_list_frame_stays_fixed_while_items_scroll(self):
+        """列表边框固定在滚动视口，不能随内部会话项一起滚动。"""
+        frame_selector = (
+            'div[data-testid="stColumn"]:has(.cstf-agent-view-history) '
+            '[data-testid="stLayoutWrapper"]:has(.cstf-history-list-marker) {'
+        )
+        frame_css = self.source.split(frame_selector, 1)[1].split("}", 1)[0]
+        self.assertIn("border: 1px solid", frame_css)
+
+        inner_selector = (
+            'div[data-testid="stColumn"]:has(.cstf-agent-view-history) '
+            '[data-testid="stLayoutWrapper"]:has(.cstf-history-list-marker) '
+            '> [data-testid="stVerticalBlock"] {'
+        )
+        inner_css = self.source.split(inner_selector, 1)[1].split("}", 1)[0]
+        self.assertIn("border: 0 !important;", inner_css)
+
     def test_status_log_panel_is_below_map_and_adjustable(self):
         """状态/日志移到地图下方，并提供可收起与高度调节。"""
         self.assertIn('cstf-map-status-zone', self.source)
