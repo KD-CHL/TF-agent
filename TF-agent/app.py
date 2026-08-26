@@ -547,7 +547,7 @@ def scan_and_register_existing(final_root):
             if f.endswith("_Index_Final.tif"):
                 task_name = f.replace("_Index_Final.tif", "")
                 key = f"{task_name}_index"
-                if key not in registry:
+                if key not in registry or not os.path.exists(str(registry.get(key, {}).get("file_path") or "")):
                     registry[key] = {
                         "task": task_name,
                         "method": "index",
@@ -573,7 +573,7 @@ def scan_and_register_existing(final_root):
                 prob = float(param_str.split("_c")[0].replace("p", ""))
                 cnt = int(param_str.split("_c")[1])
                 key = f"{task_name}_p{prob:.2f}_c{cnt}"
-                if key not in registry:
+                if key not in registry or not os.path.exists(str(registry.get(key, {}).get("file_path") or "")):
                     registry[key] = {
                         "task": task_name,
                         "prob_threshold": prob,
