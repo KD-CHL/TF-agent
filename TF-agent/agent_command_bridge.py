@@ -14,6 +14,7 @@ from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent_context_policy import redact_spatial_metadata, safe_error_summary, sanitize_external_text
+from place_geocoder import extract_direct_map_place, geocode_place
 
 _JSON_BLOCK_RE = re.compile(
     r"\[SYSTEM_COMMAND_JSON\]\s*(\{.*?\})\s*\[/SYSTEM_COMMAND_JSON\]",
@@ -223,7 +224,7 @@ def parse_system_command(text: str) -> Optional[Dict[str, Any]]:
     m = _JSON_BLOCK_RE.search(text)
     if m:
         try:
-            return json.loads(m.group(1))
+            return _normalize_command_aliases(json.loads(m.group(1)))
         except json.JSONDecodeError:
             pass
     cmd: Dict[str, Any] = {}
@@ -244,11 +245,101 @@ def parse_system_command(text: str) -> Optional[Dict[str, Any]]:
     return cmd or None
 
 
+def _normalize_command_aliases(command: Any) -> Any:
+    """Normalize compatible legacy map shapes before strict schema validation.
+
+    Some Agent responses use ``{"map": {"center": [lat, lon], "zoom": 9}}``
+    while the internal CSTF protocol uses explicit ``lat``/``lon`` fields.
+    Keep the public command schema strict after this lossless adapter so the
+    rest of the execution path has one canonical representation.
+    """
+    if not isinstance(command, dict):
+        return command
+    normalized = dict(command)
+    map_cmd = normalized.get("map")
+    if isinstance(map_cmd, dict) and "lat" not in map_cmd and "lon" not in map_cmd:
+        center = map_cmd.get("center")
+        lat = lon = None
+        if isinstance(center, (list, tuple)) and len(center) >= 2:
+            lat, lon = center[0], center[1]
+        elif isinstance(center, dict):
+            lat = center.get("lat", center.get("latitude"))
+            lon = center.get("lon", center.get("longitude"))
+        if lat is not None and lon is not None:
+            map_cmd = dict(map_cmd)
+            map_cmd.pop("center", None)
+            map_cmd["lat"] = lat
+            map_cmd["lon"] = lon
+            normalized["map"] = map_cmd
+    return normalized
+
+
+def _preset_map_command(place: str) -> Optional[Dict[str, Any]]:
+    from map_protocol import resolve_preset
+
+    preset = resolve_preset(place)
+    if not preset:
+        return None
+    preset_name = str(preset.get("preset") or "region")
+    zoom = {"overview": 4, "region": 9, "point": 12}.get(preset_name, 9)
+    return {
+        "map": {
+            "lat": float(preset["lat"]),
+            "lon": float(preset["lon"]),
+            "zoom": zoom,
+            "preset": preset_name,
+            "label": str(preset.get("label") or place),
+        }
+    }
+
+
+def parse_direct_map_request(text: str) -> Optional[Dict[str, Any]]:
+    """解析纯地图操作；已登记的特殊视角可完全离线命中。"""
+    place = extract_direct_map_place(text)
+    return _preset_map_command(place) if place else None
+
+
+def resolve_direct_map_request(
+    text: str,
+    *,
+    geocode_fn: Any = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
+    """解析任意地名并返回 ``(地图命令, 错误, 来源署名)``。
+
+    少量原有相机预设保留为离线/特殊视角；其它地名统一交给通用地理编码器，
+    不再依赖模型猜坐标或逐个把城市写入本地表。
+    """
+    place = extract_direct_map_place(text)
+    if not place:
+        return None, None, None
+
+    preset_command = _preset_map_command(place)
+    if preset_command is not None:
+        return preset_command, None, None
+
+    resolver = geocode_fn or geocode_place
+    result, error = resolver(place)
+    if not isinstance(result, dict):
+        return None, error or f"无法解析地名“{place}”。", None
+    try:
+        command = {
+            "map": {
+                "lat": float(result["lat"]),
+                "lon": float(result["lon"]),
+                "zoom": int(result.get("zoom", 10)),
+                "label": str(result.get("label") or place),
+            }
+        }
+    except (KeyError, TypeError, ValueError):
+        return None, f"地名“{place}”返回了无效坐标。", None
+    return command, None, str(result.get("attribution") or "") or None
+
+
 def _validate_command(command: Any) -> Dict[str, Any]:
     """调用统一 Schema；错误只保留用户可理解的安全摘要。"""
     from agent_command_schema import validate_system_command
 
-    validated = validate_system_command(command)
+    validated = validate_system_command(_normalize_command_aliases(command))
     sidebar = validated.get("sidebar_states") or {}
     unknown_sidebar = set(sidebar) - (set(SIDEBAR_KEY_MAP) | {"workspace_tab"})
     if unknown_sidebar:
@@ -268,7 +359,7 @@ _RE_MAP_ZOOM = re.compile(
     re.IGNORECASE,
 )
 _RE_MAP_INTENT = re.compile(
-    r"(已定位|已跳转|已将地图|地图视角|视角已|飞到|定位到|跳转到|挪到|中心点)",
+    r"(已定位|已跳转|已将地图|已为您定位|地图视角|视角已|飞到|定位到|定位至|跳转到|挪到|中心点)",
 )
 
 
