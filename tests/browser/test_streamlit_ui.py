@@ -102,8 +102,18 @@ def test_chat_attachment_state_stays_clear_and_uses_only_custom_tooltip():
 
                 def assert_compose_is_clear() -> None:
                     assert page.locator(".cstf-attach-bar").count() == 1
-                    assert page.locator('input[type="file"]').evaluate("el => el.files.length") == 0
-                    assert page.locator(".cstf-attach-preview-card").count() == 0
+                    # afff61c 起原生 FileList 保留到提交后 rerun 轮换上传器
+                    # epoch 才清空，因此轮询等待而不是在消息回显瞬间断言。
+                    page.wait_for_function(
+                        "() => {"
+                        " const el = document.querySelector('input[type=\"file\"]');"
+                        " return !!el && el.files.length === 0;"
+                        " }",
+                        timeout=15000,
+                    )
+                    page.locator(".cstf-attach-preview-card").wait_for(
+                        state="detached", timeout=15000
+                    )
                     assert upload.name not in (plus.get_attribute("data-tooltip") or "")
                     assert plus.get_attribute("title") is None
 
