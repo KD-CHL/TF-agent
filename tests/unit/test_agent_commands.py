@@ -21,8 +21,10 @@ from agent_command_bridge import (  # noqa: E402
     build_pending_task,
     flush_pending_agent_commands,
     init_ui_session_defaults,
+    parse_direct_map_request,
     parse_system_command,
     process_agent_reply,
+    resolve_direct_map_request,
 )
 
 
@@ -45,6 +47,24 @@ class TestParseSystemCommand(unittest.TestCase):
         self.assertIsNotNone(cmd)
         self.assertEqual(cmd["map"]["lat"], 30.2)
 
+    def test_json_map_center_alias_is_normalized(self):
+        raw = (
+            "好的，已将地图定位到杭州湾区域。\n"
+            '[SYSTEM_COMMAND_JSON] { "map": { "center": [30.4, 121.8], "zoom": 9 } } '
+            "[/SYSTEM_COMMAND_JSON]"
+        )
+        cmd = parse_system_command(raw)
+        self.assertEqual(cmd["map"], {"lat": 30.4, "lon": 121.8, "zoom": 9})
+
+        state = _base_state()
+        result, _ = process_agent_reply(state, raw)
+        self.assertTrue(result.map_updated)
+        flush_pending_agent_commands(state)
+        self.assertEqual(state["map_center"], [30.4, 121.8])
+        self.assertEqual(state["map_zoom"], 9)
+        self.assertEqual(state["_pending_camera_fly"]["lat"], 30.4)
+        self.assertEqual(state["_pending_camera_fly"]["lon"], 121.8)
+
     def test_legacy_pipeline(self):
         raw = "COMMAND_RUN_PIPELINE|24zhejiang1|0.05|2"
         cmd = parse_system_command(raw)
@@ -53,6 +73,71 @@ class TestParseSystemCommand(unittest.TestCase):
 
     def test_irrelevant_text_returns_none(self):
         self.assertIsNone(parse_system_command("今天天气不错"))
+
+
+class TestDirectMapRequest(unittest.TestCase):
+    def test_resolves_hangzhou_bay(self):
+        cmd = parse_direct_map_request("聚焦到杭州湾")
+        self.assertIsNotNone(cmd)
+        self.assertEqual(cmd["map"]["lat"], 30.5)
+        self.assertEqual(cmd["map"]["lon"], 120.8)
+        self.assertEqual(cmd["map"]["zoom"], 9)
+        self.assertEqual(cmd["map"]["label"], "杭州湾")
+
+    def test_resolves_yueqing_bay(self):
+        cmd = parse_direct_map_request("请把地图定位到乐清湾")
+        self.assertIsNotNone(cmd)
+        self.assertEqual(cmd["map"]["lat"], 28.0)
+        self.assertEqual(cmd["map"]["lon"], 121.2)
+
+    def test_resolves_arbitrary_places_then_updates_map_in_sequence(self):
+        places = {
+            "香港": {
+                "lat": 22.3193,
+                "lon": 114.1694,
+                "zoom": 10,
+                "label": "香港",
+                "attribution": "test-geocoder",
+            },
+            "杭州": {
+                "lat": 30.2642,
+                "lon": 120.1551,
+                "zoom": 10,
+                "label": "杭州",
+                "attribution": "test-geocoder",
+            },
+        }
+
+        def fake_geocode(place):
+            return places.get(place), None
+
+        hong_kong, hk_error, hk_attribution = resolve_direct_map_request(
+            "聚焦到香港", geocode_fn=fake_geocode
+        )
+        hangzhou, hz_error, hz_attribution = resolve_direct_map_request(
+            "聚焦到杭州", geocode_fn=fake_geocode
+        )
+        self.assertIsNone(hk_error)
+        self.assertIsNone(hz_error)
+        self.assertEqual(hk_attribution, "test-geocoder")
+        self.assertEqual(hz_attribution, "test-geocoder")
+
+        state = _base_state()
+        first = apply_system_command(state, hong_kong)
+        self.assertTrue(first.map_updated)
+        self.assertEqual(state["map_center"], [22.3193, 114.1694])
+        self.assertEqual(state["_pending_camera_fly"]["label"], "香港")
+
+        second = apply_system_command(state, hangzhou)
+        self.assertTrue(second.map_updated)
+        self.assertEqual(state["map_center"], [30.2642, 120.1551])
+        self.assertEqual(state["_pending_camera_fly"]["label"], "杭州")
+
+    def test_ignores_plain_geography_question(self):
+        self.assertIsNone(parse_direct_map_request("杭州湾在哪里？"))
+
+    def test_does_not_swallow_combined_run_request(self):
+        self.assertIsNone(parse_direct_map_request("聚焦杭州湾并跑当前任务"))
 
 
 class TestCommandSchemaBoundary(unittest.TestCase):
@@ -452,6 +537,19 @@ class TestStreamlitDeferQueue(unittest.TestCase):
 
         reply = "杭州湾大致位于 30.5°N, 120.8°E，属于浙江沿岸。"
         self.assertIsNone(parse_system_command(reply))
+
+    def test_natural_language_located_to_phrase_is_parsed(self):
+        from agent_command_bridge import parse_system_command
+
+        reply = (
+            "已为您定位至杭州市中心（经纬度：30.2642°N, 120.1551°E，"
+            "缩放级别11）。"
+        )
+        cmd = parse_system_command(reply)
+        self.assertIsNotNone(cmd)
+        self.assertEqual(cmd["map"]["lat"], 30.2642)
+        self.assertEqual(cmd["map"]["lon"], 120.1551)
+        self.assertEqual(cmd["map"]["zoom"], 11)
 
 
 if __name__ == "__main__":

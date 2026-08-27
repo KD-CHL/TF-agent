@@ -224,19 +224,27 @@ _RE_CMD_PIPELINE = re.compile(
     re.IGNORECASE,
 )
 # 模型常只写自然语言坐标而未附 SYSTEM_COMMAND / COMMAND_UPDATE_MAP
+_RE_MAP_COORDS_CHINESE = re.compile(
+    r"(?:北纬|纬度)\s*([+-]?\d+(?:\.\d+)?)\s*[°º度]?\s*[,，、;/\s]+\s*"
+    r"(?:东经|经度)\s*([+-]?\d+(?:\.\d+)?)\s*[°º度]?",
+)
 _RE_MAP_COORDS_NSEW = re.compile(
     r"([-\d.]+)\s*[°º]?\s*[Nn北]\s*[,，/]\s*([-\d.]+)\s*[°º]?\s*[Ee东]",
 )
 _RE_MAP_COORDS_PLAIN = re.compile(
-    r"(?:中心点|中心|坐标|定位(?:至|到)?|跳转(?:至|到)?|视角)\s*"
-    r"[（(]?\s*([-\d.]+)\s*[,，]\s*([-\d.]+)\s*[)）]?",
+    r"(?:中心点|中心坐标|中心|经纬度|坐标|定位(?:至|到)?|跳转(?:至|到)?|视角)\s*"
+    r"(?:约|为)?\s*[：:=]?\s*[（(]?\s*([-\d.]+)\s*[,，]\s*([-\d.]+)\s*[)）]?",
 )
 _RE_MAP_ZOOM = re.compile(
     r"(?:缩放(?:级别|等级)?|zoom)\s*(?:为|到|=|：|:)?\s*(\d{1,2})",
     re.IGNORECASE,
 )
 _RE_MAP_INTENT = re.compile(
-    r"(已定位|已跳转|已将地图|地图视角|视角已|飞到|定位到|跳转到|挪到|中心点)",
+    r"(已定位|已跳转|已将地图|已为您定位|地图视角|视角已|飞到|定位到|定位至|跳转到|挪到|中心点)",
+)
+_RE_MAP_LABEL = re.compile(
+    r"(?:已将地图(?:视角)?定位到|已成功定位到|已为您定位至|已定位到|已定位|定位到|定位至)\s*"
+    r"([^\s（(，,。；;：:\n]{1,30}?)(?:区域)?(?=[（(，,。；;：:\s]|$)"
 )
 
 
@@ -266,7 +274,17 @@ def _parse_agent_map_command(reply: str):
         return None
     lat = lon = None
     span = ""
-    m = _RE_MAP_COORDS_NSEW.search(flat)
+    m = _RE_MAP_COORDS_CHINESE.search(flat)
+    if m:
+        try:
+            lat, lon = float(m.group(1)), float(m.group(2))
+            span = m.group(0)
+        except (ValueError, TypeError):
+            lat = lon = None
+    if lat is None:
+        m = _RE_MAP_COORDS_NSEW.search(flat)
+    else:
+        m = None
     if m:
         try:
             lat, lon = float(m.group(1)), float(m.group(2))
@@ -293,6 +311,13 @@ def _parse_agent_map_command(reply: str):
         except (ValueError, TypeError):
             zoom = 9
     return lat, lon, zoom, span or f"{lat},{lon},{zoom}"
+
+
+def _parse_agent_map_label(reply: str) -> str:
+    """Extract the place name from a model's explicit map-location claim."""
+    flat = re.sub(r"[`*_\n\r]+", " " , reply or "")
+    match = _RE_MAP_LABEL.search(flat)
+    return match.group(1).strip() if match else ""
 
 
 def _strip_map_command_from_reply(reply: str) -> str:
@@ -522,7 +547,7 @@ def scan_and_register_existing(final_root):
             if f.endswith("_Index_Final.tif"):
                 task_name = f.replace("_Index_Final.tif", "")
                 key = f"{task_name}_index"
-                if key not in registry:
+                if key not in registry or not os.path.exists(str(registry.get(key, {}).get("file_path") or "")):
                     registry[key] = {
                         "task": task_name,
                         "method": "index",
@@ -548,7 +573,7 @@ def scan_and_register_existing(final_root):
                 prob = float(param_str.split("_c")[0].replace("p", ""))
                 cnt = int(param_str.split("_c")[1])
                 key = f"{task_name}_p{prob:.2f}_c{cnt}"
-                if key not in registry:
+                if key not in registry or not os.path.exists(str(registry.get(key, {}).get("file_path") or "")):
                     registry[key] = {
                         "task": task_name,
                         "prob_threshold": prob,
@@ -1935,6 +1960,7 @@ if "e1_report" not in st.session_state:
 from agent_command_bridge import (
     init_ui_session_defaults,
     process_agent_reply,
+    resolve_direct_map_request,
     build_agent_sidebar_context,
     flush_pending_agent_commands,
     queue_agent_command,
@@ -4650,7 +4676,9 @@ with col_map:
                             st.warning("地图跳转参数无效：" + "; ".join(_fly_errs or []))
                         else:
                             # READY 握手：等 Cesium 就绪后发；等待窗口超 3s 仍未就绪则带警告发送
-                            _mp_state = _globe_srv.map_protocol_state()
+                            _mp_state = _globe_srv.map_protocol_state(
+                                channel_id=st.session_state.get("_map_channel_id")
+                            )
                             _ready_ok = bool(_mp_state.get("ready_ts"))
                             if not _ready_ok:
                                 _wait_started = st.session_state.get("_map_ready_wait_started")
@@ -4694,19 +4722,39 @@ with col_map:
     }});
     return sent;
   }};
-  if (!send()) {{
-    let n = 0;
-    const t = setInterval(() => {{
-      if (send() || ++n > 40) clearInterval(t);
-    }}, 120);
-  }}
+  // 每次定位都会注入一个很短的隐藏组件。若上一轮定位的延迟重试
+  // 仍在 parent window 中排队，它们可能在本轮定位之后再次把相机拉回旧位置。
+  // 将定时器挂在 parent 上并在新命令开始时统一取消，保证“最后一次定位”胜出。
+  try {{
+    const oldTimers = Array.isArray(win.__cstfFlyRetryTimers)
+      ? win.__cstfFlyRetryTimers : [];
+    oldTimers.forEach((timerId) => win.clearTimeout(timerId));
+    win.__cstfFlyRetryTimers = [];
+  }} catch (e) {{}}
+  // The iframe element can exist before Cesium installs its message listener.
+  // Retry at a few increasing delays; avoid restarting the camera flight
+  // continuously while the viewer is animating.
+  const retryDelays = [150, 400, 900, 1800, 3200, 5000];
+  send();
+  retryDelays.forEach((delay) => {{
+    try {{
+      const timerId = win.setTimeout(send, delay);
+      win.__cstfFlyRetryTimers.push(timerId);
+    }} catch (e) {{
+      setTimeout(send, delay);
+    }}
+  }});
 }})();
 </script>
                             """,
                                 height=0,
                             )
                             # 短等待 FLY_ACK（最多 ~1.2s），成功则 toast；未确认不阻塞
-                            _ack = _globe_srv.wait_map_ack(_fly_payload.get("command_id", ""), timeout=1.2)
+                            _ack = _globe_srv.wait_map_ack(
+                                _fly_payload.get("command_id", ""),
+                                timeout=1.2,
+                                channel_id=st.session_state.get("_map_channel_id"),
+                            )
                             if _ack:
                                 st.session_state["_map_ready_wait_started"] = None
                                 if _ack.get("ok"):
@@ -5567,6 +5615,36 @@ if _user_submitted:
                         )
                         st.rerun()
 
+                    # 纯地图定位请求走通用地理编码，不依赖模型猜坐标或稳定输出工具调用。
+                    # 原有少量相机预设仅作离线/特殊视角；任意其它地名都走同一解析入口。
+                    _direct_map_cmd, _direct_map_err, _direct_map_attribution = (
+                        resolve_direct_map_request(prompt)
+                    )
+                    if _direct_map_cmd is not None:
+                        _accepted = queue_agent_command(
+                            st.session_state,
+                            _direct_map_cmd,
+                        )
+                        if _accepted:
+                            _map_label = _direct_map_cmd["map"].get("label") or "目标区域"
+                            _msg = f"已将地图定位到{_map_label}。"
+                            if _direct_map_attribution:
+                                _msg += f"（地名解析：{_direct_map_attribution}）"
+                            st.success(_msg)
+                        else:
+                            _msg = "地图定位指令校验失败，请重试。"
+                            st.warning(_msg)
+                        st.session_state.messages.append(
+                            {"role": "assistant", "content": _msg}
+                        )
+                        st.rerun()
+                    if _direct_map_err:
+                        st.warning(_direct_map_err)
+                        st.session_state.messages.append(
+                            {"role": "assistant", "content": _direct_map_err}
+                        )
+                        st.rerun()
+
                     try:
                         from dataset_assets import build_dataset_catalog_for_agent
                         _ds_cat = build_dataset_catalog_for_agent()
@@ -5642,9 +5720,17 @@ if _user_submitted:
                     parsed_map = _parse_agent_map_command(reply)
                     if parsed_map is not None:
                         target_lat, target_lon, target_zoom, _cmd_span = parsed_map
+                        _map_label = _parse_agent_map_label(reply)
+                        _map_command = {
+                            "lat": target_lat,
+                            "lon": target_lon,
+                            "zoom": target_zoom,
+                        }
+                        if _map_label:
+                            _map_command["label"] = _map_label
                         queue_agent_command(
                             st.session_state,
-                            {"map": {"lat": target_lat, "lon": target_lon, "zoom": target_zoom}},
+                            {"map": _map_command},
                         )
                         clean_reply = _strip_map_command_from_reply(reply)
                         if not clean_reply:
