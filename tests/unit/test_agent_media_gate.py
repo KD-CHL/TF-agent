@@ -112,6 +112,27 @@ def test_authorized_image_context_also_redacts_user_text(monkeypatch, tmp_path):
     assert "sk-image-secret" not in blob
 
 
+def test_legacy_default_image_context_is_sent_without_consent_argument(monkeypatch, tmp_path):
+    """兼容原 main：旧调用方未传授权参数时仍把图片交给当前 executor。"""
+    captured = {}
+
+    class _Executor:
+        def invoke(self, payload):
+            captured.update(payload)
+            return {"messages": [SimpleNamespace(type="ai", content="看到了")]}
+
+    image = tmp_path / "legacy.png"
+    image.write_bytes(b"placeholder")
+    monkeypatch.setattr(agent, "_get_agent_executor", lambda **_kwargs: _Executor())
+    monkeypatch.setattr(agent, "_build_image_data_url", lambda *_args, **_kwargs: "data:image/png;base64,AA==")
+
+    reply = agent.chat_with_vlm("请识别截图", [], image_path=str(image))
+
+    assert reply == "看到了"
+    content = captured["messages"][-1]["content"]
+    assert [item["type"] for item in content] == ["text", "image_url"]
+
+
 def test_authorized_multiple_images_share_one_multimodal_user_message(monkeypatch, tmp_path):
     """多附件必须按选择顺序进入同一轮用户消息，而不是只发送第一张。"""
     captured = {}

@@ -3144,12 +3144,6 @@ st.markdown("""
     div[data-testid="stForm"].cstf-chat-compose [data-testid="stFileUploader"] small {
         display: none !important;
     }
-    /* The actual consent value is submitted with the Streamlit form, while
-       the + menu below provides the visible one-shot choice without adding a
-       fourth item or a second row to the composer. */
-    div[data-testid="stForm"].cstf-chat-compose div[data-testid="stElementContainer"]:has(
-        [data-testid="stCheckbox"] input[aria-label*="附件外发授权"]
-    ),
     div[data-testid="stForm"].cstf-chat-compose div[data-testid="stElementContainer"]:has(
         .cstf-attachment-epoch-marker
     ) {
@@ -3275,54 +3269,6 @@ st.markdown("""
     div[data-testid="stForm"].cstf-chat-compose .cstf-plus-btn:focus-visible::after {
         opacity: 1;
         transform: translate(0, 0);
-    }
-    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-bar.is-open .cstf-plus-btn::after {
-        display: none !important;
-    }
-    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-choice {
-        display: none;
-        position: absolute;
-        left: 0;
-        bottom: calc(100% + 9px);
-        z-index: 1600;
-        width: min(18rem, 72vw);
-        padding: 10px;
-        border: 1px solid #41506c;
-        border-radius: 12px;
-        background: #111827;
-        box-shadow: 0 12px 30px rgba(0, 0, 0, 0.42);
-        color: #e6edf8;
-        text-align: left;
-    }
-    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-bar.is-open .cstf-attach-choice {
-        display: block;
-    }
-    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-choice-title {
-        margin: 0 0 8px;
-        color: #aebbd0;
-        font-size: 0.76rem;
-        line-height: 1.45;
-    }
-    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-choice-actions {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 7px;
-    }
-    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-choice button {
-        min-height: 2rem;
-        padding: 5px 8px;
-        border: 1px solid #41506c;
-        border-radius: 8px;
-        background: #182131;
-        color: #e6edf8;
-        font-size: 0.74rem;
-        cursor: pointer;
-    }
-    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-choice button:hover,
-    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-choice button:focus-visible {
-        border-color: #6f8fd7;
-        background: #23314a;
-        outline: none;
     }
     .deck-section-title {
         font-size: 0.95rem !important;
@@ -5140,10 +5086,6 @@ with col_side:
         "role": "assistant",
         "content": "您好！我是智能分析助手。请告诉我您想分析的区域和年份，或上传截图让我识别。",
     }
-    # Attachment consent is one-shot and only appears after a file is chosen;
-    # it never occupies the compact compose row or silently persists across
-    # reruns/conversations.
-    st.session_state.setdefault("agent_external_media_consent", False)
     st.session_state.setdefault("agent_spatial_consent", False)
     # Session buttons are rendered below the radio widget. Defer the widget
     # value change to the next rerun so Streamlit does not reject a post-
@@ -5265,9 +5207,6 @@ with col_side:
                 st.markdown(msg["content"])
                 _render_chat_attachment_previews(msg)
 
-    if st.session_state.pop("_attachment_consent_reset_pending", False):
-        st.session_state["agent_external_media_consent"] = False
-
     st.markdown('<div class="cstf-chat-compose-host">', unsafe_allow_html=True)
     with st.form(key="chat_form", clear_on_submit=True):
         _input_cols = st.columns([10, 1])
@@ -5294,15 +5233,6 @@ with col_side:
             key=f"chat_attach_uploader_{_attachment_uploader_epoch}",
         )
         uploaded_images = list(uploaded_images or [])
-        # The real checkbox stays inside the form so the compact attachment
-        # menu can set a one-shot choice before the same form is submitted.
-        # CSS hides the native row; the + button exposes the accessible choice
-        # between local-only preview and external model analysis.
-        st.checkbox(
-            "附件外发授权（仅本轮）",
-            key="agent_external_media_consent",
-            help="允许后，本轮附件的受限 PNG 预览才会发送给已配置模型。",
-        )
         st.markdown(
             f'<span class="cstf-attachment-epoch-marker" data-epoch="{_attachment_uploader_epoch}" '
             'aria-hidden="true"></span>',
@@ -5344,9 +5274,6 @@ with col_side:
             chatForm.classList.add('cstf-chat-compose');
             const fileWrap = chatForm.querySelector('[data-testid="stFileUploader"]');
             const fileInput = chatForm.querySelector('input[type="file"]');
-            const consentInput = chatForm.querySelector(
-              'input[type="checkbox"][aria-label*="附件外发授权"]'
-            );
             const epochMarker = chatForm.querySelector('.cstf-attachment-epoch-marker');
             const uploaderEpoch = epochMarker?.dataset?.epoch || 'unknown';
             if (!fileWrap || !fileInput) return false;
@@ -5411,23 +5338,13 @@ with col_side:
             bar.innerHTML =
                 '<button type="button" class="cstf-plus-btn" ' +
                 'data-tooltip="每个文件≤200MB · PNG / JPG / WebP / TIFF" ' +
-                'aria-haspopup="dialog" aria-expanded="false" ' +
-                'aria-label="选择附件上传方式（每个文件≤200MB；PNG、JPG、WebP、TIFF）">+</button>' +
-                '<div class="cstf-attach-preview" role="list" aria-label="已选择附件预览"></div>' +
-                '<div class="cstf-attach-choice" role="dialog" aria-label="附件上传方式" aria-hidden="true">' +
-                  '<p class="cstf-attach-choice-title">选择本轮附件用途。仅“发送给模型”会把受限预览交给已配置模型。</p>' +
-                  '<div class="cstf-attach-choice-actions">' +
-                    '<button type="button" data-media-mode="local">仅本地预览</button>' +
-                    '<button type="button" data-media-mode="external">发送给模型</button>' +
-                  '</div>' +
-                '</div>';
+                'aria-label="选择附件（每个文件≤200MB；PNG、JPG、WebP、TIFF）">+</button>' +
+                '<div class="cstf-attach-preview" role="list" aria-label="已选择附件预览"></div>';
             // 将附件入口放到消息输入行最左侧；文件选择器本身仍隐藏在表单内。
             if (bar.parentElement !== inputRow) inputRow.insertBefore(bar, inputRow.firstChild);
 
             const plusBtn = bar.querySelector('.cstf-plus-btn');
             const previewPanel = bar.querySelector('.cstf-attach-preview');
-            const choicePanel = bar.querySelector('.cstf-attach-choice');
-            const modeButtons = bar.querySelectorAll('[data-media-mode]');
 
             const defaultTooltip = '每个文件≤200MB · PNG / JPG / WebP / TIFF';
             const previewUrls = new Set();
@@ -5572,42 +5489,17 @@ with col_side:
               previewPanel.classList.add('is-visible');
             };
 
-            const setChoiceOpen = (open) => {
-              bar.classList.toggle('is-open', Boolean(open));
-              plusBtn?.setAttribute('aria-expanded', open ? 'true' : 'false');
-              choicePanel?.setAttribute('aria-hidden', open ? 'false' : 'true');
-            };
-
-            const setMediaConsent = (allowExternal) => {
-              if (consentInput && consentInput.checked !== allowExternal) {
-                consentInput.click();
-              }
-            };
-
             if (plusBtn && plusBtn.dataset.bound !== '1') {
               plusBtn.dataset.bound = '1';
               plusBtn.addEventListener('click', (e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                if (!consentInput) {
-                  fileInput.click();
-                  return;
-                }
-                setChoiceOpen(!bar.classList.contains('is-open'));
-              });
-            }
-
-            modeButtons.forEach((button) => {
-              if (button.dataset.bound === '1') return;
-              button.dataset.bound = '1';
-              button.addEventListener('click', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                setMediaConsent(button.dataset.mediaMode === 'external');
-                setChoiceOpen(false);
+                // Match the original main.py flow: + opens the native chooser
+                // directly, and the selected files are sent to the active
+                // multimodal executor on submit.
                 fileInput.click();
               });
-            });
+            }
 
             const syncAttach = (filesOverride = undefined) => {
               if (!active) return;
@@ -5671,7 +5563,6 @@ with col_side:
 
             const resetAttachmentChrome = () => {
               if (!active) return;
-              setChoiceOpen(false);
               plusBtn?.removeAttribute('title');
               if (plusBtn) {
                 plusBtn.dataset.tooltip = defaultTooltip;
@@ -5822,13 +5713,11 @@ if _user_submitted:
             + ("…" if len(preview_failures) > 3 else "")
         )
 
-    media_authorized = bool(
-        uploaded_images
-        and st.session_state.get("agent_external_media_consent", False)
-    )
-    if uploaded_images and not media_authorized:
-        st.warning("附件已保留在本地消息预览中；本轮未向外部模型发送附件内容。")
-    external_preview_paths = [path for path, _name in preview_items] if media_authorized else []
+    # Restore the original main.py behavior: every selected attachment is
+    # sent to the active chat executor in the same multimodal request.  The
+    # local preview remains separate and is cleared by the browser bridge
+    # after submission.
+    external_preview_paths = [path for path, _name in preview_items]
 
     used_default_prompt = False
     if _has_text:
@@ -5871,9 +5760,6 @@ if _user_submitted:
             create=True,
         )
     st.session_state.messages.append(user_msg)
-    # Consent applies to this submission only; a later file selection must
-    # require a fresh affirmative action.
-    st.session_state["_attachment_consent_reset_pending"] = True
     # File uploaders cannot be cleared by assigning their instantiated widget
     # state. Rotate the key so the post-submit rerun mounts a fresh input.
     st.session_state["_attachment_uploader_epoch"] = _attachment_uploader_epoch + 1
@@ -6042,7 +5928,7 @@ if _user_submitted:
                         allow_spatial_metadata=bool(
                             st.session_state.get("agent_spatial_consent", False)
                         ),
-                        allow_external_media=media_authorized,
+                        allow_external_media=True,
                         image_paths=external_preview_paths,
                     )
 

@@ -86,9 +86,8 @@ def test_chat_attachment_state_stays_clear_and_uses_only_custom_tooltip():
                 assert plus.get_attribute("title") is None
                 assert "每个文件≤200MB" in (plus.get_attribute("data-tooltip") or "")
 
-                plus.click()
                 with page.expect_file_chooser() as chooser_info:
-                    page.get_by_role("button", name="仅本地预览").click()
+                    plus.click()
                 chooser_info.value.set_files(str(upload))
                 # afff61c 起加号气泡保持格式说明不变，选定文件名出现在预览卡片上。
                 page.locator(f'.cstf-attach-preview-card[title="{upload.name}"]').wait_for(
@@ -121,11 +120,8 @@ def test_chat_attachment_state_stays_clear_and_uses_only_custom_tooltip():
                 page.wait_for_timeout(4200)
                 assert_compose_is_clear()
 
-                # A one-shot submit guard must not keep clearing a deliberate
-                # selection made for the next message in the same browser tab.
-                plus.click()
                 with page.expect_file_chooser() as second_chooser_info:
-                    page.get_by_role("button", name="仅本地预览").click()
+                    plus.click()
                 second_chooser_info.value.set_files(str(second_upload))
                 page.locator(f'.cstf-attach-preview-card[title="{second_upload.name}"]').wait_for(
                     state="visible", timeout=15000

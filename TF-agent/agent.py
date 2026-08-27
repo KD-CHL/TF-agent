@@ -1392,7 +1392,10 @@ def chat_with_vlm(
     sidebar_context: str = None,
     capability_summary: str = None,
     allow_spatial_metadata: bool = False,
-    allow_external_media: bool = False,
+    # Keep the original main.py contract: image-bearing callers that do not
+    # pass a consent flag still send the selected image to the active model.
+    # Callers that need a local-only preview can explicitly pass False.
+    allow_external_media: bool = True,
     image_paths: Optional[Sequence[str]] = None,
 ) -> str:
     """处理对话，完美支持多模态视觉能力与物理感知"""
@@ -1421,8 +1424,9 @@ def chat_with_vlm(
     if len(requested_image_paths) > 6:
         return "单轮最多支持 6 张图片附件，请减少选择数量后重试。"
 
-    # UI 之外的调用者也必须显式获得本轮媒体授权，避免把上传影像
-    # 误送到外部 VLM；文本问答不受此门闩影响。
+    # Explicit False remains available for local-only previews and for callers
+    # that intentionally enforce their own media-consent boundary.  The
+    # default stays permissive for compatibility with the original main.py.
     if requested_image_paths and not allow_external_media:
         return "当前会话未授权向外部模型发送影像内容；请先在会话设置中勾选影像发送授权。"
 
