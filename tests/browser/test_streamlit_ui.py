@@ -90,9 +90,9 @@ def test_chat_attachment_state_stays_clear_and_uses_only_custom_tooltip():
                 with page.expect_file_chooser() as chooser_info:
                     page.get_by_role("button", name="仅本地预览").click()
                 chooser_info.value.set_files(str(upload))
-                page.wait_for_function(
-                    "name => document.querySelector('.cstf-plus-btn')?.dataset.tooltip?.includes(name)",
-                    arg=upload.name,
+                # afff61c 起加号气泡保持格式说明不变，选定文件名出现在预览卡片上。
+                page.locator(f'.cstf-attach-preview-card[title="{upload.name}"]').wait_for(
+                    state="visible", timeout=15000
                 )
                 page.get_by_role("textbox", name="chat_input").fill("附件状态清理回归")
                 page.get_by_role("button", name="➤").click()
@@ -103,6 +103,7 @@ def test_chat_attachment_state_stays_clear_and_uses_only_custom_tooltip():
                 def assert_compose_is_clear() -> None:
                     assert page.locator(".cstf-attach-bar").count() == 1
                     assert page.locator('input[type="file"]').evaluate("el => el.files.length") == 0
+                    assert page.locator(".cstf-attach-preview-card").count() == 0
                     assert upload.name not in (plus.get_attribute("data-tooltip") or "")
                     assert plus.get_attribute("title") is None
 
@@ -116,10 +117,10 @@ def test_chat_attachment_state_stays_clear_and_uses_only_custom_tooltip():
                 with page.expect_file_chooser() as second_chooser_info:
                     page.get_by_role("button", name="仅本地预览").click()
                 second_chooser_info.value.set_files(str(second_upload))
-                page.wait_for_function(
-                    "name => document.querySelector('.cstf-plus-btn')?.dataset.tooltip?.includes(name)",
-                    arg=second_upload.name,
+                page.locator(f'.cstf-attach-preview-card[title="{second_upload.name}"]').wait_for(
+                    state="visible", timeout=15000
                 )
+                assert page.locator(f'.cstf-attach-preview-card[title="{upload.name}"]').count() == 0
                 assert upload.name not in (plus.get_attribute("data-tooltip") or "")
                 assert plus.get_attribute("title") is None
 
