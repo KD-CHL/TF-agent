@@ -1010,7 +1010,6 @@ _attach_geo_meta = os.environ.get("YYNET_ATTACH_GEO_META", "0").strip().lower() 
 _tiff_auto_png_mb = float(os.environ.get("YYNET_TIFF_AUTO_PNG_MB", "12"))
 _vlm_max_side = int(os.environ.get("YYNET_VLM_MAX_SIDE", "2048"))
 
-
 try:
     # 只构造轻量客户端，不在导入阶段发起网络请求；无 Key 时保持手动工作台可用。
     llm = build_chat_model(_backend_config, require_tools=True)

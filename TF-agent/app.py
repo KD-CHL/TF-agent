@@ -264,19 +264,27 @@ _RE_CMD_PIPELINE = re.compile(
     re.IGNORECASE,
 )
 # 模型常只写自然语言坐标而未附 SYSTEM_COMMAND / COMMAND_UPDATE_MAP
+_RE_MAP_COORDS_CHINESE = re.compile(
+    r"(?:北纬|纬度)\s*([+-]?\d+(?:\.\d+)?)\s*[°º度]?\s*[,，、;/\s]+\s*"
+    r"(?:东经|经度)\s*([+-]?\d+(?:\.\d+)?)\s*[°º度]?",
+)
 _RE_MAP_COORDS_NSEW = re.compile(
     r"([-\d.]+)\s*[°º]?\s*[Nn北]\s*[,，/]\s*([-\d.]+)\s*[°º]?\s*[Ee东]",
 )
 _RE_MAP_COORDS_PLAIN = re.compile(
-    r"(?:中心点|中心|坐标|定位(?:至|到)?|跳转(?:至|到)?|视角)\s*"
-    r"[（(]?\s*([-\d.]+)\s*[,，]\s*([-\d.]+)\s*[)）]?",
+    r"(?:中心点|中心坐标|中心|经纬度|坐标|定位(?:至|到)?|跳转(?:至|到)?|视角)\s*"
+    r"(?:约|为)?\s*[：:=]?\s*[（(]?\s*([-\d.]+)\s*[,，]\s*([-\d.]+)\s*[)）]?",
 )
 _RE_MAP_ZOOM = re.compile(
     r"(?:缩放(?:级别|等级)?|zoom)\s*(?:为|到|=|：|:)?\s*(\d{1,2})",
     re.IGNORECASE,
 )
 _RE_MAP_INTENT = re.compile(
-    r"(已定位|已跳转|已将地图|地图视角|视角已|飞到|定位到|跳转到|挪到|中心点)",
+    r"(已定位|已跳转|已将地图|已为您定位|地图视角|视角已|飞到|定位到|定位至|跳转到|挪到|中心点)",
+)
+_RE_MAP_LABEL = re.compile(
+    r"(?:已将地图(?:视角)?定位到|已成功定位到|已为您定位至|已定位到|已定位|定位到|定位至)\s*"
+    r"([^\s（(，,。；;：:\n]{1,30}?)(?:区域)?(?=[（(，,。；;：:\s]|$)"
 )
 
 
@@ -306,7 +314,17 @@ def _parse_agent_map_command(reply: str):
         return None
     lat = lon = None
     span = ""
-    m = _RE_MAP_COORDS_NSEW.search(flat)
+    m = _RE_MAP_COORDS_CHINESE.search(flat)
+    if m:
+        try:
+            lat, lon = float(m.group(1)), float(m.group(2))
+            span = m.group(0)
+        except (ValueError, TypeError):
+            lat = lon = None
+    if lat is None:
+        m = _RE_MAP_COORDS_NSEW.search(flat)
+    else:
+        m = None
     if m:
         try:
             lat, lon = float(m.group(1)), float(m.group(2))
@@ -333,6 +351,13 @@ def _parse_agent_map_command(reply: str):
         except (ValueError, TypeError):
             zoom = 9
     return lat, lon, zoom, span or f"{lat},{lon},{zoom}"
+
+
+def _parse_agent_map_label(reply: str) -> str:
+    """Extract the place name from a model's explicit map-location claim."""
+    flat = re.sub(r"[`*_\n\r]+", " " , reply or "")
+    match = _RE_MAP_LABEL.search(flat)
+    return match.group(1).strip() if match else ""
 
 
 def _strip_map_command_from_reply(reply: str) -> str:
@@ -6035,9 +6060,17 @@ if _user_submitted:
                     parsed_map = _parse_agent_map_command(reply)
                     if parsed_map is not None:
                         target_lat, target_lon, target_zoom, _cmd_span = parsed_map
+                        _map_label = _parse_agent_map_label(reply)
+                        _map_command = {
+                            "lat": target_lat,
+                            "lon": target_lon,
+                            "zoom": target_zoom,
+                        }
+                        if _map_label:
+                            _map_command["label"] = _map_label
                         queue_agent_command(
                             st.session_state,
-                            {"map": {"lat": target_lat, "lon": target_lon, "zoom": target_zoom}},
+                            {"map": _map_command},
                         )
                         clean_reply = _strip_map_command_from_reply(reply)
                         if not clean_reply:
