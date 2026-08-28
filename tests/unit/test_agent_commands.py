@@ -21,10 +21,8 @@ from agent_command_bridge import (  # noqa: E402
     build_pending_task,
     flush_pending_agent_commands,
     init_ui_session_defaults,
-    parse_direct_map_request,
     parse_system_command,
     process_agent_reply,
-    resolve_direct_map_request,
 )
 
 
@@ -73,71 +71,6 @@ class TestParseSystemCommand(unittest.TestCase):
 
     def test_irrelevant_text_returns_none(self):
         self.assertIsNone(parse_system_command("今天天气不错"))
-
-
-class TestDirectMapRequest(unittest.TestCase):
-    def test_resolves_hangzhou_bay(self):
-        cmd = parse_direct_map_request("聚焦到杭州湾")
-        self.assertIsNotNone(cmd)
-        self.assertEqual(cmd["map"]["lat"], 30.5)
-        self.assertEqual(cmd["map"]["lon"], 120.8)
-        self.assertEqual(cmd["map"]["zoom"], 9)
-        self.assertEqual(cmd["map"]["label"], "杭州湾")
-
-    def test_resolves_yueqing_bay(self):
-        cmd = parse_direct_map_request("请把地图定位到乐清湾")
-        self.assertIsNotNone(cmd)
-        self.assertEqual(cmd["map"]["lat"], 28.0)
-        self.assertEqual(cmd["map"]["lon"], 121.2)
-
-    def test_resolves_arbitrary_places_then_updates_map_in_sequence(self):
-        places = {
-            "香港": {
-                "lat": 22.3193,
-                "lon": 114.1694,
-                "zoom": 10,
-                "label": "香港",
-                "attribution": "test-geocoder",
-            },
-            "杭州": {
-                "lat": 30.2642,
-                "lon": 120.1551,
-                "zoom": 10,
-                "label": "杭州",
-                "attribution": "test-geocoder",
-            },
-        }
-
-        def fake_geocode(place):
-            return places.get(place), None
-
-        hong_kong, hk_error, hk_attribution = resolve_direct_map_request(
-            "聚焦到香港", geocode_fn=fake_geocode
-        )
-        hangzhou, hz_error, hz_attribution = resolve_direct_map_request(
-            "聚焦到杭州", geocode_fn=fake_geocode
-        )
-        self.assertIsNone(hk_error)
-        self.assertIsNone(hz_error)
-        self.assertEqual(hk_attribution, "test-geocoder")
-        self.assertEqual(hz_attribution, "test-geocoder")
-
-        state = _base_state()
-        first = apply_system_command(state, hong_kong)
-        self.assertTrue(first.map_updated)
-        self.assertEqual(state["map_center"], [22.3193, 114.1694])
-        self.assertEqual(state["_pending_camera_fly"]["label"], "香港")
-
-        second = apply_system_command(state, hangzhou)
-        self.assertTrue(second.map_updated)
-        self.assertEqual(state["map_center"], [30.2642, 120.1551])
-        self.assertEqual(state["_pending_camera_fly"]["label"], "杭州")
-
-    def test_ignores_plain_geography_question(self):
-        self.assertIsNone(parse_direct_map_request("杭州湾在哪里？"))
-
-    def test_does_not_swallow_combined_run_request(self):
-        self.assertIsNone(parse_direct_map_request("聚焦杭州湾并跑当前任务"))
 
 
 class TestCommandSchemaBoundary(unittest.TestCase):

@@ -14,7 +14,6 @@ from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent_context_policy import redact_spatial_metadata, safe_error_summary, sanitize_external_text
-from place_geocoder import extract_direct_map_place, geocode_place
 
 _JSON_BLOCK_RE = re.compile(
     r"\[SYSTEM_COMMAND_JSON\]\s*(\{.*?\})\s*\[/SYSTEM_COMMAND_JSON\]",
@@ -272,67 +271,6 @@ def _normalize_command_aliases(command: Any) -> Any:
             map_cmd["lon"] = lon
             normalized["map"] = map_cmd
     return normalized
-
-
-def _preset_map_command(place: str) -> Optional[Dict[str, Any]]:
-    from map_protocol import resolve_preset
-
-    preset = resolve_preset(place)
-    if not preset:
-        return None
-    preset_name = str(preset.get("preset") or "region")
-    zoom = {"overview": 4, "region": 9, "point": 12}.get(preset_name, 9)
-    return {
-        "map": {
-            "lat": float(preset["lat"]),
-            "lon": float(preset["lon"]),
-            "zoom": zoom,
-            "preset": preset_name,
-            "label": str(preset.get("label") or place),
-        }
-    }
-
-
-def parse_direct_map_request(text: str) -> Optional[Dict[str, Any]]:
-    """解析纯地图操作；已登记的特殊视角可完全离线命中。"""
-    place = extract_direct_map_place(text)
-    return _preset_map_command(place) if place else None
-
-
-def resolve_direct_map_request(
-    text: str,
-    *,
-    geocode_fn: Any = None,
-) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
-    """解析任意地名并返回 ``(地图命令, 错误, 来源署名)``。
-
-    少量原有相机预设保留为离线/特殊视角；其它地名统一交给通用地理编码器，
-    不再依赖模型猜坐标或逐个把城市写入本地表。
-    """
-    place = extract_direct_map_place(text)
-    if not place:
-        return None, None, None
-
-    preset_command = _preset_map_command(place)
-    if preset_command is not None:
-        return preset_command, None, None
-
-    resolver = geocode_fn or geocode_place
-    result, error = resolver(place)
-    if not isinstance(result, dict):
-        return None, error or f"无法解析地名“{place}”。", None
-    try:
-        command = {
-            "map": {
-                "lat": float(result["lat"]),
-                "lon": float(result["lon"]),
-                "zoom": int(result.get("zoom", 10)),
-                "label": str(result.get("label") or place),
-            }
-        }
-    except (KeyError, TypeError, ValueError):
-        return None, f"地名“{place}”返回了无效坐标。", None
-    return command, None, str(result.get("attribution") or "") or None
 
 
 def _validate_command(command: Any) -> Dict[str, Any]:

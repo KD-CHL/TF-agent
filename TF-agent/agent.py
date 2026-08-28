@@ -1010,54 +1010,11 @@ _attach_geo_meta = os.environ.get("YYNET_ATTACH_GEO_META", "0").strip().lower() 
 _tiff_auto_png_mb = float(os.environ.get("YYNET_TIFF_AUTO_PNG_MB", "12"))
 _vlm_max_side = int(os.environ.get("YYNET_VLM_MAX_SIDE", "2048"))
 
-
-def _derive_tool_backend_config(config: LLMBackendConfig) -> LLMBackendConfig:
-    """为文本控制选择稳定支持工具调用的模型。
-
-    QWEN_CHAT_MODEL 继续表示视觉/通用对话模型；当它是 VL 系列时，纯文本
-    地图与任务调度默认改用 qwen-plus。可通过 QWEN_TOOL_MODEL 单独覆盖。
-    本地 OpenAI-compatible 后端保持原配置，不擅自切换模型。
-    """
-    if config.provider != "dashscope":
-        return config
-    configured = (
-        os.environ.get("CSTF_TOOL_MODEL")
-        or os.environ.get("QWEN_TOOL_MODEL")
-        or ""
-    ).strip()
-    tool_model = configured or (
-        "qwen-plus" if "vl" in config.model.lower() else config.model
-    )
-    capabilities = {"text", "tools"}
-    if "vl" in tool_model.lower():
-        capabilities.add("vision")
-    return LLMBackendConfig(
-        provider=config.provider,
-        model=tool_model,
-        base_url=config.base_url,
-        api_key=config.api_key,
-        capabilities=frozenset(capabilities),
-        temperature=config.temperature,
-    )
-
-
-_tool_backend_config = _derive_tool_backend_config(_backend_config)
-
 try:
-    # 文本控制使用工具模型；构造客户端不会在导入阶段发起网络请求。
-    llm = build_chat_model(_tool_backend_config, require_tools=True)
+    # 只构造轻量客户端，不在导入阶段发起网络请求；无 Key 时保持手动工作台可用。
+    llm = build_chat_model(_backend_config, require_tools=True)
 except BackendUnavailable:
     llm = None
-
-try:
-    # 视觉模型仅在本轮确有授权附件时使用，并保持现有图片解译能力。
-    vision_llm = build_chat_model(
-        _backend_config,
-        require_tools=True,
-        require_vision=True,
-    )
-except BackendUnavailable:
-    vision_llm = None
 
 tools = [
     dispatch_system_command,
@@ -1221,42 +1178,25 @@ I. **端到端潮滩分析 Workflow（GEE→推理→E1/M5→PDF）**
 
 _agent_executor_lock = threading.Lock()
 agent_executor = None
-vision_agent_executor = None
 _text_model_lock = threading.Lock()
 _text_model = None
 
 
-def _get_agent_executor(*, require_vision: bool = False):
-    """按本轮输入构造工具型 Agent：文本控制与视觉解译使用独立模型。"""
-    global agent_executor, vision_agent_executor, llm, vision_llm
-    current_executor = vision_agent_executor if require_vision else agent_executor
-    if current_executor is not None:
-        return current_executor
+def _get_agent_executor():
+    """首次真正聊天时构造工具型 Agent；未配置后端时返回 None。"""
+    global agent_executor, llm
+    if agent_executor is not None:
+        return agent_executor
     with _agent_executor_lock:
-        current_executor = vision_agent_executor if require_vision else agent_executor
-        if current_executor is not None:
-            return current_executor
-        config = _backend_config if require_vision else _tool_backend_config
-        current_llm = vision_llm if require_vision else llm
-        if current_llm is None:
+        if agent_executor is not None:
+            return agent_executor
+        if llm is None:
             try:
-                current_llm = build_chat_model(
-                    config,
-                    require_tools=True,
-                    require_vision=require_vision,
-                )
+                llm = build_chat_model(_backend_config, require_tools=True)
             except BackendUnavailable:
                 return None
-            if require_vision:
-                vision_llm = current_llm
-            else:
-                llm = current_llm
-        current_executor = create_react_agent(current_llm, tools)
-        if require_vision:
-            vision_agent_executor = current_executor
-        else:
-            agent_executor = current_executor
-        return current_executor
+        agent_executor = create_react_agent(llm, tools)
+        return agent_executor
 
 
 def _get_text_model():
@@ -1452,7 +1392,10 @@ def chat_with_vlm(
     sidebar_context: str = None,
     capability_summary: str = None,
     allow_spatial_metadata: bool = False,
-    allow_external_media: bool = False,
+    # Keep the original main.py contract: image-bearing callers that do not
+    # pass a consent flag still send the selected image to the active model.
+    # Callers that need a local-only preview can explicitly pass False.
+    allow_external_media: bool = True,
     image_paths: Optional[Sequence[str]] = None,
 ) -> str:
     """处理对话，完美支持多模态视觉能力与物理感知"""
@@ -1481,14 +1424,15 @@ def chat_with_vlm(
     if len(requested_image_paths) > 6:
         return "单轮最多支持 6 张图片附件，请减少选择数量后重试。"
 
-    # UI 之外的调用者也必须显式获得本轮媒体授权，避免把上传影像
-    # 误送到外部 VLM；文本问答不受此门闩影响。
+    # Explicit False remains available for local-only previews and for callers
+    # that intentionally enforce their own media-consent boundary.  The
+    # default stays permissive for compatibility with the original main.py.
     if requested_image_paths and not allow_external_media:
         return "当前会话未授权向外部模型发送影像内容；请先在会话设置中勾选影像发送授权。"
 
     existing_image_paths = [path for path in requested_image_paths if os.path.exists(path)]
 
-    executor = _get_agent_executor(require_vision=bool(existing_image_paths))
+    executor = _get_agent_executor()
     if executor is None:
         # 无 tools 的本地后端仍可提供纯问答；只有控制侧栏/跑任务时才要求工具能力。
         if existing_image_paths and "vision" not in _backend_config.capabilities:
