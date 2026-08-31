@@ -15,6 +15,7 @@ from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent_context_policy import redact_spatial_metadata, safe_error_summary, sanitize_external_text
+from location_resolver import resolve_location
 from map_command_adapter import normalize_map_payload, parse_legacy_map_text
 
 _JSON_BLOCK_RE = re.compile(
@@ -369,7 +370,7 @@ def _normalize_command_aliases(command: Any) -> Any:
     """
     if not isinstance(command, dict):
         return command
-    normalized = dict(command)
+    normalized = dict(_resolve_map_location_alias(command))
     map_cmd = normalized.get("map")
     if isinstance(map_cmd, dict):
         map_normalized = normalize_map_payload(map_cmd)
@@ -416,6 +417,44 @@ def _validate_command(command: Any) -> Dict[str, Any]:
     if unknown_sidebar:
         raise ValueError("系统命令校验失败（sidebar_states 含未知字段）。")
     return validated
+
+
+def _resolve_map_location_alias(command: Any) -> Any:
+    """Resolve an optional user-facing map name before strict schema parsing.
+
+    ``location_name`` is a compatibility input only; it never crosses the
+    canonical map schema.  Explicit lat/lon always win, while a name without
+    coordinates must resolve uniquely from the local preset table.
+    """
+    if not isinstance(command, dict) or not isinstance(command.get("map"), dict):
+        return command
+    payload = command["map"]
+    if "location_name" not in payload:
+        return command
+
+    name = payload.get("location_name")
+    has_lat = payload.get("lat") is not None
+    has_lon = payload.get("lon") is not None
+    normalized_payload = dict(payload)
+    normalized_payload.pop("location_name", None)
+
+    # Supplied coordinates are an explicit direct-coordinate command.  Keep
+    # them byte-for-byte semantically unchanged and only remove the
+    # non-canonical compatibility field.
+    if has_lat and has_lon:
+        return {**command, "map": normalized_payload}
+
+    resolution = resolve_location(name, lat=payload.get("lat"), lon=payload.get("lon"))
+    if not resolution.ok:
+        detail = resolution.reason or "error"
+        if resolution.candidates:
+            detail += "（候选: " + "、".join(resolution.candidates) + "）"
+        raise ValueError(f"地图地名解析失败: {detail}")
+
+    normalized_payload.update({"lat": resolution.lat, "lon": resolution.lon})
+    if not normalized_payload.get("label") and resolution.label:
+        normalized_payload["label"] = resolution.label
+    return {**command, "map": normalized_payload}
 
 
 _RE_MAP_COORDS_NSEW = re.compile(

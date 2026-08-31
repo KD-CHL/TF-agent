@@ -22,6 +22,7 @@ from langchain_core.messages import SystemMessage
 from langgraph.prebuilt import ToolRuntime, create_react_agent
 from llm_backend import BackendUnavailable, LLMBackendConfig, build_chat_model
 from agent_context_policy import redact_spatial_metadata, sanitize_external_text
+from location_resolver import resolve_location
 
 # Respect explicitly injected environment values (CI, remote gateway and
 # isolated tests). The ignored local .env remains the fallback for developers.
@@ -816,6 +817,13 @@ def change_map_view(
     label: 可选，状态栏展示名（默认取 location_name）。
     """
     import json as _json
+
+    # Keep the canonical tool signature and explicit coordinate validation
+    # unchanged.  The resolver only supplies a local label for a known preset;
+    # model-provided lat/lon remain the values emitted to the command bridge.
+    resolution = resolve_location(location_name, lat=lat, lon=lon)
+    if resolution.ok and resolution.source == "local_preset" and not label:
+        label = resolution.label
 
     payload = {"map": {"lat": lat, "lon": lon, "zoom": int(zoom)}}
     if preset:
