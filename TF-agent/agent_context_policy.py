@@ -48,13 +48,13 @@ _JSON_SPATIAL_VALUE_RE = re.compile(
 )
 _JSON_SPATIAL_NUMBER_RE = re.compile(
     r"(?ix)(?P<prefix>(?:[\"']?)(?:lat|latitude|lon|longitude|west|south|east|north)(?:[\"']?)\s*:\s*)"
-    r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+    r"[\"']?[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?[\"']?"
 )
 _EXPLICIT_COORDINATE_RE = re.compile(
-    r"(?ix)(?P<label>坐标|经纬度|中心点|地图中心|coordinates?|map[\s_-]*center)"
+    r"(?ix)(?P<label>坐标|经纬度|中心点|地图中心|coordinates?|center\s+point|map[\s_-]*center)"
     r"\s*(?:[:：=]\s*)?"
-    r"(?:\(\s*[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:°|º)?\s*[NSWE]?\s*[,，]\s*"
-    r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:°|º)?\s*[NSWE]?\s*\)"
+    r"(?:[\(\[（［【]\s*[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:°|º)?\s*[NSWE]?\s*[,，]\s*"
+    r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:°|º)?\s*[NSWE]?\s*[\)\]）］】]"
     r"|[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:°|º)?\s*[NSWE]?\s*[,，]\s*"
     r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:°|º)?\s*[NSWE]?)"
 )

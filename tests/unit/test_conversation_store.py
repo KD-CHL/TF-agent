@@ -19,6 +19,22 @@ from conversation_store import ConversationStore, SCHEMA_VERSION, next_thread_id
 
 
 class TestConversationStore(unittest.TestCase):
+    def test_sqlite_roundtrip_redacts_remaining_equivalent_coordinate_forms(self):
+        """Durable storage must not retain quoted or localized map coordinates."""
+        samples = (
+            '{"lat":"30.5","lon":"120.8"}',
+            "中心点：[30.5, 120.8]",
+            "地图中心：[30.5, 120.8]",
+            "center point: (30.5, 120.8)",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            store = ConversationStore(os.path.join(td, "equivalent-coordinates.sqlite3"))
+            for index, sample in enumerate(samples):
+                store.append_message("equivalent", "assistant", sample)
+            restored = "\n".join(row["content"] for row in store.load_messages("equivalent"))
+        for exact in ("30.5", "120.8"):
+            self.assertNotIn(exact, restored)
+
     def test_sqlite_roundtrip_uses_shared_durable_sanitizer_for_spatial_and_media_inputs(self):
         with tempfile.TemporaryDirectory() as td:
             store = ConversationStore(os.path.join(td, "durable.sqlite3"))
