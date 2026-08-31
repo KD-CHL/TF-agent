@@ -1082,6 +1082,7 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
       type: "CSTF_MAP_READY",
       version: 1,
       command_id: "ready-" + Date.now(),
+      channel_id: CFG.channelId || "default",
       status: "ready",
       viewer_init_count: window.__cstfViewerInitCount || 1,
       ts: Date.now(),
@@ -1094,6 +1095,7 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
       type: "CSTF_FLY_ACK",
       version: 1,
       command_id: commandId || "",
+      channel_id: CFG.channelId || "default",
       ok: !!ok,
       ts: Date.now(),
     }};
@@ -1167,6 +1169,12 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
     if (type === "CSTF_FLY") {{
       const navigationSeq = Number(data.navigation_seq);
       const hasNavigationSeq = Number.isFinite(navigationSeq) && navigationSeq > 0;
+      if (!hasNavigationSeq && _lastFlyNavigationSeq > 0) {{
+        // Legacy delivery remains supported only before this viewer has seen
+        // a sequenced command; afterwards it could only be a stale retry.
+        sendFlyAck(data.command_id, false, {{ error: "stale_navigation" }});
+        return;
+      }}
       if (hasNavigationSeq && navigationSeq < _lastFlyNavigationSeq) {{
         // A delayed retry must not drag the camera back to an older target.
         sendFlyAck(data.command_id, false, {{

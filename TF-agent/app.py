@@ -4863,7 +4863,7 @@ with col_map:
 (() => {{
   const win = window.parent || window;
   const doc = win.document;
-  const msg = {_fly_js};
+  const msg = Object.assign({_fly_js}, {{ channel_id: {_json.dumps(_map_channel_id or "default")} }});
   // The latest payload is shared by every short-lived Streamlit bridge.
   // A bridge from an older rerun therefore cannot send its closed-over target.
   win.__cstfPendingFly = msg;
@@ -4878,9 +4878,9 @@ with col_map:
       }}
     }});
   }} catch (e) {{}}
-  const send = () => {{
+  const sendLatestFly = () => {{
     const latest = win.__cstfPendingFly;
-    if (!latest || latest.command_id !== msg.command_id) return false;
+    if (!latest) return false;
     const iframes = doc.querySelectorAll("iframe");
     let sent = false;
     iframes.forEach((ifr) => {{
@@ -4898,23 +4898,59 @@ with col_map:
   // 每次定位都会注入一个很短的隐藏组件。若上一轮定位的延迟重试
   // 仍在 parent window 中排队，它们可能在本轮定位之后再次把相机拉回旧位置。
   // 将定时器挂在 parent 上并在新命令开始时统一取消，保证“最后一次定位”胜出。
-  try {{
+  const clearFlyRetryTimers = () => {{
     const oldTimers = Array.isArray(win.__cstfFlyRetryTimers)
       ? win.__cstfFlyRetryTimers : [];
     oldTimers.forEach((timerId) => win.clearTimeout(timerId));
     win.__cstfFlyRetryTimers = [];
-  }} catch (e) {{}}
+  }};
+  try {{ clearFlyRetryTimers(); }} catch (e) {{}}
+  const replayLatestFly = () => {{
+    const latest = win.__cstfPendingFly;
+    if (!latest) return false;
+    clearFlyRetryTimers();
+    return sendLatestFly();
+  }};
+  const installMapDeliveryListener = () => {{
+    if (win.__cstfMapDeliveryListener) {{
+      win.removeEventListener("message", win.__cstfMapDeliveryListener);
+    }}
+    const listener = (event) => {{
+      const latest = win.__cstfPendingFly;
+      const msg = event && event.data;
+      if (!latest || !msg || typeof msg !== "object") return;
+      if (msg.type !== "CSTF_MAP_READY" && msg.type !== "CSTF_FLY_ACK") return;
+      if (msg.channel_id !== latest.channel_id) return;
+      if (origin !== "*" && event.origin !== origin) return;
+      if (msg.type === "CSTF_MAP_READY") {{
+        replayLatestFly();
+        return;
+      }}
+      if (msg.command_id === latest.command_id &&
+          Number(msg.navigation_seq) === Number(latest.navigation_seq)) {{
+        clearFlyRetryTimers();
+        win.__cstfPendingFly = null;
+      }}
+    }};
+    win.__cstfMapDeliveryListener = listener;
+    win.addEventListener("message", listener);
+  }};
+  installMapDeliveryListener();
   // The iframe element can exist before Cesium installs its message listener.
   // Retry at a few increasing delays; avoid restarting the camera flight
   // continuously while the viewer is animating.
   const retryDelays = [150, 400, 900, 1800, 3200, 5000];
-  send();
+  sendLatestFly();
   retryDelays.forEach((delay) => {{
     try {{
-      const timerId = win.setTimeout(send, delay);
+      const timerId = win.setTimeout(() => {{
+        if (win.__cstfPendingFly && win.__cstfPendingFly.command_id === msg.command_id) {{
+          sendLatestFly();
+        }}
+      }}, delay);
       win.__cstfFlyRetryTimers.push(timerId);
     }} catch (e) {{
-      setTimeout(send, delay);
+      setTimeout(sendLatestFly, delay);
     }}
   }});
 }})();

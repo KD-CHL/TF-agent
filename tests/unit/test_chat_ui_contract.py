@@ -357,6 +357,13 @@ class TestChatUiContract(unittest.TestCase):
         self.assertIn("oldTimers.forEach((timerId) => win.clearTimeout(timerId));", self.source)
         self.assertIn("win.__cstfFlyRetryTimers.push(timerId);", self.source)
 
+    def test_slow_map_ready_replays_the_latest_pending_fly(self):
+        """READY after all initial retries must replay the current channel payload."""
+        self.assertIn("const replayLatestFly = () =>", self.source)
+        self.assertIn('msg.type !== "CSTF_MAP_READY"', self.source)
+        self.assertIn("replayLatestFly();", self.source)
+        self.assertIn("clearFlyRetryTimers();", self.source)
+
     def test_alerts_are_dismissible_and_do_not_reflow_workbench(self):
         """错误/警告通知浮动显示并支持关闭，避免挤压地图与 Agent。"""
         self.assertIn("cstf-dismissible-alert", self.source)
