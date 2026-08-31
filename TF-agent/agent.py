@@ -543,6 +543,11 @@ def dispatch_system_command(command_json: str) -> str:
       "pending_action": { "type": "run_pipeline"|"run_m4"|"run_autotune"|"propose_m5"|"run_m5"|"confirm_m5"|"propose_e1"|"run_e1"|"confirm_e1", ... }  // 可选，启动后台
     }
 
+    map 规范：lat 是纬度、lon 是经度、zoom 必须为 1~18。规范输出中的 map 只能使用
+    lat/lon/zoom 及已定义的 preset/label，禁止 center、bounds 或任何任意键。
+    用户要求查看、定位或跳转某个地点时，必须调用 change_map_view；若同时有侧栏或流程操作，
+    则在本工具的 map 字段中使用同一规范坐标。
+
     sidebar_states 全部可用键（未提及则省略，禁止脑补）：
     workflow_tab(潮滩推理|GEE 数据下载), selected_task, run_mode(dl|index), inference_mode(深度学习|指数法),
     prob_th(0.01~0.50), min_cnt(1~10), adaptive_mode, force_rerun,
@@ -805,6 +810,8 @@ def change_map_view(
     """
     地图视角跳转。用户表达查看/定位/跳到某地时必须立即调用。
     可与 dispatch_system_command 合并；单独跳转时用本工具。
+    lat 是纬度，lon 是经度，zoom 必须为 1~18。输出 map 为规范 JSON：仅可含
+    lat/lon/zoom 及已定义的 preset/label，严禁 center、bounds 或任意额外键。
     preset: 可选，地名预设（如 杭州湾/乐清湾/中国），用于高度档位与展示。
     label: 可选，状态栏展示名（默认取 location_name）。
     """
@@ -1055,7 +1062,9 @@ B. 只改侧栏、不立即运行 → dispatch_system_command，**不要** pendi
    例：「概率改成 8%」「把 E1 打开」「切到下载页」「云量设 20」
 C. 改侧栏并立即运行 → dispatch_system_command，sidebar_states + pending_action 同轮给出
    例：「用 5% 跑一下浙江」「下载杭州湾 2020 年 1 月影像并开始」
-D. 只跳地图 → map 字段（可合并进 dispatch_system_command）
+D. 查看/定位/跳转地点 → 必须调用 change_map_view；若同时改侧栏或启动流程，则调用
+   dispatch_system_command 并在其 map 字段使用规范坐标。map 中 lat=纬度、lon=经度、zoom=1~18，
+   规范输出禁止 center、bounds 和任意额外键。
    例：「看看杭州湾」「定位到南流江口」「地图挪到舟山」
 E. 承前省略 / 指代 → 结合【侧栏快照】与对话上文补全 task/参数
    例：「那就跑吧」「同样参数再跑一遍」「云量改成 20 再下」
@@ -1094,7 +1103,9 @@ I. **端到端潮滩分析 Workflow（GEE→推理→E1/M5→PDF）**
 - prepare_m5_change_detection / confirm_and_run_m5：独立 M5 变化检测闭环
 - prepare_e1_consistency_check / confirm_and_run_e1：独立 E1 多源一致性闭环
 - analyze_workflow / confirm_workflow：**端到端潮滩分析**（GEE→推理→E1/M5→PDF，先计划后确认）
-- change_map_view：仅当地图跳转且无任何侧栏/运行需求时用
+- change_map_view：地点查看/定位/跳转必须调用；仅地图跳转时单独用，若同时有侧栏/运行需求，
+  在 dispatch_system_command 的规范 map 部分完成。lat=纬度、lon=经度、zoom=1~18；规范 map
+  禁止 center、bounds 和任意额外键
 - assist_gee_download：用户明确要 GEE 下载时可快捷调用（等价于 dispatch + run_m4）
 - trigger_spatial_analysis：仅简单跑推理且无 M5/E1/Tab 变更时用
 - web_search：文献/法规/公式/通用知识/时事/概念一律走联网实时检索（带来源 URL）

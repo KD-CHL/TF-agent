@@ -26,6 +26,20 @@ from agent_command_bridge import (  # noqa: E402
 )
 
 
+def test_change_map_view_emits_canonical_lat_lon():
+    import agent
+
+    raw = agent.change_map_view.invoke({
+        "location_name": "杭州湾",
+        "lat": 30.5,
+        "lon": 120.8,
+        "zoom": 9,
+    })
+    assert '"lat": 30.5' in raw
+    assert '"lon": 120.8' in raw
+    assert '"center"' not in raw
+
+
 def _base_state() -> dict:
     s: dict = {}
     init_ui_session_defaults(s)
