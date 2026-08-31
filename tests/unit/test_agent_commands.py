@@ -79,6 +79,18 @@ class TestParseSystemCommand(unittest.TestCase):
             {"west": 120.5, "south": 38.0, "east": 122.7, "north": 39.8},
         )
 
+    def test_unclosed_system_command_is_rejected_and_stripped(self):
+        state = {}
+        reply = '请定位。 [SYSTEM_COMMAND_JSON]{"map":{"lat":30.2'
+
+        result, clean = process_agent_reply(state, reply)
+
+        self.assertFalse(result.applied)
+        self.assertTrue(result.errors)
+        self.assertNotIn("SYSTEM_COMMAND_JSON", clean)
+        self.assertEqual(clean, "请定位。")
+        self.assertEqual(state, {})
+
     def test_legacy_pipeline(self):
         raw = "COMMAND_RUN_PIPELINE|24zhejiang1|0.05|2"
         cmd = parse_system_command(raw)
@@ -102,6 +114,34 @@ class TestCommandSchemaBoundary(unittest.TestCase):
         result = apply_system_command(state, {"debug": True})
         self.assertFalse(result.applied)
         self.assertEqual(state, {})
+
+    def test_unknown_map_field_is_rejected_before_state_mutation(self):
+        state = {"sentinel": "keep"}
+        result = apply_system_command(
+            state,
+            {"map": {"lat": 30.2, "lon": 121.5, "zoom": 8, "unrecognized": True}},
+        )
+        self.assertFalse(result.applied)
+        self.assertTrue(result.errors)
+        self.assertEqual(state, {"sentinel": "keep"})
+
+    def test_invalid_bounds_warns_and_preserves_center_navigation(self):
+        state = {}
+        result = apply_system_command(
+            state,
+            {
+                "map": {
+                    "lat": 30.2,
+                    "lon": 121.5,
+                    "zoom": 8,
+                    "bounds": [[31.0, 122.0], [30.0, 121.0]],
+                }
+            },
+        )
+        self.assertTrue(result.map_updated)
+        self.assertTrue(result.errors)
+        self.assertEqual(state["map_center"], [30.2, 121.5])
+        self.assertNotIn("bounds", state["_pending_camera_fly"])
 
     def test_unknown_action_type_is_rejected_before_queue(self):
         state = {}

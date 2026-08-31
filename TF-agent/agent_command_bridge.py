@@ -20,6 +20,11 @@ _JSON_BLOCK_RE = re.compile(
     r"\[SYSTEM_COMMAND_JSON\]\s*(\{.*?\})\s*\[/SYSTEM_COMMAND_JSON\]",
     re.DOTALL | re.IGNORECASE,
 )
+_SYSTEM_COMMAND_MARKER_RE = re.compile(r"\[SYSTEM_COMMAND_JSON\]", re.IGNORECASE)
+_SYSTEM_COMMAND_BLOCK_OR_TAIL_RE = re.compile(
+    r"\[SYSTEM_COMMAND_JSON\].*?(?:\[/SYSTEM_COMMAND_JSON\]|$)",
+    re.DOTALL | re.IGNORECASE,
+)
 _RE_CMD_MAP_PIPE = re.compile(
     r"COMMAND_UPDATE_MAP\s*\|\s*([-\d.]+)\s*\|\s*([-\d.]+)\s*\|\s*(\d+)",
     re.IGNORECASE,
@@ -224,10 +229,16 @@ def parse_system_command(text: str) -> Optional[Dict[str, Any]]:
     m = _JSON_BLOCK_RE.search(text)
     if m:
         try:
-            return _normalize_command_aliases(json.loads(m.group(1)))
+            raw_command = json.loads(m.group(1))
         except json.JSONDecodeError:
             return None
-    if "[SYSTEM_COMMAND_JSON]" in text.upper():
+        try:
+            return _normalize_command_aliases(raw_command)
+        except ValueError:
+            # Preserve the raw command so the shared schema boundary can
+            # return a safe validation error instead of crashing this parser.
+            return raw_command
+    if _SYSTEM_COMMAND_MARKER_RE.search(text):
         # A malformed JSON block must not silently become a legacy or natural
         # language command.  The UI may still parse a separate plain-text
         # coordinate command after removing this block.
@@ -265,11 +276,38 @@ def _normalize_command_aliases(command: Any) -> Any:
     normalized = dict(command)
     map_cmd = normalized.get("map")
     if isinstance(map_cmd, dict):
-        try:
-            normalized["map"] = normalize_map_payload(map_cmd).to_command_dict()
-        except ValueError:
-            pass
+        map_normalized = normalize_map_payload(map_cmd)
+        if any(warning.startswith("unknown map field:") for warning in map_normalized.warnings):
+            raise ValueError("系统命令校验失败（map 含未知字段）。")
+        normalized["map"] = map_normalized.to_command_dict()
     return normalized
+
+
+def _map_adapter_warnings(command: Any) -> List[str]:
+    """Return recoverable adapter diagnostics before canonicalization drops them."""
+    if not isinstance(command, dict) or not isinstance(command.get("map"), dict):
+        return []
+    try:
+        normalized = normalize_map_payload(command["map"])
+    except ValueError:
+        return []
+    return [
+        sanitize_external_text(warning)
+        for warning in normalized.warnings
+        if warning.startswith("invalid bounds:")
+    ]
+
+
+def _reply_map_adapter_warnings(reply: str) -> List[str]:
+    """Read valid JSON once more to retain adapter diagnostics for the UI."""
+    match = _JSON_BLOCK_RE.search(reply or "")
+    if not match:
+        return []
+    try:
+        command = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return []
+    return _map_adapter_warnings(command)
 
 
 def _validate_command(command: Any) -> Dict[str, Any]:
@@ -335,7 +373,7 @@ def _parse_natural_map_command(text: str) -> Optional[Tuple[float, float, int]]:
 
 
 def _strip_json_block(text: str) -> str:
-    t = _JSON_BLOCK_RE.sub("", text)
+    t = _SYSTEM_COMMAND_BLOCK_OR_TAIL_RE.sub("", text)
     t = _RE_CMD_MAP_PIPE.sub("", t)
     t = _RE_CMD_PIPELINE.sub("", t)
     return re.sub(r"\s+", " ", t).strip()
@@ -1423,11 +1461,12 @@ def build_pending_task(state: Dict[str, Any], action: Dict[str, Any]) -> Tuple[O
 
 def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> ApplyResult:
     """差量合流：仅更新 JSON 中非 null 字段；可选触发 pending 动作。"""
+    map_warnings = _map_adapter_warnings(command)
     try:
         command = _validate_command(command)
     except ValueError as exc:
         return ApplyResult(applied=False, errors=[sanitize_external_text(exc)])
-    result = ApplyResult(applied=True)
+    result = ApplyResult(applied=True, errors=map_warnings)
     init_ui_session_defaults(state)
 
     mp = command.get("map")
@@ -1751,6 +1790,11 @@ def process_agent_reply(state: Dict[str, Any], reply: str) -> Tuple[ApplyResult,
     cmd = parse_system_command(reply)
     clean = _strip_json_block(reply)
     if not cmd:
+        if _SYSTEM_COMMAND_MARKER_RE.search(reply or ""):
+            return ApplyResult(
+                applied=False,
+                errors=["系统指令格式无效，请检查 JSON 后重试。"],
+            ), clean
         return ApplyResult(applied=False), reply
     try:
         cmd = _validate_command(cmd)
@@ -1758,6 +1802,7 @@ def process_agent_reply(state: Dict[str, Any], reply: str) -> Tuple[ApplyResult,
         return ApplyResult(applied=False, errors=[sanitize_external_text(exc)]), clean
     queue_agent_command(state, cmd)
     result = _preview_apply_result(cmd)
+    result.errors.extend(_reply_map_adapter_warnings(reply))
     result.clean_reply_hint = clean
     return result, clean or reply
 
@@ -1767,6 +1812,11 @@ def apply_agent_reply_immediate(state: Dict[str, Any], reply: str) -> Tuple[Appl
     cmd = parse_system_command(reply)
     clean = _strip_json_block(reply)
     if not cmd:
+        if _SYSTEM_COMMAND_MARKER_RE.search(reply or ""):
+            return ApplyResult(
+                applied=False,
+                errors=["系统指令格式无效，请检查 JSON 后重试。"],
+            ), clean
         return ApplyResult(applied=False), reply
     result = apply_system_command(state, cmd)
     result.clean_reply_hint = clean
