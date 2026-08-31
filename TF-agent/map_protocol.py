@@ -108,6 +108,36 @@ def validate_coords(lat: Any, lon: Any) -> Tuple[bool, List[str]]:
     return (not errors), errors
 
 
+def bounds_to_center(bounds: Any) -> Tuple[Tuple[float, float], float]:
+    """规范化经纬度矩形，并返回其 (lat, lon) 中心和合适的相机高度。
+
+    矩形必须是未跨越反子午线的 ``west < east`` / ``south < north`` 盒子；
+    无效矩形由调用方降级为其已有的点位相机。
+    """
+    if not isinstance(bounds, dict):
+        raise ValueError("bounds 必须为对象")
+
+    try:
+        west = float(bounds["west"])
+        south = float(bounds["south"])
+        east = float(bounds["east"])
+        north = float(bounds["north"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("bounds 必须包含数值 west/south/east/north") from exc
+
+    valid_sw, sw_errors = validate_coords(south, west)
+    valid_ne, ne_errors = validate_coords(north, east)
+    if not valid_sw or not valid_ne:
+        raise ValueError("; ".join(sw_errors + ne_errors))
+    if west >= east or south >= north:
+        raise ValueError("bounds 必须满足 west < east 且 south < north")
+
+    center = ((south + north) / 2.0, (west + east) / 2.0)
+    span = max(east - west, north - south, 0.02)
+    height = max(60_000.0, min(span * 111_000.0 * 2.8, 6_000_000.0))
+    return center, height
+
+
 def make_message(
     msg_type: str,
     command_id: Optional[str] = None,
@@ -136,6 +166,7 @@ def make_fly_message(
     *,
     zoom: Optional[int] = None,
     height: Optional[float] = None,
+    bounds: Optional[Dict[str, Any]] = None,
     pitch: Optional[float] = None,
     heading: Optional[float] = None,
     duration: Optional[float] = None,
@@ -151,8 +182,23 @@ def make_fly_message(
 
     f_lat, f_lon = float(lat), float(lon)
 
+    normalized_bounds: Optional[Dict[str, float]] = None
+    bounds_height: Optional[float] = None
+    if bounds is not None:
+        try:
+            _, bounds_height = bounds_to_center(bounds)
+            normalized_bounds = {
+                key: float(bounds[key])
+                for key in ("west", "south", "east", "north")
+            }
+        except (KeyError, TypeError, ValueError):
+            # 边界是可选增强；无效时继续使用已校验的点位相机。
+            pass
+
     if height is None:
-        if zoom is not None:
+        if normalized_bounds is not None:
+            height = bounds_height
+        elif zoom is not None:
             height = zoom_to_height_m(int(zoom), f_lat)
         elif preset in PRESET_RANGES:
             height = PRESET_RANGES[preset]
@@ -169,6 +215,8 @@ def make_fly_message(
         lat=f_lat,
         height=float(height),
     )
+    if normalized_bounds is not None:
+        msg["bounds"] = normalized_bounds
     if pitch is not None:
         msg["pitch"] = float(pitch)
     if heading is not None:

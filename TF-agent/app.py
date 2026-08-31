@@ -4815,7 +4815,8 @@ with col_map:
                         _fly_lon = float(_fly["lon"])
                         _fly_zoom = int(_fly.get("zoom", 9))
                         _fly_height = _fly.get("height")
-                        if _fly_height is None:
+                        _fly_bounds = _fly.get("bounds") if isinstance(_fly.get("bounds"), dict) else None
+                        if _fly_height is None and _fly_bounds is None:
                             _fly_height = float(_globe.zoom_to_height_m(_fly_zoom, _fly_lat))
                         _fly_label = _fly.get("label") or f"({_fly_lat:.2f}°N, {_fly_lon:.2f}°E)"
                         _fly_payload, _fly_errs = _map_proto.make_fly_message(
@@ -4823,8 +4824,9 @@ with col_map:
                             _fly_lat,
                             zoom=_fly_zoom,
                             height=_fly_height,
-                            pitch=float(_globe.DEFAULT_CAMERA["pitch_deg"]),
-                            heading=float(_globe.DEFAULT_CAMERA["heading_deg"]),
+                            bounds=_fly_bounds,
+                            pitch=float(_fly.get("pitch", _globe.DEFAULT_CAMERA["pitch_deg"])),
+                            heading=float(_fly.get("heading", _globe.DEFAULT_CAMERA["heading_deg"])),
                             duration=float(_fly.get("duration", 1.0)),
                             preset=_fly.get("preset"),
                             label=_fly_label,

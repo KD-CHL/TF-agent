@@ -865,16 +865,27 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
 
   function navigateToRectangle(box, opts) {{
     if (!box) return false;
-    const rect = rectFromCfg(box);
+    const west = Number(box.west), south = Number(box.south);
+    const east = Number(box.east), north = Number(box.north);
+    if (!isFinite(west) || !isFinite(south) || !isFinite(east) || !isFinite(north) ||
+        west < -180 || east > 180 || south < -90 || north > 90 ||
+        west >= east || south >= north) {{
+      console.warn("[MapCamera] invalid rectangle", box);
+      return false;
+    }}
+    const rect = rectFromCfg({{ west, south, east, north }});
     const center = Cesium.Rectangle.center(rect);
     const lon = Cesium.Math.toDegrees(center.longitude);
     const lat = Cesium.Math.toDegrees(center.latitude);
-    const range = heightForRectangle(box);
+    let range = Number(opts && opts.height);
+    if (!isFinite(range) || range <= 0) range = heightForRectangle({{ west, south, east, north }});
     return navigateToLocation({{
       longitude: lon,
       latitude: lat,
       height: range,
       duration: (opts && opts.duration != null) ? opts.duration : (CFG.duration || 1.0),
+      pitch: (opts && opts.pitch != null) ? opts.pitch : defaultPitchDeg(),
+      heading: (opts && opts.heading != null) ? opts.heading : defaultHeadingDeg(),
       source: (opts && opts.source) || "rectangle",
       force: !!(opts && opts.force),
     }});
@@ -1152,7 +1163,7 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
     const type = data.type;
 
     if (type === "CSTF_FLY") {{
-      const ok = navigateToLocation({{
+      const navigationOptions = {{
         longitude: data.lon,
         latitude: data.lat,
         height: data.height,
@@ -1161,9 +1172,15 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
         duration: data.duration != null ? data.duration : 1.0,
         source: data.source || "postMessage",
         force: true,
-      }});
-      const label = data.label || (
-        Number(data.lat).toFixed(2) + "°N, " + Number(data.lon).toFixed(2) + "°E"
+      }};
+      let ok = data.bounds
+        ? navigateToRectangle(data.bounds, navigationOptions)
+        : navigateToLocation(navigationOptions);
+      // 不受信任的 postMessage 可能带有非法矩形；保留其点位定位退路。
+      if (!ok && data.bounds) ok = navigateToLocation(navigationOptions);
+      const label = data.label || (data.bounds
+        ? "区域范围"
+        : Number(data.lat).toFixed(2) + "°N, " + Number(data.lon).toFixed(2) + "°E"
       );
       if (ok) setStatus("底图就绪 · 已定位 " + label);
       sendFlyAck(data.command_id, ok, {{ label: label, source: data.source || "postMessage" }});
