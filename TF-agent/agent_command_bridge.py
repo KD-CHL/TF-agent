@@ -6,6 +6,7 @@ Agent ↔ Streamlit 双轨网桥：JSON 指令解析、差量合流、pending �
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import re
@@ -129,9 +130,97 @@ class ApplyResult:
     gee_plan_text: str = ""
     workflow_plan: Optional[Dict[str, Any]] = None
     workflow_plan_text: str = ""
+    # Ephemeral, user-safe map diagnostics.  ``persisted`` is deliberately a
+    # separate projection so callers cannot accidentally write rounded
+    # coordinates or command payloads into a durable log.
+    diagnostics: Optional[Dict[str, Any]] = None
 
 
 PENDING_AGENT_COMMANDS_KEY = "_pending_agent_commands"
+
+
+def _map_center_for_diagnostics(payload: Any) -> Tuple[Optional[float], Optional[float]]:
+    """Extract a map center without returning the source payload."""
+    if not isinstance(payload, dict):
+        return None, None
+    lat, lon = payload.get("lat"), payload.get("lon")
+    if lat is None or lon is None:
+        center = payload.get("center")
+        if isinstance(center, (list, tuple)) and len(center) >= 2:
+            lat, lon = center[0], center[1]
+        elif isinstance(center, dict):
+            lat = center.get("lat", center.get("latitude"))
+            lon = center.get("lon", center.get("longitude"))
+    try:
+        return float(lat), float(lon)
+    except (TypeError, ValueError):
+        return None, None
+
+
+def build_map_diagnostics(
+    command: Any,
+    *,
+    source: str = "unknown",
+    warnings: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Build a bounded diagnostic projection for map-command compatibility.
+
+    The display projection may contain a *rounded* center for an ephemeral
+    expander.  The durable projection contains only coordinate presence,
+    range validity, and a one-way hash; it never contains lat/lon, raw JSON,
+    labels, paths, credentials, or model output.
+    """
+    payload = command.get("map") if isinstance(command, dict) else None
+    lat, lon = _map_center_for_diagnostics(payload)
+    present = lat is not None and lon is not None
+    in_range = bool(
+        present
+        and math.isfinite(lat)
+        and math.isfinite(lon)
+        and -90.0 <= lat <= 90.0
+        and -180.0 <= lon <= 180.0
+    )
+    coord_hash = None
+    if present:
+        canonical = f"{lat:.15g},{lon:.15g}"
+        coord_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+    bounds_present = isinstance(payload, dict) and "bounds" in payload
+    bounds_valid: Optional[bool] = None
+    if bounds_present:
+        try:
+            bounds_valid = normalize_map_payload(payload).bounds is not None
+        except (TypeError, ValueError):
+            bounds_valid = False
+
+    clean_warnings = [
+        sanitize_external_text(item)[:200]
+        for item in (warnings or [])
+        if str(item or "").strip()
+    ]
+    display_center = None
+    if in_range:
+        display_center = f"{lat:.2f}°, {lon:.2f}°"
+    display = {
+        "command_source": sanitize_external_text(source)[:40] or "unknown",
+        "center": display_center or "不可用",
+        "zoom": payload.get("zoom", 8) if isinstance(payload, dict) else "不可用",
+        "bounds_valid": bounds_valid if bounds_present else "未提供",
+        "confirmation": (
+            bool(command.get("pending_action", {}).get("confirmed"))
+            if isinstance(command, dict) and isinstance(command.get("pending_action"), dict)
+            else "未提供"
+        ),
+        "warnings": clean_warnings,
+    }
+    persisted = {
+        "coordinate_presence": present,
+        "coordinate_range_valid": in_range,
+        "coordinate_hash": coord_hash,
+        "bounds_present": bounds_present,
+        "bounds_valid": bounds_valid,
+    }
+    return {"display": display, "persisted": persisted}
 
 
 def _default_ui_path(path: str) -> str:
@@ -1472,8 +1561,16 @@ def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> Appl
     try:
         command = _validate_command(command)
     except ValueError as exc:
-        return ApplyResult(applied=False, errors=[sanitize_external_text(exc)])
-    result = ApplyResult(applied=True, errors=map_warnings)
+        return ApplyResult(
+            applied=False,
+            errors=[sanitize_external_text(exc)],
+            diagnostics=build_map_diagnostics(command, source="invalid_system_command", warnings=map_warnings),
+        )
+    result = ApplyResult(
+        applied=True,
+        errors=map_warnings,
+        diagnostics=build_map_diagnostics(command, source="system_command", warnings=map_warnings),
+    )
     init_ui_session_defaults(state)
 
     mp = command.get("map")
@@ -1782,6 +1879,7 @@ def flush_pending_agent_commands(state: Dict[str, Any]) -> ApplyResult:
 def _preview_apply_result(command: Dict[str, Any]) -> ApplyResult:
     """不入队、不写 state，仅用于聊天区展示 action_type。"""
     result = ApplyResult(applied=True, queued=True)
+    result.diagnostics = build_map_diagnostics(command, source="agent_reply")
     action = command.get("pending_action")
     if isinstance(action, dict) and action.get("type"):
         result.action_type = str(action.get("type"))
@@ -1800,7 +1898,8 @@ def process_agent_reply(state: Dict[str, Any], reply: str) -> Tuple[ApplyResult,
         if _SYSTEM_COMMAND_MARKER_RE.search(reply or ""):
             return ApplyResult(
                 applied=False,
-                errors=["系统指令格式无效，请检查 JSON 后重试。"],
+                errors=["地图指令格式不兼容：系统命令未能解析，请重试。"],
+                diagnostics=build_map_diagnostics(None, source="malformed_system_command"),
             ), clean
         return ApplyResult(applied=False), reply
     try:
@@ -1810,6 +1909,9 @@ def process_agent_reply(state: Dict[str, Any], reply: str) -> Tuple[ApplyResult,
     queue_agent_command(state, cmd)
     result = _preview_apply_result(cmd)
     result.errors.extend(_reply_map_adapter_warnings(reply))
+    result.diagnostics = build_map_diagnostics(
+        cmd, source="agent_reply", warnings=result.errors
+    )
     result.clean_reply_hint = clean
     return result, clean or reply
 
@@ -1822,7 +1924,8 @@ def apply_agent_reply_immediate(state: Dict[str, Any], reply: str) -> Tuple[Appl
         if _SYSTEM_COMMAND_MARKER_RE.search(reply or ""):
             return ApplyResult(
                 applied=False,
-                errors=["系统指令格式无效，请检查 JSON 后重试。"],
+                errors=["地图指令格式不兼容：系统命令未能解析，请重试。"],
+                diagnostics=build_map_diagnostics(None, source="malformed_system_command"),
             ), clean
         return ApplyResult(applied=False), reply
     result = apply_system_command(state, cmd)

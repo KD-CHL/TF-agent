@@ -42,7 +42,11 @@ import threading
 import traceback
 import uuid
 import numpy as np
-from agent_context_policy import safe_error_summary, sanitize_external_text
+from agent_context_policy import (
+    redact_spatial_metadata,
+    safe_error_summary,
+    sanitize_external_text,
+)
 from preview_cache import cleanup_preview_cache, preview_cache_dir
 
 
@@ -62,9 +66,34 @@ DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent
 
 
 def _append_debug_log(message: str):
+    # The debug file is durable.  Strip command blocks before the common
+    # sanitizer so a provider exception or future caller cannot persist raw
+    # system JSON, coordinates, credentials, or local geometry.
+    safe_message = re.sub(
+        r"\[SYSTEM_COMMAND_JSON\].*?(?:\[/SYSTEM_COMMAND_JSON\]|$)",
+        "[system-command-redacted]",
+        str(message or ""),
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    # Cover JSON-shaped spatial fields that are not labelled as
+    # ``map_center``/``bounds`` prose.  This is a durable-log boundary, so a
+    # false positive is preferable to persisting an exact coordinate.
+    safe_message = re.sub(
+        r"(?i)([\"'](?:lat|latitude|lon|longitude|west|south|east|north)[\"']\s*:\s*)"
+        r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?",
+        r"\1<spatial-redacted>",
+        safe_message,
+    )
+    safe_message = re.sub(
+        r"(?i)([\"'](?:center|map_center|bounds|bbox|coordinates)[\"']\s*:\s*)"
+        r"(?:\[[^\]]*\]|\{[^}]*\})",
+        r"\1<spatial-redacted>",
+        safe_message,
+    )
+    safe_message = redact_spatial_metadata(sanitize_external_text(safe_message))[:2000]
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(f"[{ts}] {message}\n")
+        f.write(f"[{ts}] {safe_message}\n")
 
 
 def _format_agent_exception(exc: Exception) -> str:
@@ -87,6 +116,70 @@ def _record_worker_exception(shared, label: str, error: BaseException) -> None:
         lines.append(f"[CRASH] {label}: {safe}")
         shared["log_lines"] = lines[-30:]
         shared["status"] = ("error", f"{label}：{safe}")
+
+
+def _remember_map_diagnostics(diagnostics):
+    """Keep the rounded map diagnostic in session state and log only its safe projection."""
+    if not isinstance(diagnostics, dict):
+        return
+    display = diagnostics.get("display")
+    persisted = diagnostics.get("persisted")
+    if isinstance(display, dict):
+        st.session_state["_map_diagnostics"] = dict(display)
+    if isinstance(persisted, dict):
+        _append_debug_log(
+            "map_diagnostic "
+            + json.dumps(persisted, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
+
+
+def _map_runtime_diagnostics():
+    """Return ephemeral platform/protocol fields for the collapsed map panel."""
+    diagnostics = dict(st.session_state.get("_map_diagnostics") or {})
+    try:
+        from llm_backend import backend_status
+
+        backend = backend_status()
+        diagnostics["backend"] = sanitize_external_text(backend.get("provider"))[:40] or "unknown"
+        diagnostics["model"] = sanitize_external_text(backend.get("model"))[:80] or "unknown"
+    except Exception:
+        diagnostics["backend"] = sanitize_external_text(
+            os.environ.get("CSTF_LLM_BACKEND") or "dashscope"
+        )[:40]
+        diagnostics["model"] = sanitize_external_text(
+            os.environ.get("CSTF_LLM_MODEL") or os.environ.get("QWEN_CHAT_MODEL") or "qwen-plus"
+        )[:80]
+    diagnostics["globe_port"] = st.session_state.get("_globe_server_port", "—")
+    globe_url = st.session_state.get("_globe_iframe_url") or ""
+    try:
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(str(globe_url))
+        diagnostics["iframe_origin"] = (
+            f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else "不可用"
+        )
+    except Exception:
+        diagnostics["iframe_origin"] = "不可用"
+    try:
+        import globe_server as _diag_globe_server
+
+        protocol = _diag_globe_server.map_protocol_state(
+            channel_id=st.session_state.get("_map_channel_id")
+        )
+        diagnostics["ready_ts"] = protocol.get("ready_ts")
+        diagnostics["ack_command_id"] = (protocol.get("ack") or {}).get("command_id") or "—"
+        diagnostics["ack_navigation_seq"] = (protocol.get("ack") or {}).get("navigation_seq") or "—"
+    except Exception:
+        diagnostics.update({"ready_ts": None, "ack_command_id": "—", "ack_navigation_seq": "—"})
+    diagnostics["channel"] = st.session_state.get("_map_channel_id") or "default"
+    diagnostics["target_origin"] = diagnostics.get("iframe_origin") or "不可用"
+    diagnostics["command_id"] = ((st.session_state.get("_last_globe_payload") or {}).get("command_id") or "—")
+    diagnostics["navigation_seq"] = ((st.session_state.get("_last_globe_payload") or {}).get("navigation_seq") or "—")
+    diagnostics.setdefault("confirmation", st.session_state.get("_map_confirmation") or "未提供")
+    diagnostics["aoi"] = "已启用"
+    diagnostics["auto_fit"] = bool((st.session_state.get("_last_globe_payload") or {}).get("flyRectangle"))
+    diagnostics["fallback_2d"] = bool(st.session_state.get("use_2d_map_fallback", False))
+    return diagnostics
 
 
 def _chat_preview_uint8(rgb: np.ndarray) -> np.ndarray:
@@ -4791,6 +4884,8 @@ with col_map:
                     "url": _globe_open_url,
                     "port": _globe_port,
                     "serve_ok": _serve_ok,
+                    "channel": st.session_state.get("_map_channel_id") or "default",
+                    "target_origin": "",
                 }
 
                 if not _serve_ok and _serve_err:
@@ -4842,6 +4937,25 @@ with col_map:
                                 _fly_payload,
                                 channel_id=_map_channel_id,
                             )
+                            _last_map_payload = dict(st.session_state.get("_last_globe_payload") or {})
+                            _last_map_payload.update(
+                                {
+                                    "command_id": _fly_payload.get("command_id"),
+                                    "navigation_seq": _fly_payload.get("navigation_seq"),
+                                    "channel": _map_channel_id or "default",
+                                }
+                            )
+                            try:
+                                from urllib.parse import urlsplit
+
+                                _origin = urlsplit(str(_globe_open_url or ""))
+                                _last_map_payload["target_origin"] = (
+                                    f"{_origin.scheme}://{_origin.netloc}"
+                                    if _origin.scheme and _origin.netloc else ""
+                                )
+                            except Exception:
+                                pass
+                            st.session_state["_last_globe_payload"] = _last_map_payload
                             # READY 握手：等 Cesium 就绪后发送；超过窗口仍发送，UI 保持非终态等待提示。
                             _map_ready_warning = False
                             _mp_state = _globe_srv.map_protocol_state(
@@ -5048,20 +5162,37 @@ with col_map:
             st.toast("⚡ 已有成果已加载到地图", icon="✅")
 
     if raster_load_error and not st.session_state.asset_just_loaded:
-        st.toast(f"成果图层加载异常: {raster_load_error}", icon="⚠️")
-        with st.expander("🛰️ 地图加载诊断", expanded=False):
-            _lp = st.session_state.get("_last_globe_payload") or {}
-            st.write(f"**错误**：{raster_load_error}")
-            if _lp.get("url"):
-                st.write(f"**地球 URL**：{_lp.get('url')}")
-            st.write(f"**本机地球端口**：{st.session_state.get('_globe_server_port', '—')}")
-            st.write(
-                "**建议**：① 用 http://localhost:8501 打开（不要用局域网 IP，除非已配 ngrok）；"
-                "② 重启 Streamlit；③ 远程演示见 REMOTE_DEMO.md"
-            )
-            if st.button("切换为 2D 地图并重试", key="btn_force_2d_map"):
-                st.session_state.use_2d_map_fallback = True
-                st.rerun()
+        _safe_raster_error = sanitize_external_text(raster_load_error)[:240]
+        st.toast(f"成果图层加载异常: {_safe_raster_error}", icon="⚠️")
+
+    # Diagnostic values are intentionally ephemeral.  The panel is collapsed
+    # by default and shows only rounded camera data plus protocol/platform
+    # identifiers; durable logging uses _remember_map_diagnostics' projection.
+    with st.expander("🛰️ 地图加载诊断", expanded=False):
+        _diag = _map_runtime_diagnostics()
+        if raster_load_error:
+            st.warning(f"错误摘要：{sanitize_external_text(raster_load_error)[:240]}")
+        _diag_rows = (
+            ("指令来源", _diag.get("command_source", "unknown")),
+            ("中心/缩放（四舍五入）", f"{_diag.get('center', '不可用')} · zoom={_diag.get('zoom', '不可用')}"),
+            ("bounds 有效性", _diag.get("bounds_valid", "未提供")),
+            ("模型/后端", f"{_diag.get('model', 'unknown')} / {_diag.get('backend', 'unknown')}"),
+            ("Globe 端口", _diag.get("globe_port", "—")),
+            ("iframe origin", _diag.get("iframe_origin", "不可用")),
+            ("READY 时间", _diag.get("ready_ts") or "未收到"),
+            ("ACK command_id", _diag.get("ack_command_id", "—")),
+            ("ACK navigation_seq", _diag.get("ack_navigation_seq", "—")),
+            ("channel / targetOrigin", f"{_diag.get('channel', 'default')} / {_diag.get('target_origin', '不可用')}"),
+            ("确认 / AOI / 自动适配 / 2D fallback", f"{_diag.get('confirmation', '未提供')} / {_diag.get('aoi', '已启用')} / {bool(_diag.get('auto_fit'))} / {bool(_diag.get('fallback_2d'))}"),
+        )
+        for _label, _value in _diag_rows:
+            st.caption(f"{_label}：{sanitize_external_text(_value)}")
+        for _warning in (_diag.get("warnings") or []):
+            st.caption(f"适配告警：{sanitize_external_text(_warning)}")
+        st.caption("诊断仅临时显示；持久化日志仅保留坐标存在性、范围结果与哈希。")
+        if raster_load_error and st.button("切换为 2D 地图并重试", key="btn_force_2d_map"):
+            st.session_state.use_2d_map_fallback = True
+            st.rerun()
 
     # 任务状态和终端日志位于地图下方，不再占用右侧 Agent Dock。
     st.markdown('<div class="cstf-map-status-zone"></div>', unsafe_allow_html=True)
@@ -5912,6 +6043,7 @@ if _user_submitted:
                             st.session_state.messages.append({"role": "assistant", "content": _msg})
                             st.rerun()
                         cmd_result, clean_reply = process_agent_reply(st.session_state, prompt)
+                        _remember_map_diagnostics(cmd_result.diagnostics)
                         for _ce in cmd_result.errors:
                             st.warning(_ce)
                         _msg = clean_reply or (
@@ -5985,6 +6117,7 @@ if _user_submitted:
                     )
 
                     cmd_result, clean_reply = process_agent_reply(st.session_state, reply)
+                    _remember_map_diagnostics(cmd_result.diagnostics)
                     if cmd_result.applied:
                         for _ce in cmd_result.errors:
                             st.warning(_ce)
@@ -5996,7 +6129,11 @@ if _user_submitted:
                         st.rerun()
 
                     if cmd_result.errors:
-                        _warning = "系统指令未执行，请检查格式后重试。"
+                        _warning = (
+                            "地图指令格式不兼容：系统命令未执行，请检查格式后重试。"
+                            if "[SYSTEM_COMMAND_JSON]" in (reply or "")
+                            else "系统指令未执行，请检查格式后重试。"
+                        )
                         st.warning(_warning)
                         _display = clean_reply.strip()
                         if _display:
@@ -6065,13 +6202,17 @@ if _user_submitted:
                     _has_map_kw = re.search(r"COMMAND_UPDATE_MAP", reply, re.I) is not None
                     _has_pipe_kw = re.search(r"COMMAND_RUN_PIPELINE", reply, re.I) is not None
                     if (_has_map_kw or _has_pipe_kw) and parsed_map is None and parsed_pipe is None:
-                        st.warning(
-                            "模型提到了地图/跑图暗号但无法解析。推荐：让模型调用工具 `change_map_view`；"
-                            "或正文含 `COMMAND_UPDATE_MAP|纬度|经度|缩放`（竖线）。"
-                            "括号格式 `(lat,lon)` 已做兼容，若仍失败请重试。"
+                        # Never render or persist the complete model reply on
+                        # this malformed-command path: it may contain raw
+                        # protocol JSON, tool traces, or provider payloads.
+                        _map_warning = (
+                            "地图指令格式不兼容：未执行地图动作。请重新描述地点，"
+                            "或让模型调用地图定位工具后重试。"
                         )
-                        st.markdown(reply)
-                        st.session_state.messages.append({"role": "assistant", "content": reply})
+                        st.warning(_map_warning)
+                        st.session_state.messages.append(
+                            {"role": "assistant", "content": _map_warning}
+                        )
                     elif not _has_map_kw and not _has_pipe_kw:
                         st.markdown(reply)
                         st.session_state.messages.append({"role": "assistant", "content": reply})

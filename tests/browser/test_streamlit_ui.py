@@ -21,6 +21,51 @@ if str(ROOT / "TF-agent") not in sys.path:
 from task_timeline import TimelineStore  # noqa: E402
 
 
+def test_map_error_does_not_render_raw_system_command():
+    source = open(APP, encoding="utf-8").read()
+    assert "地图指令格式不兼容" in source
+
+
+def test_malformed_map_command_is_redacted_before_user_rendering():
+    from agent_command_bridge import process_agent_reply
+
+    result, clean = process_agent_reply(
+        {},
+        "请定位 [SYSTEM_COMMAND_JSON]{not-json}[/SYSTEM_COMMAND_JSON]",
+    )
+    assert "地图指令格式不兼容" in " ".join(result.errors)
+    assert "SYSTEM_COMMAND_JSON" not in clean
+
+
+def test_map_diagnostics_persist_only_presence_range_and_hash():
+    from agent_command_bridge import build_map_diagnostics
+
+    diagnostics = build_map_diagnostics(
+        {"map": {"lat": 30.1234, "lon": 121.5678, "zoom": 9}},
+        source="system_command",
+    )
+    assert diagnostics["display"]["center"] == "30.12°, 121.57°"
+    persisted = diagnostics["persisted"]
+    assert persisted["coordinate_presence"] is True
+    assert persisted["coordinate_range_valid"] is True
+    assert persisted["coordinate_hash"]
+    assert "lat" not in persisted and "lon" not in persisted
+
+
+def test_map_diagnostics_expander_is_collapsed_by_default():
+    source = APP.read_text(encoding="utf-8")
+    assert 'st.expander("🛰️ 地图加载诊断", expanded=False)' in source
+    for label in ("READY 时间", "ACK command_id", "ACK navigation_seq", "iframe origin"):
+        assert label in source
+
+
+def test_malformed_command_branch_does_not_render_full_reply():
+    source = APP.read_text(encoding="utf-8")
+    start = source.index("_map_warning =")
+    end = source.index("elif not _has_map_kw", start)
+    assert "st.markdown(reply)" not in source[start:end]
+
+
 _PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
