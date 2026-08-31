@@ -14,7 +14,18 @@ _WEB_URL_RE = re.compile(r"(?i)\b(?:https?|ftp)://[^\s<>\"']+")
 _SECRET_RE = re.compile(
     r"(?i)(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*[^\s,;，；]+"
 )
-_BARE_PROVIDER_KEY_RE = re.compile(r"(?i)\bsk-[A-Za-z0-9][A-Za-z0-9_-]{8,}")
+_BARE_PROVIDER_KEY_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:"
+    r"sk-[A-Za-z0-9][A-Za-z0-9_-]{8,}|"
+    r"ghp_[A-Za-z0-9]{8,}|"
+    r"github_pat_[A-Za-z0-9_-]{8,}|"
+    r"rk[-_][A-Za-z0-9_-]{8,}|"
+    r"pk_[A-Za-z0-9_-]{8,}"
+    r")(?![A-Za-z0-9_-])"
+)
+_DATA_URL_RE = re.compile(
+    r"(?is)\bdata:(?:image|audio|video)/[^;\s,]+;base64,[A-Za-z0-9+/=_-]+"
+)
 _URL_CREDENTIAL_RE = re.compile(r"(?i)(https?://)([^/@\s]+):([^/@\s]+)@")
 _SPATIAL_FIELD_RE = re.compile(
     r"(?i)\b(?:aoi[_ ]?bbox|bbox|centroid)\s*[:=]\s*(?:\([^\)\n]*\)|\[[^\]\n]*\])"
@@ -52,10 +63,11 @@ def safe_local_path_label(path: Any) -> str:
 
 
 def sanitize_external_text(text: Any) -> str:
-    """移除绝对路径、密钥/代理凭据和完整本地 geometry 文本。"""
+    """移除绝对路径、密钥、内联媒体和完整本地 geometry 文本。"""
     value = str(text or "")
     value = _SECRET_RE.sub("<redacted>", value)
     value = _BARE_PROVIDER_KEY_RE.sub("<redacted>", value)
+    value = _DATA_URL_RE.sub("<attachment-redacted>", value)
     value = _URL_CREDENTIAL_RE.sub(r"\1<redacted>@", value)
     # Web URLs must remain intact. Running the absolute-path expression over
     # the whole string makes the tail of ``https:/`` look like a Windows drive
@@ -68,6 +80,16 @@ def sanitize_external_text(text: Any) -> str:
         cursor = match.end()
     chunks.append(_ABS_PATH_RE.sub("<local-path>", value[cursor:]))
     return "".join(chunks)
+
+
+def sanitize_persisted_text(text: Any) -> str:
+    """Shared durable-storage boundary for messages and debug records.
+
+    Keep this wrapper explicit at persistence call sites so future model/UI
+    sanitization changes cannot accidentally bypass PAT or inline-media
+    removal before writing SQLite or debug files.
+    """
+    return sanitize_external_text(text)
 
 
 def redact_spatial_metadata(text: Any) -> str:
@@ -122,6 +144,6 @@ def raw_system_command_consent(state: dict) -> bool:
 
 __all__ = [
     "describe_local_path", "safe_local_path_label", "media_consent", "raw_system_command_consent",
-    "raw_system_command_enabled", "safe_error_summary", "sanitize_external_text",
+    "raw_system_command_enabled", "safe_error_summary", "sanitize_external_text", "sanitize_persisted_text",
     "spatial_consent", "redact_spatial_metadata"
 ]

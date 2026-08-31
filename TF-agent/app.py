@@ -46,6 +46,7 @@ from agent_context_policy import (
     redact_spatial_metadata,
     safe_error_summary,
     sanitize_external_text,
+    sanitize_persisted_text,
 )
 from preview_cache import cleanup_preview_cache, preview_cache_dir
 
@@ -90,7 +91,7 @@ def _append_debug_log(message: str):
         r"\1<spatial-redacted>",
         safe_message,
     )
-    safe_message = redact_spatial_metadata(sanitize_external_text(safe_message))[:2000]
+    safe_message = redact_spatial_metadata(sanitize_persisted_text(safe_message))[:2000]
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
         f.write(f"[{ts}] {safe_message}\n")

@@ -20,6 +20,25 @@ import agent_command_bridge as bridge  # noqa: E402
 
 
 class TestAgentContextPolicy(unittest.TestCase):
+    def test_sanitize_redacts_common_pat_prefixes_and_inline_images(self):
+        raw = (
+            "ghp_abcdefghijk1234567890 github_pat_abcdefghijk1234567890 "
+            "rk-abcdefghijk1234567890 rk_abcdefghijk1234567890 "
+            "pk_abcdefghijk1234567890 data:image/png;base64,AAAA"
+        )
+        clean = policy.sanitize_external_text(raw)
+        for secret in (
+            "ghp_abcdefghijk1234567890",
+            "github_pat_abcdefghijk1234567890",
+            "rk-abcdefghijk1234567890",
+            "rk_abcdefghijk1234567890",
+            "pk_abcdefghijk1234567890",
+            "data:image/png;base64,AAAA",
+        ):
+            self.assertNotIn(secret, clean)
+        self.assertGreaterEqual(clean.count("<redacted>"), 5)
+        self.assertIn("<attachment-redacted>", clean)
+
     def test_sanitize_removes_paths_secrets_and_proxy_credentials(self):
         raw = (
             "path=/Users/chl/Codespace/TF-agent/data/result.tif "

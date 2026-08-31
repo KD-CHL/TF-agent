@@ -19,6 +19,26 @@ from conversation_store import ConversationStore, SCHEMA_VERSION, next_thread_id
 
 
 class TestConversationStore(unittest.TestCase):
+    def test_persisted_messages_redact_common_pats_and_inline_image(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = ConversationStore(os.path.join(td, "chat-pats.sqlite3"))
+            raw = (
+                "ghp_abcdefghijk1234567890 github_pat_abcdefghijk1234567890 "
+                "rk-abcdefghijk1234567890 rk_abcdefghijk1234567890 "
+                "pk_abcdefghijk1234567890 data:image/png;base64,AAAA"
+            )
+            store.append_message("thread_common_pats", "user", raw)
+            content = store.load_messages("thread_common_pats")[0]["content"]
+            for secret in (
+                "ghp_abcdefghijk1234567890",
+                "github_pat_abcdefghijk1234567890",
+                "rk-abcdefghijk1234567890",
+                "rk_abcdefghijk1234567890",
+                "pk_abcdefghijk1234567890",
+                "data:image/png;base64,AAAA",
+            ):
+                self.assertNotIn(secret, content)
+
     def test_roundtrip_redacts_command_path_and_attachment_content(self):
         with tempfile.TemporaryDirectory() as td:
             db = os.path.join(td, "conversation.sqlite3")
