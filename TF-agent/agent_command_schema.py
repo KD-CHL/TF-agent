@@ -13,12 +13,30 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
+class MapBounds(BaseModel):
+    """Canonical WGS84 rectangle used by map commands."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    west: float = Field(ge=-180.0, le=180.0)
+    south: float = Field(ge=-90.0, le=90.0)
+    east: float = Field(ge=-180.0, le=180.0)
+    north: float = Field(ge=-90.0, le=90.0)
+
+    @model_validator(mode="after")
+    def validate_rectangle(self) -> "MapBounds":
+        if self.west > self.east or self.south > self.north:
+            raise ValueError("bounds must not be inverted")
+        return self
+
+
 class MapCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     lat: float = Field(ge=-90.0, le=90.0)
     lon: float = Field(ge=-180.0, le=180.0)
     zoom: int = Field(default=8, ge=1, le=18)
+    bounds: Optional[MapBounds] = None
     preset: Optional[str] = None
     label: Optional[str] = None
     height: Optional[float] = Field(default=None, ge=0.0)
@@ -227,6 +245,6 @@ def validate_system_command(command: Any) -> Dict[str, Any]:
 
 
 __all__ = [
-    "CommandValidationError", "M4Parameters", "MapCommand", "PendingAction", "SidebarDelta",
+    "CommandValidationError", "M4Parameters", "MapBounds", "MapCommand", "PendingAction", "SidebarDelta",
     "SystemCommand", "validate_system_command",
 ]
