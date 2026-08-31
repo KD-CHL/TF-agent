@@ -441,7 +441,7 @@ def _resolve_map_location_alias(command: Any) -> Any:
     # Supplied coordinates are an explicit direct-coordinate command.  Keep
     # them byte-for-byte semantically unchanged and only remove the
     # non-canonical compatibility field.
-    if has_lat and has_lon:
+    if (has_lat and has_lon) or "center" in payload:
         return {**command, "map": normalized_payload}
 
     resolution = resolve_location(name, lat=payload.get("lat"), lon=payload.get("lon"))

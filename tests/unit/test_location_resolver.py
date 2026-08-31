@@ -113,3 +113,45 @@ def test_unknown_name_without_coordinates_is_rejected_explicitly():
     assert result.applied is False
     assert any("unresolved" in error for error in result.errors)
     assert "map_center" not in state
+
+
+def test_legacy_list_center_wins_over_local_name_and_keeps_bounds():
+    from agent_command_bridge import parse_system_command
+
+    raw = (
+        '[SYSTEM_COMMAND_JSON]{"map":{"location_name":"杭州湾",'
+        '"center":[30.4,121.8],"zoom":9,'
+        '"bounds":[[30.0,121.0],[31.0,122.0]]}}'
+        "[/SYSTEM_COMMAND_JSON]"
+    )
+    command = parse_system_command(raw)
+    assert command["map"] == {
+        "lat": 30.4,
+        "lon": 121.8,
+        "zoom": 9,
+        "bounds": {"west": 121.0, "south": 30.0, "east": 122.0, "north": 31.0},
+    }
+
+
+def test_legacy_object_center_wins_over_local_name():
+    from agent_command_bridge import parse_system_command
+
+    raw = (
+        '[SYSTEM_COMMAND_JSON]{"map":{"location_name":"杭州湾",'
+        '"center":{"lat":30.4,"lon":121.8},"zoom":9}}'
+        "[/SYSTEM_COMMAND_JSON]"
+    )
+    command = parse_system_command(raw)
+    assert command["map"] == {"lat": 30.4, "lon": 121.8, "zoom": 9}
+
+
+def test_invalid_legacy_center_with_local_name_is_rejected():
+    from agent_command_bridge import apply_system_command
+
+    state = {}
+    result = apply_system_command(
+        state,
+        {"map": {"location_name": "杭州湾", "center": [91, 121.8], "zoom": 9}},
+    )
+    assert result.applied is False
+    assert "map_center" not in state
