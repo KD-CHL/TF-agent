@@ -67,3 +67,19 @@ def test_incomplete_bounds_become_warning_without_losing_center():
     result = normalize_map_payload({"lat": 30.5, "lon": 120.8, "bounds": {"west": 120}})
     assert result.bounds is None
     assert result.warnings
+
+
+def test_fractional_zoom_is_rejected_instead_of_truncated():
+    with pytest.raises(ValueError, match="integer"):
+        normalize_map_payload({"lat": 30.5, "lon": 120.8, "zoom": 8.5})
+
+
+def test_nested_unknown_fields_are_warned_and_never_emitted():
+    result = normalize_map_payload({
+        "center": {"latitude": 30.5, "longitude": 120.8, "extra_center": True},
+        "bounds": {"west": 120, "south": 30, "east": 121, "north": 31, "extra_bounds": True},
+    })
+    assert any("center.extra_center" in warning for warning in result.warnings)
+    assert any("bounds.extra_bounds" in warning for warning in result.warnings)
+    assert "extra_center" not in result.to_command_dict()
+    assert "extra_bounds" not in result.to_command_dict().get("bounds", {})

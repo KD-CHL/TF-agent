@@ -87,11 +87,30 @@ def normalize_map_payload(payload: dict[str, Any]) -> NormalizedMapCommand:
         raise ValueError("map payload must be an object")
     lat, lon = _center(payload)
     warnings = [f"unknown map field: {key}" for key in payload if key not in _KNOWN_KEYS]
+    center = payload.get("center")
+    if isinstance(center, Mapping):
+        center_keys = {"lat", "latitude", "lon", "longitude"}
+        warnings.extend(
+            f"unknown map field: center.{key}"
+            for key in center
+            if key not in center_keys
+        )
+    raw_bounds = payload.get("bounds")
+    if isinstance(raw_bounds, Mapping):
+        bounds_keys = {"west", "south", "east", "north"}
+        warnings.extend(
+            f"unknown map field: bounds.{key}"
+            for key in raw_bounds
+            if key not in bounds_keys
+        )
     zoom_value = payload.get("zoom", 8)
     try:
-        zoom = int(zoom_value)
+        zoom_number = float(zoom_value)
     except (TypeError, ValueError):
         raise ValueError("zoom must be an integer") from None
+    if not isfinite(zoom_number) or not zoom_number.is_integer():
+        raise ValueError("zoom must be an integer")
+    zoom = int(zoom_number)
     if not 1 <= zoom <= 18:
         raise ValueError("zoom is out of range")
     parsed_bounds = None

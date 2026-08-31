@@ -36,3 +36,31 @@ Exact output:
 71 passed in 0.33s
 ```
 
+## Reviewer round 1 fixes
+
+- Fractional and non-finite zoom values are now rejected before conversion; integral numeric strings remain accepted without truncation.
+- Unknown keys inside object-form `center` and `bounds` are surfaced as dotted-path warnings and are never copied to the canonical command dictionary.
+- Added regression tests for both findings.
+
+Exact regression command and output:
+
+```bash
+conda run -n tf-agent python -m pytest tests/unit/test_map_command_adapter.py::test_fractional_zoom_is_rejected_instead_of_truncated tests/unit/test_map_command_adapter.py::test_nested_unknown_fields_are_warned_and_never_emitted -q --tb=short -p no:cacheprovider
+```
+
+```text
+..                                                                       [100%]
+2 passed in 0.01s
+```
+
+Exact covering command and output:
+
+```bash
+conda run -n tf-agent python -m pytest tests/unit/test_map_command_adapter.py tests/unit/test_agent_commands.py tests/unit/test_map_command_protocol.py -q --tb=short -p no:cacheprovider
+```
+
+```text
+........................................................................ [ 98%]
+.                                                                        [100%]
+73 passed in 0.34s
+```
