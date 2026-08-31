@@ -21,6 +21,7 @@ _JSON_BLOCK_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 _SYSTEM_COMMAND_MARKER_RE = re.compile(r"\[SYSTEM_COMMAND_JSON\]", re.IGNORECASE)
+_SYSTEM_COMMAND_END_RE = re.compile(r"\[/SYSTEM_COMMAND_JSON\]", re.IGNORECASE)
 _SYSTEM_COMMAND_BLOCK_OR_TAIL_RE = re.compile(
     r"\[SYSTEM_COMMAND_JSON\].*?(?:\[/SYSTEM_COMMAND_JSON\]|$)",
     re.DOTALL | re.IGNORECASE,
@@ -226,6 +227,12 @@ def parse_system_command(text: str) -> Optional[Dict[str, Any]]:
     """从 Agent 回复中提取 JSON 指令；兼容 legacy COMMAND 行与自然语言坐标。"""
     if not text:
         return None
+    marker = _SYSTEM_COMMAND_MARKER_RE.search(text)
+    while marker:
+        closing = _SYSTEM_COMMAND_END_RE.search(text, marker.end())
+        if closing is None:
+            return None
+        marker = _SYSTEM_COMMAND_MARKER_RE.search(text, closing.end())
     m = _JSON_BLOCK_RE.search(text)
     if m:
         try:
@@ -1819,5 +1826,6 @@ def apply_agent_reply_immediate(state: Dict[str, Any], reply: str) -> Tuple[Appl
             ), clean
         return ApplyResult(applied=False), reply
     result = apply_system_command(state, cmd)
+    result.errors.extend(_reply_map_adapter_warnings(reply))
     result.clean_reply_hint = clean
     return result, clean or reply

@@ -14,7 +14,10 @@ from typing import Any, Mapping
 from agent_command_schema import MapBounds
 
 
-_KNOWN_KEYS = {"lat", "lon", "zoom", "bounds", "preset", "label", "center"}
+_KNOWN_KEYS = {
+    "lat", "lon", "zoom", "bounds", "preset", "label", "center",
+    "height", "duration", "pitch", "heading",
+}
 _PIPE_COMMAND = re.compile(
     r"COMMAND_UPDATE_MAP\s*\|\s*([^|]+)\s*\|\s*([^|]+)\s*\|\s*([^|\s]+)",
     re.IGNORECASE,
@@ -29,6 +32,10 @@ class NormalizedMapCommand:
     bounds: dict[str, float] | None = None
     preset: str | None = None
     label: str | None = None
+    height: float | None = None
+    duration: float | None = None
+    pitch: float | None = None
+    heading: float | None = None
     source: str = "payload"
     warnings: list[str] = field(default_factory=list)
 
@@ -41,6 +48,10 @@ class NormalizedMapCommand:
             result["preset"] = self.preset
         if self.label is not None:
             result["label"] = self.label
+        for key in ("height", "duration", "pitch", "heading"):
+            value = getattr(self, key)
+            if value is not None:
+                result[key] = value
         return result
 
 
@@ -50,6 +61,18 @@ def _number(value: Any, name: str, low: float, high: float) -> float:
     except (TypeError, ValueError):
         raise ValueError(f"{name} must be numeric") from None
     if not isfinite(number) or not low <= number <= high:
+        raise ValueError(f"{name} is out of range")
+    return number
+
+
+def _camera_number(value: Any, name: str, minimum: float | None = None) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be numeric") from None
+    if not isfinite(number) or (minimum is not None and number < minimum):
         raise ValueError(f"{name} is out of range")
     return number
 
@@ -119,7 +142,20 @@ def normalize_map_payload(payload: dict[str, Any]) -> NormalizedMapCommand:
             parsed_bounds = _bounds(payload["bounds"])
         except ValueError as exc:
             warnings.append(f"invalid bounds: {exc}")
-    return NormalizedMapCommand(lat, lon, zoom, parsed_bounds, payload.get("preset"), payload.get("label"), "payload", warnings)
+    return NormalizedMapCommand(
+        lat=lat,
+        lon=lon,
+        zoom=zoom,
+        bounds=parsed_bounds,
+        preset=payload.get("preset"),
+        label=payload.get("label"),
+        height=_camera_number(payload.get("height"), "height", 0.0),
+        duration=_camera_number(payload.get("duration"), "duration", 0.0),
+        pitch=_camera_number(payload.get("pitch"), "pitch"),
+        heading=_camera_number(payload.get("heading"), "heading"),
+        source="payload",
+        warnings=warnings,
+    )
 
 
 def parse_legacy_map_text(text: str) -> NormalizedMapCommand:

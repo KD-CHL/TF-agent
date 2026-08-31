@@ -28,6 +28,28 @@ def test_canonical_payload_is_unchanged():
     assert (result.lat, result.lon, result.zoom) == (30.5, 120.8, 9)
 
 
+def test_camera_options_are_canonical_map_fields():
+    result = normalize_map_payload(
+        {
+            "lat": 30.5,
+            "lon": 120.8,
+            "height": 1000,
+            "duration": 2.5,
+            "pitch": -45,
+            "heading": 90,
+        }
+    )
+    assert result.to_command_dict() == {
+        "lat": 30.5,
+        "lon": 120.8,
+        "zoom": 8,
+        "height": 1000.0,
+        "duration": 2.5,
+        "pitch": -45.0,
+        "heading": 90.0,
+    }
+
+
 def test_invalid_bounds_does_not_discard_valid_center():
     result = normalize_map_payload({"lat": 30.5, "lon": 120.8, "zoom": 9, "bounds": [[95, 120], [96, 121]]})
     assert (result.lat, result.lon) == (30.5, 120.8)

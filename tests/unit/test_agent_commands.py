@@ -91,6 +91,55 @@ class TestParseSystemCommand(unittest.TestCase):
         self.assertEqual(clean, "请定位。")
         self.assertEqual(state, {})
 
+    def test_trailing_unclosed_system_command_is_rejected_and_stripped(self):
+        state = {}
+        reply = (
+            '[SYSTEM_COMMAND_JSON]{"map":{"lat":30.2,"lon":121.5}}'
+            '[/SYSTEM_COMMAND_JSON] 请定位。 '
+            '[SYSTEM_COMMAND_JSON]{"map":{"lat":31.0'
+        )
+
+        result, clean = process_agent_reply(state, reply)
+
+        self.assertFalse(result.applied)
+        self.assertTrue(result.errors)
+        self.assertNotIn("SYSTEM_COMMAND_JSON", clean)
+        self.assertEqual(clean, "请定位。")
+        self.assertEqual(state, {})
+
+    def test_immediate_invalid_bounds_warns_and_preserves_center_navigation(self):
+        state = {}
+        reply = (
+            '[SYSTEM_COMMAND_JSON]'
+            '{"map":{"lat":30.2,"lon":121.5,"zoom":8,'
+            '"bounds":[[31.0,122.0],[30.0,121.0]]}}'
+            '[/SYSTEM_COMMAND_JSON]'
+        )
+
+        result, _ = apply_agent_reply_immediate(state, reply)
+
+        self.assertTrue(result.map_updated)
+        self.assertTrue(result.errors)
+        self.assertEqual(state["map_center"], [30.2, 121.5])
+        self.assertNotIn("bounds", state["_pending_camera_fly"])
+
+    def test_camera_options_reach_pending_camera_fly(self):
+        state = {}
+        reply = (
+            '[SYSTEM_COMMAND_JSON]'
+            '{"map":{"lat":30.2,"lon":121.5,"zoom":8,'
+            '"height":1000,"duration":2.5,"pitch":-45,"heading":90}}'
+            '[/SYSTEM_COMMAND_JSON]'
+        )
+
+        result, _ = apply_agent_reply_immediate(state, reply)
+
+        self.assertTrue(result.map_updated)
+        self.assertEqual(
+            {key: state["_pending_camera_fly"][key] for key in ("height", "duration", "pitch", "heading")},
+            {"height": 1000.0, "duration": 2.5, "pitch": -45.0, "heading": 90.0},
+        )
+
     def test_legacy_pipeline(self):
         raw = "COMMAND_RUN_PIPELINE|24zhejiang1|0.05|2"
         cmd = parse_system_command(raw)
