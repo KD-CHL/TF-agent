@@ -5943,7 +5943,27 @@ if _user_submitted:
                         st.session_state.messages.append({"role": "assistant", "content": display})
                         st.rerun()
 
-                    parsed_map = _parse_agent_map_command(reply)
+                    if cmd_result.errors:
+                        _warning = "系统指令未执行，请检查格式后重试。"
+                        st.warning(_warning)
+                        _display = clean_reply.strip()
+                        if _display:
+                            st.markdown(_display)
+                        st.session_state.messages.append(
+                            {"role": "assistant", "content": _display or _warning}
+                        )
+                        st.rerun()
+
+                    # A malformed JSON command is never treated as a natural
+                    # language map command.  Only coordinates outside that
+                    # block remain eligible for the legacy UI fallback.
+                    _map_fallback_reply = re.sub(
+                        r"\[SYSTEM_COMMAND_JSON\].*?(?:\[/SYSTEM_COMMAND_JSON\]|$)",
+                        "",
+                        reply,
+                        flags=re.DOTALL | re.IGNORECASE,
+                    )
+                    parsed_map = _parse_agent_map_command(_map_fallback_reply)
                     if parsed_map is not None:
                         target_lat, target_lon, target_zoom, _cmd_span = parsed_map
                         _map_label = _parse_agent_map_label(reply)

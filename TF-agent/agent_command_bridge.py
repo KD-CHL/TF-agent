@@ -14,6 +14,7 @@ from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent_context_policy import redact_spatial_metadata, safe_error_summary, sanitize_external_text
+from map_command_adapter import normalize_map_payload, parse_legacy_map_text
 
 _JSON_BLOCK_RE = re.compile(
     r"\[SYSTEM_COMMAND_JSON\]\s*(\{.*?\})\s*\[/SYSTEM_COMMAND_JSON\]",
@@ -225,11 +226,17 @@ def parse_system_command(text: str) -> Optional[Dict[str, Any]]:
         try:
             return _normalize_command_aliases(json.loads(m.group(1)))
         except json.JSONDecodeError:
-            pass
+            return None
+    if "[SYSTEM_COMMAND_JSON]" in text.upper():
+        # A malformed JSON block must not silently become a legacy or natural
+        # language command.  The UI may still parse a separate plain-text
+        # coordinate command after removing this block.
+        return None
     cmd: Dict[str, Any] = {}
-    mp = _RE_CMD_MAP_PIPE.search(text)
-    if mp:
-        cmd["map"] = {"lat": float(mp.group(1)), "lon": float(mp.group(2)), "zoom": int(mp.group(3))}
+    try:
+        cmd["map"] = parse_legacy_map_text(text).to_command_dict()
+    except ValueError:
+        pass
     pp = _RE_CMD_PIPELINE.search(text)
     if pp:
         cmd.setdefault("sidebar_states", {})
@@ -240,36 +247,28 @@ def parse_system_command(text: str) -> Optional[Dict[str, Any]]:
     if "map" not in cmd:
         nl = _parse_natural_map_command(text)
         if nl:
-            cmd["map"] = {"lat": nl[0], "lon": nl[1], "zoom": nl[2]}
+            cmd["map"] = normalize_map_payload(
+                {"lat": nl[0], "lon": nl[1], "zoom": nl[2]}
+            ).to_command_dict()
     return cmd or None
 
 
 def _normalize_command_aliases(command: Any) -> Any:
-    """Normalize compatible legacy map shapes before strict schema validation.
+    """Normalize map payloads before strict schema validation.
 
-    Some Agent responses use ``{"map": {"center": [lat, lon], "zoom": 9}}``
-    while the internal CSTF protocol uses explicit ``lat``/``lon`` fields.
-    Keep the public command schema strict after this lossless adapter so the
-    rest of the execution path has one canonical representation.
+    The adapter is the compatibility boundary for ``center`` aliases and
+    bounds formats.  Invalid map payloads are deliberately left unchanged so
+    the strict system-command schema can reject them without mutating state.
     """
     if not isinstance(command, dict):
         return command
     normalized = dict(command)
     map_cmd = normalized.get("map")
-    if isinstance(map_cmd, dict) and "lat" not in map_cmd and "lon" not in map_cmd:
-        center = map_cmd.get("center")
-        lat = lon = None
-        if isinstance(center, (list, tuple)) and len(center) >= 2:
-            lat, lon = center[0], center[1]
-        elif isinstance(center, dict):
-            lat = center.get("lat", center.get("latitude"))
-            lon = center.get("lon", center.get("longitude"))
-        if lat is not None and lon is not None:
-            map_cmd = dict(map_cmd)
-            map_cmd.pop("center", None)
-            map_cmd["lat"] = lat
-            map_cmd["lon"] = lon
-            normalized["map"] = map_cmd
+    if isinstance(map_cmd, dict):
+        try:
+            normalized["map"] = normalize_map_payload(map_cmd).to_command_dict()
+        except ValueError:
+            pass
     return normalized
 
 
@@ -1449,6 +1448,9 @@ def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> Appl
                     "zoom": int(zoom),
                     "source": "agent",
                 }
+                bounds = mp.get("bounds")
+                if isinstance(bounds, dict):
+                    fly["bounds"] = dict(bounds)
                 preset = mp.get("preset")
                 if preset:
                     fly["preset"] = str(preset)

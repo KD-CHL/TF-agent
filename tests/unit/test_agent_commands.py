@@ -63,6 +63,22 @@ class TestParseSystemCommand(unittest.TestCase):
         self.assertEqual(state["_pending_camera_fly"]["lat"], 30.4)
         self.assertEqual(state["_pending_camera_fly"]["lon"], 121.8)
 
+    def test_center_bounds_json_reaches_pending_camera_fly(self):
+        state = {}
+        reply = (
+            '[SYSTEM_COMMAND_JSON]'
+            '{"map":{"center":[38.9126,121.6174],"zoom":8,'
+            '"bounds":[[38.0,120.5],[39.8,122.7]]}}'
+            '[/SYSTEM_COMMAND_JSON]'
+        )
+        result, _ = apply_agent_reply_immediate(state, reply)
+        self.assertTrue(result.map_updated)
+        self.assertEqual(state["map_center"], [38.9126, 121.6174])
+        self.assertEqual(
+            state["_pending_camera_fly"]["bounds"],
+            {"west": 120.5, "south": 38.0, "east": 122.7, "north": 39.8},
+        )
+
     def test_legacy_pipeline(self):
         raw = "COMMAND_RUN_PIPELINE|24zhejiang1|0.05|2"
         cmd = parse_system_command(raw)
