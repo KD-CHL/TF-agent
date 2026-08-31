@@ -66,6 +66,16 @@ def new_command_id() -> str:
     return uuid.uuid4().hex
 
 
+def latest_navigation(current_seq: int, candidate_seq: int) -> int:
+    """Return the sequence that must retain navigation ownership.
+
+    Navigation commands are intentionally ordered independently of their UUID
+    command IDs: retries can repeat a command ID, while a later user action
+    must always supersede an earlier camera request.
+    """
+    return max(int(current_seq), int(candidate_seq))
+
+
 def zoom_to_height_m(zoom: int, lat: float = 30.0) -> float:
     """Web 缩放级别 → Cesium lookAt 距离（米），与 globe_engine.zoom_to_height_m 一致。"""
     z = max(1, min(18, int(zoom)))

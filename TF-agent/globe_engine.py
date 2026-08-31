@@ -1016,6 +1016,8 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
   let _parentOrigin = "";
   const _cstfLayers = {{}};
   let _aoiPreviewEntity = null;
+  let _lastFlyNavigationSeq = 0;
+  let _lastFlyCommandId = "";
 
   function clearLocalAoiPreview() {{
     if (!_aoiPreviewEntity) return;
@@ -1066,10 +1068,10 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
     }} catch (e) {{}}
   }}
 
-  function notifyAckToServer(commandId, ok) {{
+  function notifyAckToServer(commandId, ok, navigationSeq) {{
     try {{
       fetch(
-        "./api/map/ack?channel_id=" + encodeURIComponent(CFG.channelId || "default") + "&command_id=" + encodeURIComponent(commandId || "") + "&ok=" + (ok ? "1" : "0"),
+        "./api/map/ack?channel_id=" + encodeURIComponent(CFG.channelId || "default") + "&command_id=" + encodeURIComponent(commandId || "") + "&navigation_seq=" + encodeURIComponent(navigationSeq != null ? navigationSeq : "") + "&ok=" + (ok ? "1" : "0"),
         {{ method: "GET", cache: "no-store" }}
       ).catch(function() {{}});
     }} catch (e) {{}}
@@ -1097,7 +1099,7 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
     }};
     if (extra) Object.assign(msg, extra);
     postToParent(msg);
-    notifyAckToServer(commandId, ok);
+    notifyAckToServer(commandId, ok, msg.navigation_seq);
   }}
 
   function sendLayerAck(commandId, layerId, ok, error) {{
@@ -1163,6 +1165,26 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
     const type = data.type;
 
     if (type === "CSTF_FLY") {{
+      const navigationSeq = Number(data.navigation_seq);
+      const hasNavigationSeq = Number.isFinite(navigationSeq) && navigationSeq > 0;
+      if (hasNavigationSeq && navigationSeq < _lastFlyNavigationSeq) {{
+        // A delayed retry must not drag the camera back to an older target.
+        sendFlyAck(data.command_id, false, {{
+          navigation_seq: navigationSeq,
+          error: "stale_navigation",
+        }});
+        return;
+      }}
+      if (hasNavigationSeq && navigationSeq === _lastFlyNavigationSeq &&
+          data.command_id === _lastFlyCommandId) {{
+        // Delivery retries get a correlated ACK without restarting the flight.
+        sendFlyAck(data.command_id, true, {{ navigation_seq: navigationSeq, retry: true }});
+        return;
+      }}
+      if (hasNavigationSeq) {{
+        _lastFlyNavigationSeq = navigationSeq;
+        _lastFlyCommandId = data.command_id || "";
+      }}
       const navigationOptions = {{
         longitude: data.lon,
         latitude: data.lat,
@@ -1183,7 +1205,11 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
         : Number(data.lat).toFixed(2) + "°N, " + Number(data.lon).toFixed(2) + "°E"
       );
       if (ok) setStatus("底图就绪 · 已定位 " + label);
-      sendFlyAck(data.command_id, ok, {{ label: label, source: data.source || "postMessage" }});
+      sendFlyAck(data.command_id, ok, {{
+        label: label,
+        source: data.source || "postMessage",
+        navigation_seq: hasNavigationSeq ? navigationSeq : undefined,
+      }});
       return;
     }}
 

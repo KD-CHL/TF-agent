@@ -50,3 +50,11 @@ def test_fly_message_falls_back_to_point_when_bounds_are_invalid():
     assert "bounds" not in message
     assert message["lat"] == 38.9
     assert message["lon"] == 121.6
+
+
+def test_latest_navigation_sequence_wins():
+    """A delayed command must not supersede a newer navigation command."""
+    from map_protocol import latest_navigation
+
+    assert latest_navigation(3, 2) == 3
+    assert latest_navigation(3, 4) == 4

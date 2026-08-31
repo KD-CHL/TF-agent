@@ -4835,9 +4835,15 @@ with col_map:
                         if _fly_payload is None:
                             st.warning("地图跳转参数无效：" + "; ".join(_fly_errs or []))
                         else:
-                            # READY 握手：等 Cesium 就绪后发；等待窗口超 3s 仍未就绪则带警告发送
-                            _map_ready_warning = False
+                            # 每个地图 channel 只保留最后一条待送达相机命令；旧命令即使
+                            # 还在浏览器延迟重试，也会因较小 sequence 被 Cesium 丢弃。
                             _map_channel_id = st.session_state.get("_map_channel_id")
+                            _fly_payload = _globe_srv.queue_map_fly(
+                                _fly_payload,
+                                channel_id=_map_channel_id,
+                            )
+                            # READY 握手：等 Cesium 就绪后发送；超过窗口仍发送，UI 保持非终态等待提示。
+                            _map_ready_warning = False
                             _mp_state = _globe_srv.map_protocol_state(
                                 channel_id=_map_channel_id
                             )
@@ -4858,6 +4864,9 @@ with col_map:
   const win = window.parent || window;
   const doc = win.document;
   const msg = {_fly_js};
+  // The latest payload is shared by every short-lived Streamlit bridge.
+  // A bridge from an older rerun therefore cannot send its closed-over target.
+  win.__cstfPendingFly = msg;
   // targetOrigin 收紧：从 iframe src 提取精确 origin；取不到时回退当前页面 origin
   let origin = "*";
   try {{
@@ -4870,6 +4879,8 @@ with col_map:
     }});
   }} catch (e) {{}}
   const send = () => {{
+    const latest = win.__cstfPendingFly;
+    if (!latest || latest.command_id !== msg.command_id) return false;
     const iframes = doc.querySelectorAll("iframe");
     let sent = false;
     iframes.forEach((ifr) => {{
@@ -4877,7 +4888,7 @@ with col_map:
       if (!src) return;
       if (src.indexOf("/globe") >= 0 || src.indexOf(":8765") >= 0) {{
         try {{
-          ifr.contentWindow.postMessage(msg, origin);
+          ifr.contentWindow.postMessage(latest, origin);
           sent = true;
         }} catch (e) {{}}
       }}
@@ -4916,6 +4927,7 @@ with col_map:
                                 _fly_payload.get("command_id", ""),
                                 timeout=1.2,
                                 channel_id=_map_channel_id,
+                                navigation_seq=_fly_payload.get("navigation_seq"),
                             )
                             if _ack:
                                 st.session_state["_map_ready_wait_started"] = None
@@ -4924,7 +4936,9 @@ with col_map:
                                 else:
                                     st.warning("地图跳转未完成，请检查地球页面状态。")
                             if _ack is None and _map_ready_warning:
-                                st.caption("⚠️ 地图尚未确认就绪（可能仍在加载），已尝试跳转。")
+                                st.caption("等待地图确认（确认窗口已超时，仍会继续尝试）。")
+                            elif _ack is None:
+                                st.caption("等待地图确认…")
                     except (TypeError, ValueError):
                         pass
             else:

@@ -30,6 +30,8 @@ _PROBE_TTL_SEC = 30.0
 _MAP_STATE: dict = {
     "ready_ts": None,
     "ready_count": 0,
+    "navigation_seq": 0,
+    "pending_fly": None,
     "ack": None,
     "ack_ts": None,
     "aoi_seq": 0,          # 已处理的 AOI 消息最大序号
@@ -48,6 +50,8 @@ def _new_map_state() -> dict:
     return {
         "ready_ts": None,
         "ready_count": 0,
+        "navigation_seq": 0,
+        "pending_fly": None,
         "ack": None,
         "ack_ts": None,
         "aoi_seq": 0,
@@ -78,13 +82,40 @@ def reset_map_protocol_state() -> None:
         _MAP_STATE.update(_new_map_state())
 
 
-def wait_map_ack(command_id: str, timeout: float = 1.5, *, channel_id: Optional[str] = None) -> Optional[dict]:
-    """轮询等待指定 command_id 的 FLY_ACK；超时返回 None。"""
+def queue_map_fly(payload: dict, *, channel_id: Optional[str] = None) -> dict:
+    """Queue the sole deliverable FLY for one map channel.
+
+    A Streamlit rerun can emit a new navigation while the previous iframe
+    retry is still alive.  The per-channel sequence makes that newer command
+    authoritative and leaves no second pending camera target to replay.
+    """
+    if not isinstance(payload, dict) or not payload.get("command_id"):
+        raise ValueError("FLY payload requires command_id")
+    with _lock:
+        state = _map_state(channel_id)
+        seq = int(state.get("navigation_seq") or 0) + 1
+        queued = dict(payload, navigation_seq=seq)
+        state["navigation_seq"] = seq
+        state["pending_fly"] = queued
+        return dict(queued)
+
+
+def wait_map_ack(
+    command_id: str,
+    timeout: float = 1.5,
+    *,
+    channel_id: Optional[str] = None,
+    navigation_seq: Optional[int] = None,
+) -> Optional[dict]:
+    """Wait for the FLY_ACK for this exact command and navigation sequence."""
     deadline = time.time() + float(timeout)
     while time.time() < deadline:
         with _lock:
             ack = _map_state(channel_id).get("ack")
-            if ack and ack.get("command_id") == command_id:
+            if ack and ack.get("command_id") == command_id and (
+                navigation_seq is None
+                or int(ack.get("navigation_seq") or -1) == int(navigation_seq)
+            ):
                 return dict(ack)
         time.sleep(0.1)
     return None
@@ -392,14 +423,27 @@ class _GlobeHandler(BaseHTTPRequestHandler):
                 if "=" in part:
                     k, v = part.split("=", 1)
                     q[k] = urllib.parse.unquote(v)
+            try:
+                navigation_seq = int(q.get("navigation_seq") or 0)
+            except (TypeError, ValueError):
+                navigation_seq = 0
             with _lock:
                 state = _map_state(channel_id)
-                state["ack"] = {
-                    "command_id": q.get("command_id", ""),
-                    "ok": q.get("ok") == "1",
-                    "ts": time.time(),
-                }
-                state["ack_ts"] = time.time()
+                pending = state.get("pending_fly")
+                if (
+                    isinstance(pending, dict)
+                    and pending.get("command_id") == q.get("command_id", "")
+                    and int(pending.get("navigation_seq") or -1) == navigation_seq
+                ):
+                    now = time.time()
+                    state["ack"] = {
+                        "command_id": q.get("command_id", ""),
+                        "navigation_seq": navigation_seq,
+                        "ok": q.get("ok") == "1",
+                        "ts": now,
+                    }
+                    state["ack_ts"] = now
+                    state["pending_fly"] = None
             self._send(200, b"ok", "text/plain; charset=utf-8")
             return
         self._send(404, b"not found", "text/plain; charset=utf-8")
