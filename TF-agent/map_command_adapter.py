@@ -100,8 +100,8 @@ def _bounds(value: Any) -> dict[str, float]:
         values = {"west": _number(value[0][1], "west", -180, 180), "south": _number(value[0][0], "south", -90, 90), "east": _number(value[1][1], "east", -180, 180), "north": _number(value[1][0], "north", -90, 90)}
     else:
         raise ValueError("bounds must be [[south, west], [north, east]] or an object")
-    if values["west"] > values["east"] or values["south"] > values["north"]:
-        raise ValueError("bounds must not be inverted")
+    if values["west"] >= values["east"] or values["south"] >= values["north"]:
+        raise ValueError("bounds must satisfy west < east and south < north")
     return values
 
 

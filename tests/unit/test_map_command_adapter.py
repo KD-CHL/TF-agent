@@ -57,6 +57,22 @@ def test_invalid_bounds_does_not_discard_valid_center():
     assert result.warnings
 
 
+@pytest.mark.parametrize(
+    "bounds",
+    [
+        [[30.0, 120.0], [30.0, 121.0]],
+        [[30.0, 120.0], [31.0, 120.0]],
+    ],
+)
+def test_equal_bounds_are_invalid_without_discarding_center(bounds):
+    result = normalize_map_payload(
+        {"lat": 30.5, "lon": 120.8, "zoom": 9, "bounds": bounds}
+    )
+    assert (result.lat, result.lon) == (30.5, 120.8)
+    assert result.bounds is None
+    assert any("invalid bounds" in warning for warning in result.warnings)
+
+
 def test_pipe_text_uses_lat_lon_zoom_order():
     result = parse_legacy_map_text("COMMAND_UPDATE_MAP|30.5|120.8|9")
     assert (result.lat, result.lon, result.zoom) == (30.5, 120.8, 9)
@@ -72,6 +88,17 @@ def test_unknown_fields_are_warned_and_never_emitted():
 def test_map_schema_rejects_unknown_fields():
     with pytest.raises(ValidationError):
         MapCommand.model_validate({"lat": 30.5, "lon": 120.8, "secret": "x"})
+
+
+def test_map_schema_rejects_degenerate_bounds():
+    with pytest.raises(ValidationError):
+        MapCommand.model_validate(
+            {
+                "lat": 30.5,
+                "lon": 120.8,
+                "bounds": {"west": 120.0, "south": 30.0, "east": 120.0, "north": 31.0},
+            }
+        )
 
 
 def test_bounds_dict_and_center_object_aliases_are_supported():

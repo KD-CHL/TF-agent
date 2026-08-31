@@ -100,6 +100,8 @@ def _exercise_browser_protocol(index: int, map_command: dict[str, Any]) -> None:
     fly_ok, fly_validation_errors = parse_map_message(fly)
     assert fly_ok and not fly_validation_errors, "FLY envelope rejected"
     assert (fly["lat"], fly["lon"]) == (map_command["lat"], map_command["lon"])
+    if map_command.get("bounds") is not None:
+        assert fly.get("bounds") == map_command["bounds"], "FLY bounds changed after normalization"
 
     ack = make_message(MSG_FLY_ACK, command_id=command_id, ok=True)
     ack_ok, ack_errors = parse_map_message(ack)
@@ -133,6 +135,7 @@ def _exercise_case(index: int, raw: str) -> dict[str, Any]:
         rectangle_center, _ = bounds_to_center(bounds)
         assert rectangle_center == (38.9, 121.6)
         normalized_bounds = dict(bounds)
+        assert pending["bounds"] == normalized_bounds
     else:
         assert bounds is None, "unexpected bounds in a matrix case"
 

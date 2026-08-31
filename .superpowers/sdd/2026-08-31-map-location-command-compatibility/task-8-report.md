@@ -83,4 +83,40 @@ AssertionError: '' != '[SYSTEM_COMMAND_JSON]\\n{not valid json\\n[/SYSTEM_COMMAN
 
 ## 版本控制
 
-将以单一 commit 提交本 Task 的矩阵、协议文档、README 和本报告。
+初始 Task 8 已以单一 commit 提交矩阵、协议文档、README 和本报告；本次复审修复将
+以独立的新 commit 提交。
+
+## 复审 Minor 修复
+
+- `map_command_adapter._bounds` 与 `MapBounds.validate_rectangle` 统一采用严格
+  `west < east`、`south < north`；等值矩形在 adapter 层保留有效中心并产生
+  `invalid bounds` warning，在 Schema/协议层拒绝退化矩形。
+- 新增等值 bounds 回归测试（东西等值、南北等值）及 Schema 退化矩形拒绝测试。
+- 矩阵第三例新增 `_pending_camera_fly["bounds"]` 与归一化 bounds 相等断言，并验证
+  最终 `CSTF_FLY` envelope 的 bounds 未被改变。
+- 文档明确等值 bounds 无效、adapter warning/fallback 以及 Schema/协议拒绝行为。
+
+### 修复验证
+
+先添加 Schema 回归测试并运行：1 项失败（`DID NOT RAISE ValidationError`），确认
+schema 原先允许退化矩形；随后完成严格不等式修复。
+
+```text
+/opt/homebrew/Caskroom/miniconda/base/envs/tf-agent/bin/python -m pytest \
+  tests/unit/test_map_command_adapter.py tests/unit/test_agent_commands.py \
+  tests/unit/test_map_protocol.py tests/unit/test_map_command_protocol.py \
+  -q --tb=short -p no:cacheprovider
+```
+
+结果：`89 passed in 1.46s`。
+
+```text
+/opt/homebrew/Caskroom/miniconda/base/envs/tf-agent/bin/python tests/acceptance/map_location_matrix.py
+/opt/homebrew/Caskroom/miniconda/base/envs/tf-agent/bin/python -m py_compile \
+  TF-agent/map_command_adapter.py TF-agent/agent_command_schema.py \
+  tests/acceptance/map_location_matrix.py
+git diff --check
+```
+
+结果：矩阵 `PASS`（4 cases，等价中心分组 `[[1, 4], [2, 3]]`）；编译和差异检查均
+通过（return code 0）。

@@ -81,7 +81,8 @@
 
 列表形式 `bounds` 的输入顺序固定为 `[[south, west], [north, east]]`；归一化后
 固定为对象顺序 `west, south, east, north`，且必须满足 `west < east`、
-`south < north`。无效 bounds 不得覆盖有效中心，记录 warning 后使用点位相机。
+`south < north`；等值（`west == east` 或 `south == north`）同样无效。适配器会将
+无效 bounds 降级为 warning 并保留有效中心，Schema 和协议层也拒绝退化矩形。
 
 定位消息的最小时序为 **READY → FLY → ACK**：iframe 完成 Viewer/底图/初始相机
 初始化后只发送一次 `CSTF_MAP_READY`；parent 收到 READY 后发送带同一

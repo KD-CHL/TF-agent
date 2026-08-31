@@ -25,8 +25,8 @@ class MapBounds(BaseModel):
 
     @model_validator(mode="after")
     def validate_rectangle(self) -> "MapBounds":
-        if self.west > self.east or self.south > self.north:
-            raise ValueError("bounds must not be inverted")
+        if self.west >= self.east or self.south >= self.north:
+            raise ValueError("bounds must satisfy west < east and south < north")
         return self
 
 
