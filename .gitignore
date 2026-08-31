@@ -75,5 +75,8 @@ scan_tidal_data.py
 tests/acceptance/_out/
 acceptance_matrix.json
 
+# Local linked worktrees
+.worktrees/
+
 # Local research release artifacts (kept out of the project push)
 docs/research/
