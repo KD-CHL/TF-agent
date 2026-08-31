@@ -57,6 +57,56 @@
 - **有界队列**：相机队列只保留最新一条（`_lastNavKey` 语义升级为 command 级）；图层队列按 `layer_id` 去重。
 - **targetOrigin**：A 阶段将发送方改为 `http://127.0.0.1:{port}` 精确源（保留 `"*"` 兼容远程演示开关，默认收紧）。
 
+#### 1.3.1 地图定位字段与跨平台兼容矩阵
+
+地图命令进入 Schema 前必须先归一化为以下 canonical 字段：
+
+| 字段 | 类型/顺序 | 语义 |
+| --- | --- | --- |
+| `lat` | number，纬度 | canonical 中心纬度（-90～90） |
+| `lon` | number，经度 | canonical 中心经度（-180～180） |
+| `zoom` | integer，1～18 | canonical 缩放级别，缺省为 8 |
+| `bounds` | `{west, south, east, north}` | 可选 WGS84 矩形，供相机 fit 使用 |
+
+可选 canonical 相机字段还包括 `preset`、`label`、`height`、`duration`、`pitch` 和
+`heading`；这些字段同样只能按 Schema 定义的类型进入命令。`location_name` 仅作为
+本地预设解析的兼容输入，解析后不会进入 canonical map payload。
+
+兼容输入包括 `center: [lat, lon]`、`center: {lat, lon}`（也接受
+`latitude/longitude` 键）以及 `COMMAND_UPDATE_MAP|lat|lon|zoom` 管道文本。
+它们只在适配边界消费；canonical 命令始终输出 `lat/lon/zoom`，进入 `CSTF_FLY`
+时中心始终为 `lat/lon`（`zoom` 在 Python 侧转换为相机 `height`）。
+`center + bounds` 是旧客户端的兼容输入，不是推荐输出；新生产者不得重新生成
+`center` 别名或将其与 canonical 字段并列输出。
+
+列表形式 `bounds` 的输入顺序固定为 `[[south, west], [north, east]]`；归一化后
+固定为对象顺序 `west, south, east, north`，且必须满足 `west < east`、
+`south < north`。无效 bounds 不得覆盖有效中心，记录 warning 后使用点位相机。
+
+定位消息的最小时序为 **READY → FLY → ACK**：iframe 完成 Viewer/底图/初始相机
+初始化后只发送一次 `CSTF_MAP_READY`；parent 收到 READY 后发送带同一
+`command_id` 的 `CSTF_FLY`；Cesium 完成或拒绝飞行后必须回送
+`CSTF_FLY_ACK {ok, command_id}`。超时只能表示“尚未确认”，不能当作成功；旧
+iframe 仍可由有限重试兼容，但不得绕过 ACK 状态。
+
+验收矩阵 `tests/acceptance/map_location_matrix.py` 固定覆盖四个输入：canonical
+JSON、`center` JSON、`center + bounds` JSON 和 legacy 管道文本。矩阵同时检查
+Python 合流状态与 READY/FLY/ACK 信封，并断言等价输入得到相同 canonical 中心，
+矩形得到有效归一化 bounds。
+
+#### 1.3.2 定位诊断症状映射
+
+| 症状 | 优先检查 | 诊断含义/处理 |
+| --- | --- | --- |
+| 没有 READY | iframe URL、精确 `targetOrigin`、Viewer 初始化 | 地图尚未就绪或来源不匹配；等待 READY，超时仅保留 warning |
+| 有 READY 但没有 ACK | `command_id`、`channel_id`、FLY 重试记录 | parent 已握手但 FLY 未被当前 iframe 接收；检查通道和重试是否匹配 |
+| ACK 返回 `ok=false` | `lat/lon` 范围、Cesium 相机错误、`CSTF_MAP_ERROR` | 命令到达但导航失败；修正坐标/相机参数，不报告“已定位” |
+| canonical 中心已更新但画面不动 | `_pending_camera_fly`、iframe 是否复用、ACK | Python 合流成功而浏览器侧未完成；检查 iframe 复用和 ACK，而非重新解析文本 |
+| `bounds_valid=false` 或出现 invalid-bounds warning | bounds 顺序和范围 | 仅矩形增强无效；保留有效中心点飞行，不把 warning 当作中心失败 |
+
+诊断展示只使用经过裁剪/四舍五入的临时投影（中心、缩放、bounds 有效性、READY/ACK
+状态）；持久化日志不保存原始命令、完整坐标、路径或凭据。
+
 ### 1.4 相机预设（Python 侧常量，Cesium 侧实现）
 
 | preset | 定义 | 高度 |

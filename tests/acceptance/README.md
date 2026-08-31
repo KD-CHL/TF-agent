@@ -6,6 +6,21 @@
 python tests/acceptance/run_acceptance_matrix.py --offline-only
 ```
 
+地图定位跨平台矩阵是独立的离线验收入口，固定只覆盖四个协议输入（canonical
+`lat/lon/zoom` JSON、legacy `center` JSON、`center + bounds` JSON、以及
+`COMMAND_UPDATE_MAP|lat|lon|zoom` 文本）：
+
+```bash
+/opt/homebrew/Caskroom/miniconda/base/envs/tf-agent/bin/python \
+  tests/acceptance/map_location_matrix.py
+```
+
+矩阵不启动 Streamlit、不访问公网或真实密钥。每个输入都会经过命令解析与
+`apply_system_command`，再验证浏览器通信的 `CSTF_MAP_READY → CSTF_FLY →
+CSTF_FLY_ACK` 信封；等价坐标必须得到相同 canonical 中心，带 bounds 的输入还
+必须得到 `west/south/east/north` 有序的归一化矩形。`center + bounds` 仅为兼容
+旧客户端的输入形式，不能作为新命令的输出格式。
+
 离线核心矩阵包含 Streamlit 原生 AppTest、Gateway/本地 API 认证与请求体边界测试，可验证根页面、会话控制以及深度学习/指数法计划确认门闩；AutoTune 的统一执行契约由单元测试覆盖。它不需要 Chromium。Playwright 浏览器测试仍单独受 `RUN_BROWSER_ACCEPTANCE=1` 控制。
 
 需要运行浏览器验收时，先安装可选依赖和 Chromium：
