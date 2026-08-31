@@ -111,7 +111,7 @@ class TestApplyAgentReplyImmediate(unittest.TestCase):
         result, clean = apply_agent_reply_immediate(state, reply)
         self.assertTrue(result.applied)
         self.assertEqual(state["ui_prob_th"], 0.05)
-        self.assertIn("prob_th", clean or "")
+        self.assertEqual(clean, "")
 
     def test_invalid_json_does_not_crash(self):
         state = _base_state()

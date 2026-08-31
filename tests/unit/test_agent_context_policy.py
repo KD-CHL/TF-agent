@@ -20,6 +20,24 @@ import agent_command_bridge as bridge  # noqa: E402
 
 
 class TestAgentContextPolicy(unittest.TestCase):
+    def test_durable_sanitizer_redacts_command_tail_spatial_shapes_and_parameterized_media(self):
+        samples = [
+            '[SYSTEM_COMMAND_JSON]{"map":{"lat":30.5,"lon":120.8}}',
+            '{"latitude":30.5,"longitude":120.8,"center":[30.5,120.8],"bounds":{"west":120.0,"south":30.0,"east":121.0,"north":31.0},"coordinates":[[120.0,30.0],[121.0,31.0]]}',
+            "坐标：30.5000°N, 120.8000°E；中心点 (30.5, 120.8)",
+            "coordinates: (30.5, 120.8)",
+            "data:image/svg+xml;charset=utf-8;base64,PHN2Zz4=\nPHN2Zz4=",
+            "data:audio/ogg;codecs=opus;rate=48000;base64,T2dnUw==\nAAAA",
+            "data:video/mp4;codecs=avc1.42E01E;base64,AAAA\nBBBB",
+            "https://example.org/data/paper.pdf and ordinary 42",
+        ]
+        clean = "\n".join(policy.sanitize_persisted_text(sample) for sample in samples)
+        for exact in ("30.5", "120.8", "120.0", "121.0", "30.0", "31.0", "SYSTEM_COMMAND_JSON", "base64"):
+            self.assertNotIn(exact, clean)
+        self.assertNotIn("PHN2Zz4=", clean)
+        self.assertIn("https://example.org/data/paper.pdf", clean)
+        self.assertIn("ordinary 42", clean)
+
     def test_sanitize_redacts_common_pat_prefixes_and_inline_images(self):
         raw = (
             "ghp_abcdefghijk1234567890 github_pat_abcdefghijk1234567890 "

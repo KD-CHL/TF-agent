@@ -53,6 +53,22 @@ def _base_state() -> dict:
 
 
 class TestParseSystemCommand(unittest.TestCase):
+    def test_pure_system_command_blocks_never_return_raw_reply(self):
+        """Command-only replies are consumed; callers must use their safe placeholder."""
+        replies = [
+            '[SYSTEM_COMMAND_JSON]{"map":{"lat":30.5,"lon":120.8,"zoom":9}}[/SYSTEM_COMMAND_JSON]',
+            '[SYSTEM_COMMAND_JSON]{"map":{"center":[38.9126,121.6174],"zoom":8,"bounds":[[38.0,120.5],[39.8,122.7]]}}[/SYSTEM_COMMAND_JSON]',
+            '[SYSTEM_COMMAND_JSON]{"pending_action":{"type":"run_pipeline","task":"24zhejiang1"}}[/SYSTEM_COMMAND_JSON]',
+        ]
+        for reply in replies:
+            for apply in (process_agent_reply, apply_agent_reply_immediate):
+                state = {}
+                _result, clean = apply(state, reply)
+                self.assertEqual(clean, "")
+                self.assertNotIn("SYSTEM_COMMAND_JSON", clean)
+                self.assertNotIn("30.5", clean)
+                self.assertNotIn("120.8", clean)
+
     def test_json_block(self):
         raw = '好的。\n[SYSTEM_COMMAND_JSON]\n{"map":{"lat":30.2,"lon":121.5,"zoom":11}}\n[/SYSTEM_COMMAND_JSON]'
         cmd = parse_system_command(raw)
@@ -159,6 +175,21 @@ class TestParseSystemCommand(unittest.TestCase):
         cmd = parse_system_command(raw)
         self.assertEqual(cmd["sidebar_states"]["selected_task"], "24zhejiang1")
         self.assertEqual(cmd["pending_action"]["type"], "run_pipeline")
+
+    def test_map_adapter_source_is_internal_side_channel(self):
+        canonical = '[SYSTEM_COMMAND_JSON]{"map":{"lat":30.5,"lon":120.8}}[/SYSTEM_COMMAND_JSON]'
+        canonical_cmd = parse_system_command(canonical)
+        self.assertEqual(canonical_cmd["_map_adapter_source"], "payload")
+
+        legacy_cmd = parse_system_command("COMMAND_UPDATE_MAP|30.5|120.8|9")
+        self.assertEqual(legacy_cmd["_map_adapter_source"], "legacy_text")
+
+        state = {}
+        apply_agent_reply_immediate(state, canonical)
+        self.assertEqual(state["_pending_camera_fly"]["source"], "payload")
+        state = {}
+        apply_agent_reply_immediate(state, "COMMAND_UPDATE_MAP|30.5|120.8|9")
+        self.assertEqual(state["_pending_camera_fly"]["source"], "legacy_text")
 
     def test_irrelevant_text_returns_none(self):
         self.assertIsNone(parse_system_command("今天天气不错"))
@@ -486,8 +517,8 @@ class TestScenarioExamples(unittest.TestCase):
         result, clean = process_agent_reply(state, reply)
         self.assertTrue(result.applied)
         self.assertTrue(result.queued)
+        self.assertEqual(clean, "")
         flush_pending_agent_commands(state)
-        self.assertIn("24zhejiang", clean or "ok")
         self.assertEqual(state["pending_task"]["mode"], "dl")
 
 

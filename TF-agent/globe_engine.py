@@ -1161,10 +1161,13 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
   // Streamlit 侧仅改 center/zoom 时通过 postMessage 飞行，避免 iframe 重建
   window.addEventListener("message", function(ev) {{
     if (!ev.origin) return;
-    _parentOrigin = ev.origin;  // 记录父窗口精确 origin，回发收紧 targetOrigin
     const data = ev.data;
     if (!data || typeof data !== "object") return;
     const type = data.type;
+    if (type !== "CSTF_FLY" && type !== "CSTF_LAYER_ADD" && type !== "CSTF_LAYER_REMOVE") return;
+    if (data.version !== 1) return;
+    if (data.channel_id !== (CFG.channelId || "default")) return;
+    _parentOrigin = ev.origin;  // 记录已通过协议/通道校验的父窗口 origin
 
     if (type === "CSTF_FLY") {{
       const navigationSeq = Number(data.navigation_seq);

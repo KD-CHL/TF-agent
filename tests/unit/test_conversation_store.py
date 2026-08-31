@@ -19,6 +19,26 @@ from conversation_store import ConversationStore, SCHEMA_VERSION, next_thread_id
 
 
 class TestConversationStore(unittest.TestCase):
+    def test_sqlite_roundtrip_uses_shared_durable_sanitizer_for_spatial_and_media_inputs(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = ConversationStore(os.path.join(td, "durable.sqlite3"))
+            samples = [
+                '[SYSTEM_COMMAND_JSON]{"map":{"lat":30.5,"lon":120.8}}',
+                '{"latitude":30.5,"longitude":120.8,"center":[30.5,120.8],"bounds":{"west":120.0,"south":30.0,"east":121.0,"north":31.0},"coordinates":[[120.0,30.0],[121.0,31.0]]}',
+                "坐标：30.5000°N, 120.8000°E；中心点 (30.5, 120.8)",
+                "data:image/svg+xml;charset=utf-8;base64,PHN2Zz4=\nPHN2Zz4=",
+                "data:audio/ogg;codecs=opus;base64,T2dnUw==\nAAAA",
+                "data:video/mp4;codecs=avc1;base64,AAAA\nBBBB",
+                "https://example.org/data/paper.pdf ordinary 42",
+            ]
+            for index, sample in enumerate(samples):
+                store.append_message("durable", "assistant", sample)
+            restored = "\n".join(row["content"] for row in store.load_messages("durable"))
+            for exact in ("SYSTEM_COMMAND_JSON", "30.5", "120.8", "120.0", "121.0", "30.0", "31.0", "base64", "PHN2Zz4="):
+                self.assertNotIn(exact, restored)
+            self.assertIn("https://example.org/data/paper.pdf", restored)
+            self.assertIn("ordinary 42", restored)
+
     def test_persisted_messages_redact_common_pats_and_inline_image(self):
         with tempfile.TemporaryDirectory() as td:
             store = ConversationStore(os.path.join(td, "chat-pats.sqlite3"))

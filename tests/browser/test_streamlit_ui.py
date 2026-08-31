@@ -37,6 +37,24 @@ def test_malformed_map_command_is_redacted_before_user_rendering():
     assert "SYSTEM_COMMAND_JSON" not in clean
 
 
+def test_command_only_reply_uses_safe_ui_message_and_durable_snapshot():
+    from agent_command_bridge import process_agent_reply
+    from conversation_store import ConversationStore
+
+    reply = '[SYSTEM_COMMAND_JSON]{"map":{"center":[38.9126,121.6174],"zoom":8,"bounds":[[38.0,120.5],[39.8,122.7]]}}[/SYSTEM_COMMAND_JSON]'
+    result, clean = process_agent_reply({}, reply)
+    display = clean or "已更新系统设置。"
+    assert result.applied is True
+    assert display == "已更新系统设置。"
+    assert "SYSTEM_COMMAND_JSON" not in display
+    with tempfile.TemporaryDirectory() as td:
+        store = ConversationStore(os.path.join(td, "ui.sqlite3"))
+        store.replace_messages("ui", [{"role": "assistant", "content": display}])
+        persisted = store.load_messages("ui")[0]["content"]
+        assert persisted == display
+        assert "121.6174" not in persisted
+
+
 def test_map_diagnostics_persist_only_presence_range_and_hash():
     from agent_command_bridge import build_map_diagnostics
 

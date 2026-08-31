@@ -28,6 +28,8 @@ _SYSTEM_COMMAND_BLOCK_OR_TAIL_RE = re.compile(
     r"\[SYSTEM_COMMAND_JSON\].*?(?:\[/SYSTEM_COMMAND_JSON\]|$)",
     re.DOTALL | re.IGNORECASE,
 )
+_MAP_ADAPTER_SOURCE_KEY = "_map_adapter_source"
+_TRUSTED_MAP_ADAPTER_SOURCES = {"payload", "legacy_text", "natural_language"}
 _RE_CMD_MAP_PIPE = re.compile(
     r"COMMAND_UPDATE_MAP\s*\|\s*([-\d.]+)\s*\|\s*([-\d.]+)\s*\|\s*(\d+)",
     re.IGNORECASE,
@@ -330,7 +332,12 @@ def parse_system_command(text: str) -> Optional[Dict[str, Any]]:
         except json.JSONDecodeError:
             return None
         try:
-            return _normalize_command_aliases(raw_command)
+            normalized = _normalize_command_aliases(raw_command)
+            if isinstance(normalized, dict) and isinstance(normalized.get("map"), dict):
+                # Internal provenance is carried beside (never inside) the
+                # strict map schema; model-provided ``source`` is ignored.
+                normalized[_MAP_ADAPTER_SOURCE_KEY] = "payload"
+            return normalized
         except ValueError:
             # Preserve the raw command so the shared schema boundary can
             # return a safe validation error instead of crashing this parser.
@@ -342,7 +349,9 @@ def parse_system_command(text: str) -> Optional[Dict[str, Any]]:
         return None
     cmd: Dict[str, Any] = {}
     try:
-        cmd["map"] = parse_legacy_map_text(text).to_command_dict()
+        legacy_map = parse_legacy_map_text(text)
+        cmd["map"] = legacy_map.to_command_dict()
+        cmd[_MAP_ADAPTER_SOURCE_KEY] = legacy_map.source
     except ValueError:
         pass
     pp = _RE_CMD_PIPELINE.search(text)
@@ -358,6 +367,7 @@ def parse_system_command(text: str) -> Optional[Dict[str, Any]]:
             cmd["map"] = normalize_map_payload(
                 {"lat": nl[0], "lon": nl[1], "zoom": nl[2]}
             ).to_command_dict()
+            cmd[_MAP_ADAPTER_SOURCE_KEY] = "natural_language"
     return cmd or None
 
 
@@ -411,11 +421,20 @@ def _validate_command(command: Any) -> Dict[str, Any]:
     """调用统一 Schema；错误只保留用户可理解的安全摘要。"""
     from agent_command_schema import validate_system_command
 
-    validated = validate_system_command(_normalize_command_aliases(command))
+    adapter_source = None
+    command_for_schema = command
+    if isinstance(command, dict):
+        adapter_source = command.get(_MAP_ADAPTER_SOURCE_KEY)
+        if adapter_source is not None:
+            command_for_schema = dict(command)
+            command_for_schema.pop(_MAP_ADAPTER_SOURCE_KEY, None)
+    validated = validate_system_command(_normalize_command_aliases(command_for_schema))
     sidebar = validated.get("sidebar_states") or {}
     unknown_sidebar = set(sidebar) - (set(SIDEBAR_KEY_MAP) | {"workspace_tab"})
     if unknown_sidebar:
         raise ValueError("系统命令校验失败（sidebar_states 含未知字段）。")
+    if adapter_source in _TRUSTED_MAP_ADAPTER_SOURCES:
+        validated[_MAP_ADAPTER_SOURCE_KEY] = adapter_source
     return validated
 
 
@@ -1608,7 +1627,11 @@ def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> Appl
     result = ApplyResult(
         applied=True,
         errors=map_warnings,
-        diagnostics=build_map_diagnostics(command, source="system_command", warnings=map_warnings),
+        diagnostics=build_map_diagnostics(
+            command,
+            source=command.get(_MAP_ADAPTER_SOURCE_KEY) or "system_command",
+            warnings=map_warnings,
+        ),
     )
     init_ui_session_defaults(state)
 
@@ -1628,7 +1651,7 @@ def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> Appl
                     "lat": float(lat),
                     "lon": float(lon),
                     "zoom": int(zoom),
-                    "source": "agent",
+                    "source": command.get(_MAP_ADAPTER_SOURCE_KEY) or "agent",
                 }
                 bounds = mp.get("bounds")
                 if isinstance(bounds, dict):
@@ -1949,10 +1972,12 @@ def process_agent_reply(state: Dict[str, Any], reply: str) -> Tuple[ApplyResult,
     result = _preview_apply_result(cmd)
     result.errors.extend(_reply_map_adapter_warnings(reply))
     result.diagnostics = build_map_diagnostics(
-        cmd, source="agent_reply", warnings=result.errors
+        cmd,
+        source=cmd.get(_MAP_ADAPTER_SOURCE_KEY) or "agent_reply",
+        warnings=result.errors,
     )
     result.clean_reply_hint = clean
-    return result, clean or reply
+    return result, clean
 
 
 def apply_agent_reply_immediate(state: Dict[str, Any], reply: str) -> Tuple[ApplyResult, str]:
@@ -1970,4 +1995,4 @@ def apply_agent_reply_immediate(state: Dict[str, Any], reply: str) -> Tuple[Appl
     result = apply_system_command(state, cmd)
     result.errors.extend(_reply_map_adapter_warnings(reply))
     result.clean_reply_hint = clean
-    return result, clean or reply
+    return result, clean
