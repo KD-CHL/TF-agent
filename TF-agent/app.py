@@ -5,6 +5,7 @@ from streamlit_folium import st_folium
 import sidebar_ui as sbui
 import ui_labels as uil
 import hashlib
+import base64
 import os
 import re
 import glob
@@ -210,47 +211,94 @@ def _dedupe_uploaded_images(uploaded_files):
     return unique
 
 
-def _format_agent_markdown(content: str) -> str:
-    """智能体回复的轻量前端格式化（仅展示层增强，不改原始语义）。
+def _agent_svg_avatar() -> str:
+    """科研 Copilot 风格助手头像：卫星轨道 SVG（data URI）。"""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+        '<circle cx="32" cy="32" r="31" fill="#1e2a1f"/>'
+        '<circle cx="32" cy="32" r="18" fill="none" stroke="#6fce8a" stroke-width="3"/>'
+        '<path d="M32 14 A18 18 0 0 0 32 50 A14 14 0 0 1 32 14" fill="#6fce8a" opacity="0.5"/>'
+        '<circle cx="32" cy="14" r="3" fill="#9be0b0"/>'
+        '</svg>'
+    )
+    return "data:image/svg+xml;base64," + base64.b64encode(svg.encode("utf-8")).decode("ascii")
 
-    目的：让智能体长回复不再挤成一大段，增强分段、列表、重点高亮与
-    「模块化信息」（定位结果 / 当前状态 / 建议操作）的可读性。
-    只做展示增强，不改变存储的原始 content；保护代码块与已有结构。
+
+def _user_svg_avatar() -> str:
+    """科研 Copilot 风格用户头像：人物轮廓 SVG（data URI）。"""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+        '<circle cx="32" cy="32" r="31" fill="#232a3a"/>'
+        '<circle cx="32" cy="26" r="11" fill="#8aa8d8"/>'
+        '<path d="M12 54c3-11 11-17 20-17s17 6 20 17" fill="#8aa8d8"/>'
+        '</svg>'
+    )
+    return "data:image/svg+xml;base64," + base64.b64encode(svg.encode("utf-8")).decode("ascii")
+
+
+def _format_agent_markdown(content: str) -> str:
+    """科研 Copilot 风格智能体回复的轻量展示格式化（不改原始语义）。
+
+    仅增强可读性：
+    - 常见「模块」标题（定位结果/当前状态/需要确认/可执行操作/下一步等）加粗；
+    - 路径/年份/参数/任务 ID/命令等用行内 code 样式；
+    - 列表块与数字块前补空行，保持连续列表紧凑；
+    - 保护代码块，不破坏原始 markdown，不新增内容。
     """
     if not content:
         return content
     text = str(content)
 
-    # 保护代码块：避免对 ```...``` 内部做任何替换
+    # 保护代码块与已存在的行内 code，避免被误替换
     code_blocks = []
     def _hold(m):
         code_blocks.append(m.group(0))
         return f"@@CODEBLOCK{len(code_blocks)-1}@@"
     text = re.sub(r"```.*?```", _hold, text, flags=re.DOTALL)
-    text = re.sub(r"`[^`\n]+`", _hold, text)  # 行内代码也保护
+    text = re.sub(r"`[^`\n]+`", _hold, text)
 
-    # 1) 常见「模块化信息」标题：加醒目加粗（不改文字语义）
+    # 1) 模块标题：行首 "xx："（当前未加粗）→ 加粗
     module_heads = [
-        "定位结果", "当前状态", "建议操作", "下一步建议", "可执行命令",
-        "执行结果", "分析结论", "区域范围", "任务计划", "注意事项",
-        "关键参数", "成果文件", "推荐操作", "说明",
+        "定位结果", "当前状态", "需要确认", "可执行操作", "下一步", "下一步建议",
+        "建议操作", "可执行命令", "执行结果", "分析结论", "区域范围", "任务计划",
+        "注意事项", "关键参数", "成果文件", "推荐操作", "说明", "数据源", "参数",
     ]
     for head in module_heads:
         pat = re.compile(
-            r"(?m)^(\s*)" + re.escape(head) + r"(\s*[:：]\s*)"
+            r"(?m)^(\s*)(?!\*\*)" + re.escape(head) + r"(\s*[:：]\s*)"
         )
-        # 用函数替换，避免 replacement 字符串里的反斜杠/group 引用问题
         text = pat.sub(lambda m: m.group(1) + "**" + head + "**" + m.group(2), text)
 
-    # 2) 列表块前确保空行（仅列表块首项补空行，保持连续列表紧凑）
-    #    匹配：非空行之后紧跟列表项时，在列表项前补一个空行
+    # 2) 敏感值 → 行内 code（路径 / 年份 / 参数 / 任务 ID / 命令）
+    #    仅在未包 code 的文本里替换，且保守避免误判。
+    def _code_repl(m):
+        return "`" + m.group(0) + "`"
+    # 2a) Windows/Unix 路径（含盘符或斜杠）——精确到路径片段，不吞中文标点/后续文字
+    #     匹配如 C:\Data\out 或 /home/x/file；遇中文标点、空格、引号即停
+    text = re.sub(
+        r"(?<![\w`])(?:[A-Za-z]:[\\/][^\s`\"'<>|，。；：、（）【】]+|[^\s`\"'<>|：,，；。]+[\\/][^\s`\"'<>|，。；：、（）【】]+)",
+        _code_repl,
+        text,
+    )
+    # 2b) 年份（独立 4 位数字，如 2020/2022/2025）
+    text = re.sub(r"(?<![\w`])(?<!\d)(1\d{3}|20\d{2})(?![\w`])(?!\d)", _code_repl, text)
+    # 2c) 概率/频次参数：P=0.05 / C=2 / prob 0.05
+    text = re.sub(r"(?<![\w`])([PpCc]\s*=\s*[\d.]+)", _code_repl, text)
+    # 2d) 任务/计划 ID：形如 wf_xxx / plan_xxx / 一长串数字字母
+    text = re.sub(r"(?<![\w`])(wf_[a-f0-9]+|plan_[a-f0-9]+|20\d{2}[a-z]+\d?)", _code_repl, text)
+    # 2e) 简单命令（earthengine / streamlit run 等）——保守：含空格的短命令
+    text = re.sub(r"(?<![\w`])(earthengine\s+\w+[\w\s-]*|streamlit\s+run\s+\S+)", _code_repl, text)
+    # 移除可能的重复反引号（若值已带 code）
+    text = re.sub(r"``([^`]+)``", r"`\1`", text)
+
+    # 3) 列表块与数字块前补空行（保持连续列表紧凑）
     text = re.sub(
         r"(?m)(?<=\n[^\n-*•\d])\n*(?=\s*[-*•]\s)",
         "\n\n",
         text,
     )
     text = re.sub(
-        r"(?m)(?<=\n[^\n\d])\n*(?=\s*\d+[.、)]\s)",
+        r"(?m)(?<=\n[^\n\d\*\s])\n*(?=\s*\d+[.、)]\s)",
         "\n\n",
         text,
     )
@@ -2440,29 +2488,15 @@ st.markdown("""
         border: none !important;
     }
     [data-testid="stChatMessageAvatar"] {
-        background: linear-gradient(135deg, #2a3f66 0%, #1a2536 100%) !important;
-        border: 1px solid #3a62d7 !important;
-        box-shadow: 0 0 10px rgba(58, 98, 215, 0.35) !important;
+        background: #1c2331 !important;
+        border: 1px solid #2e3a4d !important;
+        box-shadow: none !important;
     }
     /* Streamlit 1.62 renders the avatar as the first child without a stable
        data-testid; keep that actual container dark as well. */
     [data-testid="stChatMessage"] > div:first-child {
-        background-color: #0d131d !important;
-        border: 1px solid #2c3649 !important;
-    }
-    /* 用户头像：蓝紫色渐变 + 光晕（区分于助手） */
-    [data-testid="stChatMessage"]:has(.msg-role-user) [data-testid="stChatMessageAvatar"],
-    [data-testid="stChatMessage"]:has(.msg-role-user) > div:first-child {
-        background: linear-gradient(135deg, #3a62d7 0%, #273a5e 100%) !important;
-        border: 1px solid #5d82e8 !important;
-        box-shadow: 0 0 12px rgba(93, 130, 232, 0.45) !important;
-    }
-    /* 助手头像：绿色渐变 + 光晕 */
-    [data-testid="stChatMessage"]:has(.msg-role-assistant) [data-testid="stChatMessageAvatar"],
-    [data-testid="stChatMessage"]:has(.msg-role-assistant) > div:first-child {
-        background: linear-gradient(135deg, #4ea56a 0%, #1f3a28 100%) !important;
-        border: 1px solid #4ea56a !important;
-        box-shadow: 0 0 12px rgba(78, 165, 106, 0.45) !important;
+        background-color: #10141c !important;
+        border: 1px solid #2e3a4d !important;
     }
     .stTextInput>div>div>input, .stSelectbox>div>div>div { background-color: #252526 !important; color: #eeeeee !important; border: 1px solid #3d3d3d !important; border-radius: 2px !important; }
     .stTextInput>div>div>input:focus, .stSelectbox>div>div>div:focus { border-color: #3A62D7 !important; box-shadow: none !important; }
@@ -2472,61 +2506,52 @@ st.markdown("""
     .main-title { font-size: 1.8rem; font-weight: 600; color: #eeeeee !important; margin-bottom: 0px; border-left: 4px solid #3A62D7; padding-left: 10px;}
     .sub-title { font-size: 0.9rem; color: #888888 !important; margin-bottom: 15px; margin-top: 5px; padding-left: 14px;}
     .stProgress > div > div > div > div { background-color: #3A62D7 !important; }
-    .msg-role {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.25rem;
-        padding: 0.15rem 0.5rem;
-        border-radius: 999px;
-        font-size: 0.72rem;
-        font-weight: 700;
-        margin-bottom: 0.45rem;
-        letter-spacing: 0.2px;
-    }
-    .msg-role-user {
-        background: #1f355a;
-        color: #cfe1ff !important;
-        border: 1px solid #3a62d7;
-    }
-    .msg-role-assistant {
-        background: #23452f;
-        color: #cbf1d4 !important;
-        border: 1px solid #4ea56a;
+    /* 弱化角色名：科研 Copilot 风格，非胶囊标签 */
+    .chat-role-label {
+        font-size: 0.68rem;
+        font-weight: 600;
+        letter-spacing: 0.4px;
+        text-transform: uppercase;
+        color: #7a8598 !important;
+        margin-bottom: 0.25rem;
+        line-height: 1.3;
     }
     [data-testid="stChatMessage"] {
         display: flex !important;
         flex: 0 0 auto !important;
         width: fit-content !important;
         min-width: 7rem !important;
-        max-width: 86% !important;
-        background: linear-gradient(180deg, #141a25 0%, #10151f 100%);
-        border: 1px solid #2c3649;
-        border-radius: 12px;
-        padding: 0.55rem 0.8rem;
-        margin-bottom: 0.55rem;
+        max-width: 85% !important;
+        background: #161c27 !important;
+        border: 1px solid #2a3648;
+        border-radius: 10px;
+        padding: 0.5rem 0.7rem;
+        margin-bottom: 0.5rem;
         box-sizing: border-box;
-        line-height: 1.65;
+        line-height: 1.6;
     }
-    /* 对话采用双侧气泡：助手在左，用户在右。 */
-    [data-testid="stChatMessage"]:has(.msg-role-assistant) {
+    /* 对话采用双侧气泡：Agent 在左，User 在右。 */
+    [data-testid="stChatMessage"]:has(.chat-role-label-agent) {
         margin-left: 0 !important;
         margin-right: auto !important;
-        border-left: 3px solid #4ea56a;
+        border-left: 2px solid #3f8f5c;
     }
-    [data-testid="stChatMessage"]:has(.msg-role-user) {
+    [data-testid="stChatMessage"]:has(.chat-role-label-user) {
         flex-direction: row-reverse !important;
         margin-left: auto !important;
         margin-right: 0 !important;
-        background: linear-gradient(180deg, #182b4a 0%, #13223a 100%);
-        border-right: 3px solid #5d82e8;
-        border-left: 1px solid #2c4678;
+        background: #1b2b46 !important;
+        border: 1px solid #3a5f8f;
+        border-right: 2px solid #5d82e8;
+        max-width: 68% !important;   /* 用户消息更紧凑 */
+        padding: 0.4rem 0.6rem !important;
     }
-    [data-testid="stChatMessage"]:has(.msg-role-user) [data-testid="stChatMessageAvatar"] {
-        margin-left: 0.55rem !important;
+    [data-testid="stChatMessage"]:has(.chat-role-label-user) [data-testid="stChatMessageAvatar"] {
+        margin-left: 0.45rem !important;
         margin-right: 0 !important;
     }
-    [data-testid="stChatMessage"]:has(.msg-role-assistant) [data-testid="stChatMessageAvatar"] {
-        margin-right: 0.55rem !important;
+    [data-testid="stChatMessage"]:has(.chat-role-label-agent) [data-testid="stChatMessageAvatar"] {
+        margin-right: 0.45rem !important;
     }
     [data-testid="stChatMessage"] [data-testid="stChatMessageContent"] {
         width: fit-content !important;
@@ -2540,54 +2565,54 @@ st.markdown("""
         max-width: 100% !important;
     }
     [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] p {
-        color: #e6ecf6 !important;
-        line-height: 1.7;
-        margin: 0.35rem 0 !important;
+        color: #dfe7f3 !important;
+        line-height: 1.68;
+        margin: 0.3rem 0 !important;
     }
-    /* 消息正文：段落、列表、重点高亮排版优化 */
+    /* 消息正文：段落、列表、重点高亮排版优化（克制科研风格） */
     [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] {
-        color: #e6ecf6 !important;
-        font-size: 0.92rem;
-        line-height: 1.7;
+        color: #dfe7f3 !important;
+        font-size: 0.9rem;
+        line-height: 1.68;
         word-break: break-word;
     }
     [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] p + p {
-        margin-top: 0.6rem !important;
+        margin-top: 0.5rem !important;
     }
     [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] ul,
     [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] ol {
-        margin: 0.4rem 0 !important;
-        padding-left: 1.25rem !important;
+        margin: 0.35rem 0 !important;
+        padding-left: 1.15rem !important;
     }
     [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] li {
-        margin: 0.25rem 0 !important;
+        margin: 0.2rem 0 !important;
         line-height: 1.6;
     }
     [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] li + li {
-        padding-top: 0.15rem !important;
+        padding-top: 0.1rem !important;
     }
-    /* 重点信息高亮（markdown **加粗** 与行内 code） */
+    /* 重点信息：仅对加粗做克制的青色强调，不再大面积橙色 */
     [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] strong {
-        color: #ffd479 !important;
+        color: #a5d6ff !important;
         font-weight: 700;
-        background: rgba(255, 212, 121, 0.08);
-        padding: 0 0.2rem;
-        border-radius: 3px;
     }
+    /* 行内 code：路径/年份/参数/ID/命令 */
     [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] code {
-        color: #7fd7ff !important;
-        background: #16202f !important;
-        padding: 0.1rem 0.3rem;
+        color: #8fe3c1 !important;
+        background: #14201c !important;
+        padding: 0.06rem 0.28rem;
         border-radius: 4px;
-        font-size: 0.85rem;
+        font-size: 0.84rem;
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", Monospace, monospace;
     }
-    /* 标题（#/##/###）层级 */
+    /* 状态强调（PASS/READY/BLOCKED/WARNING）：轻量颜色，不用大色块 */
+    /* 标题（#/##/###）层级（科研风格，克制） */
     [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] h1,
     [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] h2,
     [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] h3,
     [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] h4 {
-        color: #f0f4fb !important;
-        margin: 0.6rem 0 0.35rem !important;
+        color: #eef3fb !important;
+        margin: 0.55rem 0 0.3rem !important;
         letter-spacing: 0.3px;
     }
     [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] h3 {
@@ -5339,13 +5364,21 @@ with col_side:
         # view uses it to remove this otherwise empty bordered chat container.
         st.markdown('<div class="cstf-chat-stream-marker" aria-hidden="true"></div>', unsafe_allow_html=True)
         for msg in st.session_state.messages:
-            avatar = "🧑‍💻" if msg["role"] == "user" else "🛰️"
+            is_user = msg["role"] == "user"
+            avatar = _user_svg_avatar() if is_user else _agent_svg_avatar()
             with st.chat_message(msg["role"], avatar=avatar):
-                if msg["role"] == "user":
-                    st.markdown('<div class="msg-role msg-role-user">🧑‍💻 用户</div>', unsafe_allow_html=True)
+                # 头像旁弱化角色名（科研 Copilot 风格，非胶囊标签）
+                if is_user:
+                    st.markdown(
+                        '<div class="chat-role-label chat-role-label-user">User</div>',
+                        unsafe_allow_html=True,
+                    )
                 else:
-                    st.markdown('<div class="msg-role msg-role-assistant">🛰️ 智能体</div>', unsafe_allow_html=True)
-                if msg["role"] == "assistant":
+                    st.markdown(
+                        '<div class="chat-role-label chat-role-label-agent">CSTF Copilot</div>',
+                        unsafe_allow_html=True,
+                    )
+                if not is_user:
                     st.markdown(_format_agent_markdown(msg["content"]))
                 else:
                     st.markdown(msg["content"])
@@ -5891,8 +5924,8 @@ if _user_submitted:
         user_msg["image_name"] = preview_items[0][1]
 
     with chat_box:
-        with st.chat_message("user", avatar="🧑‍💻"):
-            st.markdown('<div class="msg-role msg-role-user">🧑‍💻 用户</div>', unsafe_allow_html=True)
+        with st.chat_message("user", avatar=_user_svg_avatar()):
+            st.markdown('<div class="chat-role-label chat-role-label-user">User</div>', unsafe_allow_html=True)
             st.markdown(display_prompt)
             _render_chat_attachment_previews(user_msg)
     if st.session_state.get("_conversation_store") is not None:
@@ -5909,8 +5942,8 @@ if _user_submitted:
     st.session_state["_attachment_uploader_epoch"] = _attachment_uploader_epoch + 1
 
     with chat_box:
-        with st.chat_message("assistant", avatar="🛰️"):
-            st.markdown('<div class="msg-role msg-role-assistant">🛰️ 智能体</div>', unsafe_allow_html=True)
+        with st.chat_message("assistant", avatar=_agent_svg_avatar()):
+            st.markdown('<div class="chat-role-label chat-role-label-agent">CSTF Copilot</div>', unsafe_allow_html=True)
             with st.spinner("🧠 智能体思考中..."):
                 try:
                     import agent
