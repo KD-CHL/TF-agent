@@ -383,12 +383,12 @@ class TestChatUiContract(unittest.TestCase):
 
     def test_chat_messages_have_distinct_left_right_alignment(self):
         """用户消息右对齐、助手消息左对齐，且卡片宽度受控。"""
-        self.assertIn('[data-testid="stChatMessage"]:has(.msg-role-user)', self.source)
+        self.assertIn('[data-testid="stChatMessage"]:has(.chat-role-label-user)', self.source)
         self.assertIn('flex-direction: row-reverse', self.source)
         self.assertIn('margin-left: auto', self.source)
-        self.assertIn('[data-testid="stChatMessage"]:has(.msg-role-assistant)', self.source)
+        self.assertIn('[data-testid="stChatMessage"]:has(.chat-role-label-agent)', self.source)
         self.assertIn('margin-right: auto', self.source)
-        self.assertIn('max-width: 86%', self.source)
+        self.assertIn('max-width: 85%', self.source)
 
     def test_chat_stream_and_composer_have_explicit_size_contract(self):
         """消息滚动区占剩余高度，输入区固定收缩，避免再次出现空白或溢出。"""
@@ -400,7 +400,7 @@ class TestChatUiContract(unittest.TestCase):
         """短消息不应继承整列宽度，长消息仍受最大宽度约束。"""
         self.assertIn('width: fit-content !important', self.source)
         self.assertIn('min-width: 7rem !important', self.source)
-        self.assertIn('max-width: 86% !important', self.source)
+        self.assertIn('max-width: 85% !important', self.source)
 
     def test_history_view_is_navigation_only_and_session_switch_opens_chat(self):
         """历史页仅展示记录，选中会话后自动返回对话视图。"""
