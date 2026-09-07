@@ -238,11 +238,70 @@ def _default_ui_path(path: str) -> str:
         return ""
 
 
+def _first_existing(*paths: str) -> str:
+    """返回第一个存在的路径；全不存在则返回空串。
+
+    用于"外部优先、仓库内置兜底"的路径默认值（如研究区域矢量）。
+    """
+    for p in paths:
+        try:
+            if p and os.path.exists(p):
+                return p
+        except Exception:
+            continue
+    return ""
+
+
+def _read_gee_project() -> str:
+    """解析 GEE Cloud Project：环境变量 → 项目文件 → credentials JSON。
+
+    与 m4_engine._resolve_ee_project 语义一致；返回空串表示未配置。
+    支持 earthengine set_project 写入的 ~/.config/earthengine/project。
+    """
+    for key in ("EE_PROJECT", "GOOGLE_CLOUD_PROJECT", "EARTHENGINE_PROJECT"):
+        val = (os.environ.get(key) or "").strip()
+        if val:
+            return val
+    cfg_dir = os.path.join(os.path.expanduser("~"), ".config", "earthengine")
+    for fname in ("project", "project_id"):
+        p = os.path.join(cfg_dir, fname)
+        try:
+            if os.path.isfile(p):
+                text = open(p, encoding="utf-8").read().strip()
+                if text:
+                    return text
+        except OSError:
+            pass
+    cred = os.path.join(cfg_dir, "credentials")
+    try:
+        if os.path.isfile(cred):
+            data = json.loads(open(cred, encoding="utf-8").read())
+            for k in ("project", "project_id", "cloud_project"):
+                if data.get(k):
+                    return str(data[k]).strip()
+    except (OSError, ValueError, TypeError):
+        pass
+    return ""
+
+
 def init_ui_session_defaults(state: Dict[str, Any]) -> None:
     """初始化侧栏 UI 绑定键（仅缺省时写入，不覆盖用户/Agent 已有值）。"""
     _repo_root = os.path.normpath(
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
     )
+    # 仓库内置矢量资源（TF-agent/data/）：优先使用，保证同门拉下即可用；
+    # 不存在时回退到开发机外部旧路径（本机体验不变）。
+    _data_dir = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
+
+    def _local_or_fallback(name: str, *fallbacks: str) -> str:
+        local = os.path.join(_data_dir, name)
+        if os.path.exists(local):
+            return local
+        for fb in fallbacks:
+            if fb and os.path.exists(fb):
+                return fb
+        return ""
+
     defaults = {
         "ui_workflow": "潮滩推理",
         "ui_run_mode": "dl",
@@ -253,12 +312,17 @@ def init_ui_session_defaults(state: Dict[str, Any]) -> None:
             r"E:\Code\GEE\best_train_loss_model_resnet50.pth"
         ),
         "ui_shp_path": _default_ui_path(
-            r"E:\Code\GEE\jb\water-line\max_water_extent23.shp"
+            r"E:\Code\GEE\research\jb\water-line\max_water_extent23.shp"
         ),
-        "ui_points_shp": _default_ui_path(
-            os.path.join(_repo_root, "jb", "point", "points_export.shp")
+        "ui_points_shp": _local_or_fallback(
+            "points_export.shp",
+            r"E:\Code\GEE\research\jb\point\points_export.shp",
+            os.path.join(_repo_root, "jb", "point", "points_export.shp"),
         ),
-        "ui_task_aoi_shp": _default_ui_path(r"E:\Data\CHINA_tf_city\china_costal.shp"),
+        "ui_task_aoi_shp": _local_or_fallback(
+            "china_costal.shp",
+            r"E:\Data\CHINA_tf_city\china_costal.shp",
+        ),
         "ui_inference_mode": "深度学习",
         "ui_adaptive_mode": False,
         "ui_prob_th": 0.05,
@@ -272,21 +336,28 @@ def init_ui_session_defaults(state: Dict[str, Any]) -> None:
         "ui_e1_compare_sources": [],
         "ui_e1_export_maps": True,
         "ui_e1_export_heatmap": True,
-        "ui_m4_roi_path": _default_ui_path(r"E:\Data\CHINA_tf_city\china_costal.shp"),
+        "ui_m4_roi_path": _first_existing(
+            r"E:\Data\CHINA_tf_city\china_costal.shp",      # 优先：本机原始区分 AOI 矢量
+            os.path.join(_data_dir, "china_costal.shp"),    # 回退：仓库内置副本
+            r"E:\Data\CHINA_tf_city\china_costal.shp",
+        ),
         "ui_m4_roi_name": "",
         "ui_m4_start_date": "2020-01-01",
         "ui_m4_end_date": "2020-01-31",
         "ui_m4_export_to": "drive",
         "ui_m4_drive_folder": "GEE_Downloads",
-        "ui_m4_local_dir": "",
+        "ui_m4_local_dir": _first_existing(
+            r"I:\GEE_data\20",                              # 默认：任务根目录（存在）
+            r"E:\Data\843output",
+        ),
         "ui_m4_cloud_limit": 60,
         "ui_m4_min_land": 5.0,
         "ui_m4_max_land": 95.0,
         "ui_m4_min_pixel_count": 1000,
         "ui_m4_bands": ["B8", "B4", "B3", "B2", "B11"],
         "ui_m4_scale": 10,
-        "ui_m4_gee_proxy": "",
-        "ui_m4_gee_project": os.environ.get("EE_PROJECT", "").strip(),
+        "ui_m4_gee_proxy": os.environ.get("GEE_PROXY_URL", "").strip() or "",
+        "ui_m4_gee_project": _read_gee_project(),
     }
     for k, v in defaults.items():
         if k not in state:
