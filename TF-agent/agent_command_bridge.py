@@ -6,6 +6,7 @@ Agent ↔ Streamlit 双轨网桥：JSON 指令解析、差量合流、pending �
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import re
@@ -14,11 +15,21 @@ from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent_context_policy import redact_spatial_metadata, safe_error_summary, sanitize_external_text
+from location_resolver import resolve_location
+from map_command_adapter import normalize_map_payload, parse_legacy_map_text
 
 _JSON_BLOCK_RE = re.compile(
     r"\[SYSTEM_COMMAND_JSON\]\s*(\{.*?\})\s*\[/SYSTEM_COMMAND_JSON\]",
     re.DOTALL | re.IGNORECASE,
 )
+_SYSTEM_COMMAND_MARKER_RE = re.compile(r"\[SYSTEM_COMMAND_JSON\]", re.IGNORECASE)
+_SYSTEM_COMMAND_END_RE = re.compile(r"\[/SYSTEM_COMMAND_JSON\]", re.IGNORECASE)
+_SYSTEM_COMMAND_BLOCK_OR_TAIL_RE = re.compile(
+    r"\[SYSTEM_COMMAND_JSON\].*?(?:\[/SYSTEM_COMMAND_JSON\]|$)",
+    re.DOTALL | re.IGNORECASE,
+)
+_MAP_ADAPTER_SOURCE_KEY = "_map_adapter_source"
+_TRUSTED_MAP_ADAPTER_SOURCES = {"payload", "legacy_text", "natural_language"}
 _RE_CMD_MAP_PIPE = re.compile(
     r"COMMAND_UPDATE_MAP\s*\|\s*([-\d.]+)\s*\|\s*([-\d.]+)\s*\|\s*(\d+)",
     re.IGNORECASE,
@@ -122,9 +133,97 @@ class ApplyResult:
     gee_plan_text: str = ""
     workflow_plan: Optional[Dict[str, Any]] = None
     workflow_plan_text: str = ""
+    # Ephemeral, user-safe map diagnostics.  ``persisted`` is deliberately a
+    # separate projection so callers cannot accidentally write rounded
+    # coordinates or command payloads into a durable log.
+    diagnostics: Optional[Dict[str, Any]] = None
 
 
 PENDING_AGENT_COMMANDS_KEY = "_pending_agent_commands"
+
+
+def _map_center_for_diagnostics(payload: Any) -> Tuple[Optional[float], Optional[float]]:
+    """Extract a map center without returning the source payload."""
+    if not isinstance(payload, dict):
+        return None, None
+    lat, lon = payload.get("lat"), payload.get("lon")
+    if lat is None or lon is None:
+        center = payload.get("center")
+        if isinstance(center, (list, tuple)) and len(center) >= 2:
+            lat, lon = center[0], center[1]
+        elif isinstance(center, dict):
+            lat = center.get("lat", center.get("latitude"))
+            lon = center.get("lon", center.get("longitude"))
+    try:
+        return float(lat), float(lon)
+    except (TypeError, ValueError):
+        return None, None
+
+
+def build_map_diagnostics(
+    command: Any,
+    *,
+    source: str = "unknown",
+    warnings: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Build a bounded diagnostic projection for map-command compatibility.
+
+    The display projection may contain a *rounded* center for an ephemeral
+    expander.  The durable projection contains only coordinate presence,
+    range validity, and a one-way hash; it never contains lat/lon, raw JSON,
+    labels, paths, credentials, or model output.
+    """
+    payload = command.get("map") if isinstance(command, dict) else None
+    lat, lon = _map_center_for_diagnostics(payload)
+    present = lat is not None and lon is not None
+    in_range = bool(
+        present
+        and math.isfinite(lat)
+        and math.isfinite(lon)
+        and -90.0 <= lat <= 90.0
+        and -180.0 <= lon <= 180.0
+    )
+    coord_hash = None
+    if present:
+        canonical = f"{lat:.15g},{lon:.15g}"
+        coord_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+    bounds_present = isinstance(payload, dict) and "bounds" in payload
+    bounds_valid: Optional[bool] = None
+    if bounds_present:
+        try:
+            bounds_valid = normalize_map_payload(payload).bounds is not None
+        except (TypeError, ValueError):
+            bounds_valid = False
+
+    clean_warnings = [
+        sanitize_external_text(item)[:200]
+        for item in (warnings or [])
+        if str(item or "").strip()
+    ]
+    display_center = None
+    if in_range:
+        display_center = f"{lat:.2f}°, {lon:.2f}°"
+    display = {
+        "command_source": sanitize_external_text(source)[:40] or "unknown",
+        "center": display_center or "不可用",
+        "zoom": payload.get("zoom", 8) if isinstance(payload, dict) else "不可用",
+        "bounds_valid": bounds_valid if bounds_present else "未提供",
+        "confirmation": (
+            bool(command.get("pending_action", {}).get("confirmed"))
+            if isinstance(command, dict) and isinstance(command.get("pending_action"), dict)
+            else "未提供"
+        ),
+        "warnings": clean_warnings,
+    }
+    persisted = {
+        "coordinate_presence": present,
+        "coordinate_range_valid": in_range,
+        "coordinate_hash": coord_hash,
+        "bounds_present": bounds_present,
+        "bounds_valid": bounds_valid,
+    }
+    return {"display": display, "persisted": persisted}
 
 
 def _default_ui_path(path: str) -> str:
@@ -291,16 +390,41 @@ def parse_system_command(text: str) -> Optional[Dict[str, Any]]:
     """从 Agent 回复中提取 JSON 指令；兼容 legacy COMMAND 行与自然语言坐标。"""
     if not text:
         return None
+    marker = _SYSTEM_COMMAND_MARKER_RE.search(text)
+    while marker:
+        closing = _SYSTEM_COMMAND_END_RE.search(text, marker.end())
+        if closing is None:
+            return None
+        marker = _SYSTEM_COMMAND_MARKER_RE.search(text, closing.end())
     m = _JSON_BLOCK_RE.search(text)
     if m:
         try:
-            return _normalize_command_aliases(json.loads(m.group(1)))
+            raw_command = json.loads(m.group(1))
         except json.JSONDecodeError:
-            pass
+            return None
+        try:
+            normalized = _normalize_command_aliases(raw_command)
+            if isinstance(normalized, dict) and isinstance(normalized.get("map"), dict):
+                # Internal provenance is carried beside (never inside) the
+                # strict map schema; model-provided ``source`` is ignored.
+                normalized[_MAP_ADAPTER_SOURCE_KEY] = "payload"
+            return normalized
+        except ValueError:
+            # Preserve the raw command so the shared schema boundary can
+            # return a safe validation error instead of crashing this parser.
+            return raw_command
+    if _SYSTEM_COMMAND_MARKER_RE.search(text):
+        # A malformed JSON block must not silently become a legacy or natural
+        # language command.  The UI may still parse a separate plain-text
+        # coordinate command after removing this block.
+        return None
     cmd: Dict[str, Any] = {}
-    mp = _RE_CMD_MAP_PIPE.search(text)
-    if mp:
-        cmd["map"] = {"lat": float(mp.group(1)), "lon": float(mp.group(2)), "zoom": int(mp.group(3))}
+    try:
+        legacy_map = parse_legacy_map_text(text)
+        cmd["map"] = legacy_map.to_command_dict()
+        cmd[_MAP_ADAPTER_SOURCE_KEY] = legacy_map.source
+    except ValueError:
+        pass
     pp = _RE_CMD_PIPELINE.search(text)
     if pp:
         cmd.setdefault("sidebar_states", {})
@@ -311,49 +435,116 @@ def parse_system_command(text: str) -> Optional[Dict[str, Any]]:
     if "map" not in cmd:
         nl = _parse_natural_map_command(text)
         if nl:
-            cmd["map"] = {"lat": nl[0], "lon": nl[1], "zoom": nl[2]}
+            cmd["map"] = normalize_map_payload(
+                {"lat": nl[0], "lon": nl[1], "zoom": nl[2]}
+            ).to_command_dict()
+            cmd[_MAP_ADAPTER_SOURCE_KEY] = "natural_language"
     return cmd or None
 
 
 def _normalize_command_aliases(command: Any) -> Any:
-    """Normalize compatible legacy map shapes before strict schema validation.
+    """Normalize map payloads before strict schema validation.
 
-    Some Agent responses use ``{"map": {"center": [lat, lon], "zoom": 9}}``
-    while the internal CSTF protocol uses explicit ``lat``/``lon`` fields.
-    Keep the public command schema strict after this lossless adapter so the
-    rest of the execution path has one canonical representation.
+    The adapter is the compatibility boundary for ``center`` aliases and
+    bounds formats.  Invalid map payloads are deliberately left unchanged so
+    the strict system-command schema can reject them without mutating state.
     """
     if not isinstance(command, dict):
         return command
-    normalized = dict(command)
+    normalized = dict(_resolve_map_location_alias(command))
     map_cmd = normalized.get("map")
-    if isinstance(map_cmd, dict) and "lat" not in map_cmd and "lon" not in map_cmd:
-        center = map_cmd.get("center")
-        lat = lon = None
-        if isinstance(center, (list, tuple)) and len(center) >= 2:
-            lat, lon = center[0], center[1]
-        elif isinstance(center, dict):
-            lat = center.get("lat", center.get("latitude"))
-            lon = center.get("lon", center.get("longitude"))
-        if lat is not None and lon is not None:
-            map_cmd = dict(map_cmd)
-            map_cmd.pop("center", None)
-            map_cmd["lat"] = lat
-            map_cmd["lon"] = lon
-            normalized["map"] = map_cmd
+    if isinstance(map_cmd, dict):
+        map_normalized = normalize_map_payload(map_cmd)
+        if any(warning.startswith("unknown map field:") for warning in map_normalized.warnings):
+            raise ValueError("系统命令校验失败（map 含未知字段）。")
+        normalized["map"] = map_normalized.to_command_dict()
     return normalized
+
+
+def _map_adapter_warnings(command: Any) -> List[str]:
+    """Return recoverable adapter diagnostics before canonicalization drops them."""
+    if not isinstance(command, dict) or not isinstance(command.get("map"), dict):
+        return []
+    try:
+        normalized = normalize_map_payload(command["map"])
+    except ValueError:
+        return []
+    return [
+        sanitize_external_text(warning)
+        for warning in normalized.warnings
+        if warning.startswith("invalid bounds:")
+    ]
+
+
+def _reply_map_adapter_warnings(reply: str) -> List[str]:
+    """Read valid JSON once more to retain adapter diagnostics for the UI."""
+    match = _JSON_BLOCK_RE.search(reply or "")
+    if not match:
+        return []
+    try:
+        command = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return []
+    return _map_adapter_warnings(command)
 
 
 def _validate_command(command: Any) -> Dict[str, Any]:
     """调用统一 Schema；错误只保留用户可理解的安全摘要。"""
     from agent_command_schema import validate_system_command
 
-    validated = validate_system_command(_normalize_command_aliases(command))
+    adapter_source = None
+    command_for_schema = command
+    if isinstance(command, dict):
+        adapter_source = command.get(_MAP_ADAPTER_SOURCE_KEY)
+        if adapter_source is not None:
+            command_for_schema = dict(command)
+            command_for_schema.pop(_MAP_ADAPTER_SOURCE_KEY, None)
+    validated = validate_system_command(_normalize_command_aliases(command_for_schema))
     sidebar = validated.get("sidebar_states") or {}
     unknown_sidebar = set(sidebar) - (set(SIDEBAR_KEY_MAP) | {"workspace_tab"})
     if unknown_sidebar:
         raise ValueError("系统命令校验失败（sidebar_states 含未知字段）。")
+    if adapter_source in _TRUSTED_MAP_ADAPTER_SOURCES:
+        validated[_MAP_ADAPTER_SOURCE_KEY] = adapter_source
     return validated
+
+
+def _resolve_map_location_alias(command: Any) -> Any:
+    """Resolve an optional user-facing map name before strict schema parsing.
+
+    ``location_name`` is a compatibility input only; it never crosses the
+    canonical map schema.  Explicit lat/lon always win, while a name without
+    coordinates must resolve uniquely from the local preset table.
+    """
+    if not isinstance(command, dict) or not isinstance(command.get("map"), dict):
+        return command
+    payload = command["map"]
+    if "location_name" not in payload:
+        return command
+
+    name = payload.get("location_name")
+    has_lat = payload.get("lat") is not None
+    has_lon = payload.get("lon") is not None
+    normalized_payload = dict(payload)
+    normalized_payload.pop("location_name", None)
+
+    # Supplied coordinates are an explicit direct-coordinate command.  Keep
+    # them byte-for-byte semantically unchanged and only remove the
+    # non-canonical compatibility field.
+    if (has_lat and has_lon) or "center" in payload:
+        return {**command, "map": normalized_payload}
+
+    resolution = resolve_location(name, lat=payload.get("lat"), lon=payload.get("lon"))
+    if not resolution.ok:
+        detail = resolution.reason or "error"
+        if resolution.candidates:
+            detail += "（候选: " + "、".join(resolution.candidates) + "）"
+        raise ValueError(f"地图地名解析失败: {detail}")
+
+    normalized_payload.update({"lat": resolution.lat, "lon": resolution.lon})
+    if not normalized_payload.get("label") and resolution.label:
+        normalized_payload["label"] = resolution.label
+    return {**command, "map": normalized_payload}
 
 
 _RE_MAP_COORDS_NSEW = re.compile(
@@ -407,7 +598,7 @@ def _parse_natural_map_command(text: str) -> Optional[Tuple[float, float, int]]:
 
 
 def _strip_json_block(text: str) -> str:
-    t = _JSON_BLOCK_RE.sub("", text)
+    t = _SYSTEM_COMMAND_BLOCK_OR_TAIL_RE.sub("", text)
     t = _RE_CMD_MAP_PIPE.sub("", t)
     t = _RE_CMD_PIPELINE.sub("", t)
     return re.sub(r"\s+", " ", t).strip()
@@ -1495,11 +1686,24 @@ def build_pending_task(state: Dict[str, Any], action: Dict[str, Any]) -> Tuple[O
 
 def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> ApplyResult:
     """差量合流：仅更新 JSON 中非 null 字段；可选触发 pending 动作。"""
+    map_warnings = _map_adapter_warnings(command)
     try:
         command = _validate_command(command)
     except ValueError as exc:
-        return ApplyResult(applied=False, errors=[sanitize_external_text(exc)])
-    result = ApplyResult(applied=True)
+        return ApplyResult(
+            applied=False,
+            errors=[sanitize_external_text(exc)],
+            diagnostics=build_map_diagnostics(command, source="invalid_system_command", warnings=map_warnings),
+        )
+    result = ApplyResult(
+        applied=True,
+        errors=map_warnings,
+        diagnostics=build_map_diagnostics(
+            command,
+            source=command.get(_MAP_ADAPTER_SOURCE_KEY) or "system_command",
+            warnings=map_warnings,
+        ),
+    )
     init_ui_session_defaults(state)
 
     mp = command.get("map")
@@ -1518,8 +1722,11 @@ def apply_system_command(state: Dict[str, Any], command: Dict[str, Any]) -> Appl
                     "lat": float(lat),
                     "lon": float(lon),
                     "zoom": int(zoom),
-                    "source": "agent",
+                    "source": command.get(_MAP_ADAPTER_SOURCE_KEY) or "agent",
                 }
+                bounds = mp.get("bounds")
+                if isinstance(bounds, dict):
+                    fly["bounds"] = dict(bounds)
                 preset = mp.get("preset")
                 if preset:
                     fly["preset"] = str(preset)
@@ -1805,6 +2012,7 @@ def flush_pending_agent_commands(state: Dict[str, Any]) -> ApplyResult:
 def _preview_apply_result(command: Dict[str, Any]) -> ApplyResult:
     """不入队、不写 state，仅用于聊天区展示 action_type。"""
     result = ApplyResult(applied=True, queued=True)
+    result.diagnostics = build_map_diagnostics(command, source="agent_reply")
     action = command.get("pending_action")
     if isinstance(action, dict) and action.get("type"):
         result.action_type = str(action.get("type"))
@@ -1820,6 +2028,12 @@ def process_agent_reply(state: Dict[str, Any], reply: str) -> Tuple[ApplyResult,
     cmd = parse_system_command(reply)
     clean = _strip_json_block(reply)
     if not cmd:
+        if _SYSTEM_COMMAND_MARKER_RE.search(reply or ""):
+            return ApplyResult(
+                applied=False,
+                errors=["地图指令格式不兼容：系统命令未能解析，请重试。"],
+                diagnostics=build_map_diagnostics(None, source="malformed_system_command"),
+            ), clean
         return ApplyResult(applied=False), reply
     try:
         cmd = _validate_command(cmd)
@@ -1827,8 +2041,14 @@ def process_agent_reply(state: Dict[str, Any], reply: str) -> Tuple[ApplyResult,
         return ApplyResult(applied=False, errors=[sanitize_external_text(exc)]), clean
     queue_agent_command(state, cmd)
     result = _preview_apply_result(cmd)
+    result.errors.extend(_reply_map_adapter_warnings(reply))
+    result.diagnostics = build_map_diagnostics(
+        cmd,
+        source=cmd.get(_MAP_ADAPTER_SOURCE_KEY) or "agent_reply",
+        warnings=result.errors,
+    )
     result.clean_reply_hint = clean
-    return result, clean or reply
+    return result, clean
 
 
 def apply_agent_reply_immediate(state: Dict[str, Any], reply: str) -> Tuple[ApplyResult, str]:
@@ -1836,7 +2056,14 @@ def apply_agent_reply_immediate(state: Dict[str, Any], reply: str) -> Tuple[Appl
     cmd = parse_system_command(reply)
     clean = _strip_json_block(reply)
     if not cmd:
+        if _SYSTEM_COMMAND_MARKER_RE.search(reply or ""):
+            return ApplyResult(
+                applied=False,
+                errors=["地图指令格式不兼容：系统命令未能解析，请重试。"],
+                diagnostics=build_map_diagnostics(None, source="malformed_system_command"),
+            ), clean
         return ApplyResult(applied=False), reply
     result = apply_system_command(state, cmd)
+    result.errors.extend(_reply_map_adapter_warnings(reply))
     result.clean_reply_hint = clean
-    return result, clean or reply
+    return result, clean

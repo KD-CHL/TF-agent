@@ -19,6 +19,62 @@ from conversation_store import ConversationStore, SCHEMA_VERSION, next_thread_id
 
 
 class TestConversationStore(unittest.TestCase):
+    def test_sqlite_roundtrip_redacts_remaining_equivalent_coordinate_forms(self):
+        """Durable storage must not retain quoted or localized map coordinates."""
+        samples = (
+            '{"lat":"30.5","lon":"120.8"}',
+            "中心点：[30.5, 120.8]",
+            "地图中心：[30.5, 120.8]",
+            "center point: (30.5, 120.8)",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            store = ConversationStore(os.path.join(td, "equivalent-coordinates.sqlite3"))
+            for index, sample in enumerate(samples):
+                store.append_message("equivalent", "assistant", sample)
+            restored = "\n".join(row["content"] for row in store.load_messages("equivalent"))
+        for exact in ("30.5", "120.8"):
+            self.assertNotIn(exact, restored)
+
+    def test_sqlite_roundtrip_uses_shared_durable_sanitizer_for_spatial_and_media_inputs(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = ConversationStore(os.path.join(td, "durable.sqlite3"))
+            samples = [
+                '[SYSTEM_COMMAND_JSON]{"map":{"lat":30.5,"lon":120.8}}',
+                '{"latitude":30.5,"longitude":120.8,"center":[30.5,120.8],"bounds":{"west":120.0,"south":30.0,"east":121.0,"north":31.0},"coordinates":[[120.0,30.0],[121.0,31.0]]}',
+                "坐标：30.5000°N, 120.8000°E；中心点 (30.5, 120.8)",
+                "data:image/svg+xml;charset=utf-8;base64,PHN2Zz4=\nPHN2Zz4=",
+                "data:audio/ogg;codecs=opus;base64,T2dnUw==\nAAAA",
+                "data:video/mp4;codecs=avc1;base64,AAAA\nBBBB",
+                "https://example.org/data/paper.pdf ordinary 42",
+            ]
+            for index, sample in enumerate(samples):
+                store.append_message("durable", "assistant", sample)
+            restored = "\n".join(row["content"] for row in store.load_messages("durable"))
+            for exact in ("SYSTEM_COMMAND_JSON", "30.5", "120.8", "120.0", "121.0", "30.0", "31.0", "base64", "PHN2Zz4="):
+                self.assertNotIn(exact, restored)
+            self.assertIn("https://example.org/data/paper.pdf", restored)
+            self.assertIn("ordinary 42", restored)
+
+    def test_persisted_messages_redact_common_pats_and_inline_image(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = ConversationStore(os.path.join(td, "chat-pats.sqlite3"))
+            raw = (
+                "ghp_abcdefghijk1234567890 github_pat_abcdefghijk1234567890 "
+                "rk-abcdefghijk1234567890 rk_abcdefghijk1234567890 "
+                "pk_abcdefghijk1234567890 data:image/png;base64,AAAA"
+            )
+            store.append_message("thread_common_pats", "user", raw)
+            content = store.load_messages("thread_common_pats")[0]["content"]
+            for secret in (
+                "ghp_abcdefghijk1234567890",
+                "github_pat_abcdefghijk1234567890",
+                "rk-abcdefghijk1234567890",
+                "rk_abcdefghijk1234567890",
+                "pk_abcdefghijk1234567890",
+                "data:image/png;base64,AAAA",
+            ):
+                self.assertNotIn(secret, content)
+
     def test_roundtrip_redacts_command_path_and_attachment_content(self):
         with tempfile.TemporaryDirectory() as td:
             db = os.path.join(td, "conversation.sqlite3")

@@ -33,6 +33,22 @@ class TestGlobeEngineUi(unittest.TestCase):
         self.assertIn("AOI 已选定，已同步", html)
         self.assertIn("AOI 发送失败，请重试", html)
 
+    def test_unsequenced_fly_is_rejected_after_a_sequenced_navigation(self):
+        """A delayed legacy FLY must not cancel the current sequenced flight."""
+        html = globe_engine.build_cesium_html({})
+        guard = "if (!hasNavigationSeq && _lastFlyNavigationSeq > 0)"
+        self.assertIn(guard, html)
+        self.assertLess(html.index(guard), html.index("const navigationOptions ="))
+
+    def test_message_listener_validates_protocol_and_channel_before_binding_origin(self):
+        html = globe_engine.build_cesium_html({})
+        listener = html[html.index('window.addEventListener("message"'):]
+        self.assertIn("if (data.version !== 1) return;", listener)
+        self.assertIn('if (data.channel_id !== (CFG.channelId || "default")) return;', listener)
+        self.assertLess(listener.index("if (data.version !== 1) return;"), listener.index("_parentOrigin = ev.origin"))
+        self.assertLess(listener.index('if (data.channel_id !== (CFG.channelId || "default")) return;'), listener.index("_parentOrigin = ev.origin"))
+        self.assertIn('if (type !== "CSTF_FLY" && type !== "CSTF_LAYER_ADD" && type !== "CSTF_LAYER_REMOVE") return;', listener)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -772,6 +772,9 @@ class TestB12Integration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             state: dict = {}
             init_ui_session_defaults(state)
+            # Keep this no-AOI branch deterministic even when the developer
+            # checkout provides the packaged coastline fallback vector.
+            state["ui_m4_roi_path"] = ""
             # propose_gee：无 AOI → 计划带 blockers（不崩溃），并且不启动线程
             res = apply_system_command(state, {
                 "pending_action": {"type": "propose_gee", "task": "p1",

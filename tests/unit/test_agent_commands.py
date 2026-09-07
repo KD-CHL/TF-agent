@@ -26,6 +26,20 @@ from agent_command_bridge import (  # noqa: E402
 )
 
 
+def test_change_map_view_emits_canonical_lat_lon():
+    import agent
+
+    raw = agent.change_map_view.invoke({
+        "location_name": "杭州湾",
+        "lat": 30.5,
+        "lon": 120.8,
+        "zoom": 9,
+    })
+    assert '"lat": 30.5' in raw
+    assert '"lon": 120.8' in raw
+    assert '"center"' not in raw
+
+
 def _base_state() -> dict:
     s: dict = {}
     init_ui_session_defaults(s)
@@ -39,6 +53,22 @@ def _base_state() -> dict:
 
 
 class TestParseSystemCommand(unittest.TestCase):
+    def test_pure_system_command_blocks_never_return_raw_reply(self):
+        """Command-only replies are consumed; callers must use their safe placeholder."""
+        replies = [
+            '[SYSTEM_COMMAND_JSON]{"map":{"lat":30.5,"lon":120.8,"zoom":9}}[/SYSTEM_COMMAND_JSON]',
+            '[SYSTEM_COMMAND_JSON]{"map":{"center":[38.9126,121.6174],"zoom":8,"bounds":[[38.0,120.5],[39.8,122.7]]}}[/SYSTEM_COMMAND_JSON]',
+            '[SYSTEM_COMMAND_JSON]{"pending_action":{"type":"run_pipeline","task":"24zhejiang1"}}[/SYSTEM_COMMAND_JSON]',
+        ]
+        for reply in replies:
+            for apply in (process_agent_reply, apply_agent_reply_immediate):
+                state = {}
+                _result, clean = apply(state, reply)
+                self.assertEqual(clean, "")
+                self.assertNotIn("SYSTEM_COMMAND_JSON", clean)
+                self.assertNotIn("30.5", clean)
+                self.assertNotIn("120.8", clean)
+
     def test_json_block(self):
         raw = '好的。\n[SYSTEM_COMMAND_JSON]\n{"map":{"lat":30.2,"lon":121.5,"zoom":11}}\n[/SYSTEM_COMMAND_JSON]'
         cmd = parse_system_command(raw)
@@ -63,11 +93,103 @@ class TestParseSystemCommand(unittest.TestCase):
         self.assertEqual(state["_pending_camera_fly"]["lat"], 30.4)
         self.assertEqual(state["_pending_camera_fly"]["lon"], 121.8)
 
+    def test_center_bounds_json_reaches_pending_camera_fly(self):
+        state = {}
+        reply = (
+            '[SYSTEM_COMMAND_JSON]'
+            '{"map":{"center":[38.9126,121.6174],"zoom":8,'
+            '"bounds":[[38.0,120.5],[39.8,122.7]]}}'
+            '[/SYSTEM_COMMAND_JSON]'
+        )
+        result, _ = apply_agent_reply_immediate(state, reply)
+        self.assertTrue(result.map_updated)
+        self.assertEqual(state["map_center"], [38.9126, 121.6174])
+        self.assertEqual(
+            state["_pending_camera_fly"]["bounds"],
+            {"west": 120.5, "south": 38.0, "east": 122.7, "north": 39.8},
+        )
+
+    def test_unclosed_system_command_is_rejected_and_stripped(self):
+        state = {}
+        reply = '请定位。 [SYSTEM_COMMAND_JSON]{"map":{"lat":30.2'
+
+        result, clean = process_agent_reply(state, reply)
+
+        self.assertFalse(result.applied)
+        self.assertTrue(result.errors)
+        self.assertNotIn("SYSTEM_COMMAND_JSON", clean)
+        self.assertEqual(clean, "请定位。")
+        self.assertEqual(state, {})
+
+    def test_trailing_unclosed_system_command_is_rejected_and_stripped(self):
+        state = {}
+        reply = (
+            '[SYSTEM_COMMAND_JSON]{"map":{"lat":30.2,"lon":121.5}}'
+            '[/SYSTEM_COMMAND_JSON] 请定位。 '
+            '[SYSTEM_COMMAND_JSON]{"map":{"lat":31.0'
+        )
+
+        result, clean = process_agent_reply(state, reply)
+
+        self.assertFalse(result.applied)
+        self.assertTrue(result.errors)
+        self.assertNotIn("SYSTEM_COMMAND_JSON", clean)
+        self.assertEqual(clean, "请定位。")
+        self.assertEqual(state, {})
+
+    def test_immediate_invalid_bounds_warns_and_preserves_center_navigation(self):
+        state = {}
+        reply = (
+            '[SYSTEM_COMMAND_JSON]'
+            '{"map":{"lat":30.2,"lon":121.5,"zoom":8,'
+            '"bounds":[[31.0,122.0],[30.0,121.0]]}}'
+            '[/SYSTEM_COMMAND_JSON]'
+        )
+
+        result, _ = apply_agent_reply_immediate(state, reply)
+
+        self.assertTrue(result.map_updated)
+        self.assertTrue(result.errors)
+        self.assertEqual(state["map_center"], [30.2, 121.5])
+        self.assertNotIn("bounds", state["_pending_camera_fly"])
+
+    def test_camera_options_reach_pending_camera_fly(self):
+        state = {}
+        reply = (
+            '[SYSTEM_COMMAND_JSON]'
+            '{"map":{"lat":30.2,"lon":121.5,"zoom":8,'
+            '"height":1000,"duration":2.5,"pitch":-45,"heading":90}}'
+            '[/SYSTEM_COMMAND_JSON]'
+        )
+
+        result, _ = apply_agent_reply_immediate(state, reply)
+
+        self.assertTrue(result.map_updated)
+        self.assertEqual(
+            {key: state["_pending_camera_fly"][key] for key in ("height", "duration", "pitch", "heading")},
+            {"height": 1000.0, "duration": 2.5, "pitch": -45.0, "heading": 90.0},
+        )
+
     def test_legacy_pipeline(self):
         raw = "COMMAND_RUN_PIPELINE|24zhejiang1|0.05|2"
         cmd = parse_system_command(raw)
         self.assertEqual(cmd["sidebar_states"]["selected_task"], "24zhejiang1")
         self.assertEqual(cmd["pending_action"]["type"], "run_pipeline")
+
+    def test_map_adapter_source_is_internal_side_channel(self):
+        canonical = '[SYSTEM_COMMAND_JSON]{"map":{"lat":30.5,"lon":120.8}}[/SYSTEM_COMMAND_JSON]'
+        canonical_cmd = parse_system_command(canonical)
+        self.assertEqual(canonical_cmd["_map_adapter_source"], "payload")
+
+        legacy_cmd = parse_system_command("COMMAND_UPDATE_MAP|30.5|120.8|9")
+        self.assertEqual(legacy_cmd["_map_adapter_source"], "legacy_text")
+
+        state = {}
+        apply_agent_reply_immediate(state, canonical)
+        self.assertEqual(state["_pending_camera_fly"]["source"], "payload")
+        state = {}
+        apply_agent_reply_immediate(state, "COMMAND_UPDATE_MAP|30.5|120.8|9")
+        self.assertEqual(state["_pending_camera_fly"]["source"], "legacy_text")
 
     def test_irrelevant_text_returns_none(self):
         self.assertIsNone(parse_system_command("今天天气不错"))
@@ -86,6 +208,34 @@ class TestCommandSchemaBoundary(unittest.TestCase):
         result = apply_system_command(state, {"debug": True})
         self.assertFalse(result.applied)
         self.assertEqual(state, {})
+
+    def test_unknown_map_field_is_rejected_before_state_mutation(self):
+        state = {"sentinel": "keep"}
+        result = apply_system_command(
+            state,
+            {"map": {"lat": 30.2, "lon": 121.5, "zoom": 8, "unrecognized": True}},
+        )
+        self.assertFalse(result.applied)
+        self.assertTrue(result.errors)
+        self.assertEqual(state, {"sentinel": "keep"})
+
+    def test_invalid_bounds_warns_and_preserves_center_navigation(self):
+        state = {}
+        result = apply_system_command(
+            state,
+            {
+                "map": {
+                    "lat": 30.2,
+                    "lon": 121.5,
+                    "zoom": 8,
+                    "bounds": [[31.0, 122.0], [30.0, 121.0]],
+                }
+            },
+        )
+        self.assertTrue(result.map_updated)
+        self.assertTrue(result.errors)
+        self.assertEqual(state["map_center"], [30.2, 121.5])
+        self.assertNotIn("bounds", state["_pending_camera_fly"])
 
     def test_unknown_action_type_is_rejected_before_queue(self):
         state = {}
@@ -281,7 +431,10 @@ class TestWorkflowPreflightBridge(unittest.TestCase):
             state = _base_state()
             with mock.patch.object(
                 wo, "validate_analysis_workflow", wraps=wo.validate_analysis_workflow
-            ) as validator:
+            ) as validator, mock.patch(
+                "agent_command_bridge._workflow_capability_statuses",
+                return_value={"gee_download": "BLOCKED"},
+            ):
                 plan, _ = propose_workflow_plan(state, self._workflow_action(td))
 
             self.assertTrue(validator.called)
@@ -367,8 +520,8 @@ class TestScenarioExamples(unittest.TestCase):
         result, clean = process_agent_reply(state, reply)
         self.assertTrue(result.applied)
         self.assertTrue(result.queued)
+        self.assertEqual(clean, "")
         flush_pending_agent_commands(state)
-        self.assertIn("24zhejiang", clean or "ok")
         self.assertEqual(state["pending_task"]["mode"], "dl")
 
 
