@@ -431,7 +431,10 @@ class TestWorkflowPreflightBridge(unittest.TestCase):
             state = _base_state()
             with mock.patch.object(
                 wo, "validate_analysis_workflow", wraps=wo.validate_analysis_workflow
-            ) as validator:
+            ) as validator, mock.patch(
+                "agent_command_bridge._workflow_capability_statuses",
+                return_value={"gee_download": "BLOCKED"},
+            ):
                 plan, _ = propose_workflow_plan(state, self._workflow_action(td))
 
             self.assertTrue(validator.called)
