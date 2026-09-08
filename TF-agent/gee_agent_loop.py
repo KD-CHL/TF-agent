@@ -788,8 +788,16 @@ def execute_gee_download(
         def on_task_started(task_obj: Any) -> None:
             """drive 模式：捕获每个 ee.batch.Task 的 id/description/开始时间。"""
             try:
-                tid = str(task_obj.id)
-                desc = str(task_obj.description or "")
+                tid = str(getattr(task_obj, "id", None)
+                          or (getattr(task_obj, "config", None) or {}).get("taskId")
+                          or "")
+                if not tid:
+                    warnings.append("GEE 任务已启动但无法获取 task id（api 版本差异）。")
+                    push_log("[GEE] ⚠️ 任务已启动但 id 为空，跳过账本记录。")
+                    return
+                desc = str(getattr(task_obj, "description", None)
+                           or (getattr(task_obj, "config", None) or {}).get("description")
+                           or "")
                 _ledger_upsert(task_id, plan_id=plan_id, gee_task_id=tid,
                                status="READY", description=desc,
                                export_to="drive", created_at=_now_str())
