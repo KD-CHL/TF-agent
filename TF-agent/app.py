@@ -2851,6 +2851,42 @@ st.markdown("""
         padding: 0 !important;
         overflow: hidden !important;
     }
+    /* Only the drawer scrolls: stretch containers grow with their contents
+       and get clipped by the fixed-height workbench. Keep the native scroll
+       viewport and its wrapper on the same drag-controlled height budget. */
+    :root {
+        --cstf-status-drawer-h: max(0px, min(
+            calc(var(--cstf-status-panel-reserve, 228px) - 8px),
+            calc(var(--workbench-h) - 288px)
+        ));
+    }
+    div[data-testid="stColumn"]:has(.cockpit-map-col) > div[data-testid="stVerticalBlock"] > [data-testid="stLayoutWrapper"]:has(> .st-key-map_status_drawer),
+    .st-key-map_status_drawer {
+        flex: 0 0 auto !important;
+        height: var(--cstf-status-drawer-h) !important;
+        max-height: var(--cstf-status-drawer-h) !important;
+        min-height: 0 !important;
+        min-width: 0 !important;
+    }
+    .st-key-map_status_drawer {
+        overflow-y: auto !important;
+        overflow-x: hidden !important;
+        overscroll-behavior-y: contain;
+        scrollbar-gutter: stable;
+        scroll-padding-block: 12px;
+        padding: 12px !important;
+    }
+    .st-key-map_status_drawer [data-testid="stMarkdownContainer"] {
+        overflow-wrap: anywhere;
+    }
+    .st-key-task_terminal_log {
+        overscroll-behavior-y: auto;
+    }
+    .st-key-task_terminal_log [data-testid="stCode"] pre,
+    .st-key-task_terminal_log [data-testid="stCode"] code {
+        white-space: pre-wrap !important;
+        overflow-wrap: anywhere !important;
+    }
     .cstf-layout-defaults {
         display: none !important;
         width: 0 !important;
@@ -4860,7 +4896,7 @@ try:
     _status_panel_height = int(st.session_state.get("agent_status_panel_height", 220))
 except (TypeError, ValueError):
     _status_panel_height = 220
-_status_panel_height = max(140, min(340, _status_panel_height))
+_status_panel_height = max(140, min(384, _status_panel_height))
 st.session_state.agent_status_panel_height = _status_panel_height
 _status_panel_collapsed = bool(st.session_state.get("agent_status_panel_collapsed", False))
 # 地图下方预留状态工具栏 + 可调状态区；收起时只保留工具栏。
@@ -5357,35 +5393,6 @@ with col_map:
         _safe_raster_error = sanitize_external_text(raster_load_error)[:240]
         st.toast(f"成果图层加载异常: {_safe_raster_error}", icon="⚠️")
 
-    # Diagnostic values are intentionally ephemeral.  The panel is collapsed
-    # by default and shows only rounded camera data plus protocol/platform
-    # identifiers; durable logging uses _remember_map_diagnostics' projection.
-    with st.expander("🛰️ 地图加载诊断", expanded=False):
-        _diag = _map_runtime_diagnostics()
-        if raster_load_error:
-            st.warning(f"错误摘要：{sanitize_external_text(raster_load_error)[:240]}")
-        _diag_rows = (
-            ("指令来源", _diag.get("command_source", "unknown")),
-            ("中心/缩放（四舍五入）", f"{_diag.get('center', '不可用')} · zoom={_diag.get('zoom', '不可用')}"),
-            ("bounds 有效性", _diag.get("bounds_valid", "未提供")),
-            ("模型/后端", f"{_diag.get('model', 'unknown')} / {_diag.get('backend', 'unknown')}"),
-            ("Globe 端口", _diag.get("globe_port", "—")),
-            ("iframe origin", _diag.get("iframe_origin", "不可用")),
-            ("READY 时间", _diag.get("ready_ts") or "未收到"),
-            ("ACK command_id", _diag.get("ack_command_id", "—")),
-            ("ACK navigation_seq", _diag.get("ack_navigation_seq", "—")),
-            ("channel / targetOrigin", f"{_diag.get('channel', 'default')} / {_diag.get('target_origin', '不可用')}"),
-            ("确认 / AOI / 自动适配 / 2D fallback", f"{_diag.get('confirmation', '未提供')} / {_diag.get('aoi', '已启用')} / {bool(_diag.get('auto_fit'))} / {bool(_diag.get('fallback_2d'))}"),
-        )
-        for _label, _value in _diag_rows:
-            st.caption(f"{_label}：{sanitize_external_text(_value)}")
-        for _warning in (_diag.get("warnings") or []):
-            st.caption(f"适配告警：{sanitize_external_text(_warning)}")
-        st.caption("诊断仅临时显示；持久化日志仅保留坐标存在性、范围结果与哈希。")
-        if raster_load_error and st.button("切换为 2D 地图并重试", key="btn_force_2d_map"):
-            st.session_state.use_2d_map_fallback = True
-            st.rerun()
-
     # 任务状态和终端日志位于地图下方，不再占用右侧 Agent Dock。
     st.markdown('<div class="cstf-map-status-zone"></div>', unsafe_allow_html=True)
     _status_toolbar_c1, _status_toolbar_c2 = st.columns([6, 1], gap="small")
@@ -5405,7 +5412,36 @@ with col_map:
             st.session_state.agent_status_panel_collapsed = not _status_panel_collapsed
             st.rerun()
     if not _status_panel_collapsed:
-        _log_panel_slot = st.container(height="stretch", border=True)
+        with st.container(height=_status_panel_height, border=True, key="map_status_drawer"):
+            _log_panel_slot = st.container()
+            # Diagnostics share the drawer's scroll budget instead of adding
+            # an unaccounted row between the map and the task monitor.
+            # Values remain ephemeral; durable logging uses the projection.
+            with st.expander("🛰️ 地图加载诊断", expanded=False):
+                _diag = _map_runtime_diagnostics()
+                if raster_load_error:
+                    st.warning(f"错误摘要：{sanitize_external_text(raster_load_error)[:240]}")
+                _diag_rows = (
+                    ("指令来源", _diag.get("command_source", "unknown")),
+                    ("中心/缩放（四舍五入）", f"{_diag.get('center', '不可用')} · zoom={_diag.get('zoom', '不可用')}"),
+                    ("bounds 有效性", _diag.get("bounds_valid", "未提供")),
+                    ("模型/后端", f"{_diag.get('model', 'unknown')} / {_diag.get('backend', 'unknown')}"),
+                    ("Globe 端口", _diag.get("globe_port", "—")),
+                    ("iframe origin", _diag.get("iframe_origin", "不可用")),
+                    ("READY 时间", _diag.get("ready_ts") or "未收到"),
+                    ("ACK command_id", _diag.get("ack_command_id", "—")),
+                    ("ACK navigation_seq", _diag.get("ack_navigation_seq", "—")),
+                    ("channel / targetOrigin", f"{_diag.get('channel', 'default')} / {_diag.get('target_origin', '不可用')}"),
+                    ("确认 / AOI / 自动适配 / 2D fallback", f"{_diag.get('confirmation', '未提供')} / {_diag.get('aoi', '已启用')} / {bool(_diag.get('auto_fit'))} / {bool(_diag.get('fallback_2d'))}"),
+                )
+                for _label, _value in _diag_rows:
+                    st.caption(f"{_label}：{sanitize_external_text(_value)}")
+                for _warning in (_diag.get("warnings") or []):
+                    st.caption(f"适配告警：{sanitize_external_text(_warning)}")
+                st.caption("诊断仅临时显示；持久化日志仅保留坐标存在性、范围结果与哈希。")
+                if raster_load_error and st.button("切换为 2D 地图并重试", key="btn_force_2d_map"):
+                    st.session_state.use_2d_map_fallback = True
+                    st.rerun()
 
 with col_side:
     st.markdown('<div class="command-deck-side">', unsafe_allow_html=True)
@@ -7358,7 +7394,7 @@ def _pipeline_monitor_inner(render: bool = True):
                     st.rerun()
 
     st.markdown('<div class="deck-section-title">🖥️ 系统终端日志</div>', unsafe_allow_html=True)
-    with st.container(height=LOG_PANEL_HEIGHT, border=False):
+    with st.container(height=LOG_PANEL_HEIGHT, border=False, key="task_terminal_log"):
         if lines:
             st.code("\n".join(lines), language="bash")
         elif st.session_state.is_running:
@@ -7865,7 +7901,9 @@ components.html(
       const syncWorkbenchHeight = () => {
         const header = doc.querySelector('[data-testid="stHeader"]');
         const headerH = header ? header.offsetHeight : 56;
-        const h = Math.max(480, win.innerHeight - headerH - 6);
+        const row = doc.querySelector('div[data-testid="stHorizontalBlock"]:has(.cockpit-map-col)');
+        const top = Math.max(headerH, row?.getBoundingClientRect().top || headerH);
+        const h = Math.max(280, win.innerHeight - top - 12);
         const px = h + "px";
         const reserve = parseFloat(
           win.getComputedStyle(doc.documentElement).getPropertyValue("--cstf-status-panel-reserve")
@@ -7910,8 +7948,9 @@ components.html(
               if (canScroll(el)) {
                 const top = el.scrollTop <= 0;
                 const bottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 1;
-                if ((e.deltaY < 0 && top) || (e.deltaY > 0 && bottom)) e.preventDefault();
-                return;
+                // At a nested log's boundary, let the enclosing drawer take
+                // the wheel before preventing scroll on the fixed page.
+                if ((e.deltaY < 0 && !top) || (e.deltaY > 0 && !bottom)) return;
               }
               el = el.parentElement;
             }
@@ -7990,7 +8029,8 @@ components.html(
           if (!nodes.mapCol) return;
           const header = doc.querySelector('[data-testid="stHeader"]');
           const headerH = header ? header.offsetHeight : 56;
-          const workbenchH = Math.max(480, win.innerHeight - headerH - 6);
+          const top = Math.max(headerH, nodes.row?.getBoundingClientRect().top || headerH);
+          const workbenchH = Math.max(280, win.innerHeight - top - 12);
           const reserve = getReserve();
           const mapH = Math.max(280, workbenchH - reserve);
           doc.documentElement.style.setProperty("--workbench-h", workbenchH + "px");
@@ -8149,7 +8189,10 @@ components.html(
           }
           moveEvent.preventDefault();
         };
-        stop = () => {
+        stop = (stopEvent) => {
+          // Focusing the separator blurs the previously focused control.
+          // Only leaving the browser window should cancel the active drag.
+          if (stopEvent?.type === "blur" && stopEvent.target !== win) return;
           if (drag) {
             if (drag.kind === "dock") {
               setLayoutParam("cstf_agent_w", drag.currentPct);
@@ -8326,7 +8369,8 @@ components.html(
               if (!nodes.mapCol) return;
               const header = doc.querySelector('[data-testid="stHeader"]');
               const headerH = header ? header.offsetHeight : 56;
-              const workbenchH = Math.max(480, win.innerHeight - headerH - 6);
+              const top = Math.max(headerH, nodes.row?.getBoundingClientRect().top || headerH);
+              const workbenchH = Math.max(280, win.innerHeight - top - 12);
               const reserve = getReserve();
               const mapH = Math.max(280, workbenchH - reserve);
               doc.documentElement.style.setProperty("--workbench-h", workbenchH + "px");
