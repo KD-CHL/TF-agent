@@ -4753,8 +4753,12 @@ with st.sidebar:
             try:
                 from agent_command_bridge import propose_gee_plan as _propose_manual_gee
 
+                # The bridge normalizes UI defaults and the region name. Use
+                # a snapshot because those widgets are already instantiated
+                # in this run; only publish the resulting execution plan.
+                _manual_gee_state = dict(st.session_state)
                 _manual_gee_plan, _manual_gee_errors = _propose_manual_gee(
-                    st.session_state,
+                    _manual_gee_state,
                     {
                         "task": selected_task or m4_roi_name,
                         "roi_name": m4_roi_name,
@@ -4773,15 +4777,12 @@ with st.sidebar:
                         "gee_project_id": (m4_gee_project or "").strip(),
                     },
                 )
-                if _manual_gee_plan.get("ready"):
-                    st.info("已生成影像获取计划，请在下方确认后执行。")
-                else:
-                    st.warning("影像获取计划暂不可执行，请先修复以下条件：")
-                for _plan_error in _manual_gee_errors or _manual_gee_plan.get("blockers") or []:
-                    st.caption(f"· {_plan_error}")
+                st.session_state["_gee_pending_plan"] = _manual_gee_plan
+                st.session_state["_gee_plan_confirmed"] = set()
             except Exception as _manual_gee_exc:
                 st.error(f"影像获取计划生成失败：{type(_manual_gee_exc).__name__}")
-            st.rerun()
+            else:
+                st.rerun()
 
     if run_btn:
         if cache_hit and not force_rerun:

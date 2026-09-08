@@ -52,6 +52,34 @@ def _button(at, label: str):
     return next(button for button in at.button if button.label == label)
 
 
+def test_manual_gee_click_creates_plan_after_widgets_render(tmp_path, monkeypatch):
+    import json
+    roi = tmp_path / "roi.geojson"
+    roi.write_text(json.dumps({"type": "FeatureCollection", "features": [{
+        "type": "Feature", "properties": {}, "geometry": {
+            "type": "Polygon", "coordinates": [[[121, 30], [121.01, 30],
+                [121.01, 30.01], [121, 30.01], [121, 30]]]} }]}))
+    at = _run_app(tmp_path, monkeypatch)
+    at.session_state["ui_workflow"] = "GEE 数据下载"
+    at.session_state["ui_m4_roi_path"] = str(roi)
+    at.session_state["ui_m4_roi_name"] = "test-region"
+    at.run(timeout=60)
+    _button(at, "开始获取影像").click().run(timeout=60)
+    assert not at.exception
+    assert isinstance(at.session_state.filtered_state.get("_gee_pending_plan"), dict)
+    assert not _button(at, "确认下载影像").disabled
+    assert at.session_state["ui_m4_roi_name"] == "test-region"
+    assert not at.session_state["is_running"]  # still requires explicit confirmation
+
+    # An unexpected planning failure must remain visible, not disappear in a rerun.
+    import agent_command_bridge
+    def fail_plan(*args, **kwargs):
+        raise ValueError("test planning failure")
+    monkeypatch.setattr(agent_command_bridge, "propose_gee_plan", fail_plan)
+    _button(at, "开始获取影像").click().run(timeout=60)
+    assert any("ValueError" in item.value for item in at.error)
+
+
 def test_root_shell_and_conversation_controls_render_without_credentials(tmp_path, monkeypatch):
     at = _run_app(tmp_path, monkeypatch)
     assert not at.exception
