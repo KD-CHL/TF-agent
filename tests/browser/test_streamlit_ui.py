@@ -96,6 +96,110 @@ def _free_port() -> int:
 
 
 @pytest.mark.external
+@pytest.mark.parametrize("simulate_translation", [False, True])
+def test_clearing_image_directory_survives_browser_translation(tmp_path, simulate_translation):
+    """A translator must not replace React text nodes before a directory rerun."""
+    if os.environ.get("RUN_EXTERNAL_ACCEPTANCE") != "1" or os.environ.get("RUN_BROWSER_ACCEPTANCE") != "1":
+        pytest.skip("browser acceptance is opt-in")
+    playwright = pytest.importorskip("playwright.sync_api")
+    image_root = tmp_path / "images"
+    (image_root / "task-a").mkdir(parents=True)
+    env = os.environ.copy()
+    env.update({
+        "CSTF_CONVERSATION_DB_PATH": str(tmp_path / "conversations.sqlite3"),
+        "CSTF_JOB_DB_PATH": str(tmp_path / "jobs.sqlite3"),
+        "CSTF_TIMELINE_LEDGER_PATH": str(tmp_path / "timeline.json"),
+        "CSTF_CHAT_PREVIEW_DIR": str(tmp_path / "previews"),
+    })
+    port = _free_port()
+    process = subprocess.Popen(
+        [sys.executable, "-m", "streamlit", "run", str(APP),
+         "--server.headless", "true", "--server.address", "127.0.0.1",
+         "--server.port", str(port), "--server.fileWatcherType", "none"],
+        cwd=str(ROOT), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        with playwright.sync_playwright() as browser_api:
+            browser = browser_api.chromium.launch(headless=True, args=["--no-proxy-server"])
+            page = browser.new_page(viewport={"width": 1600, "height": 1000})
+            errors = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            # React error boundaries catch this exception; it may reach only
+            # console.error, without a Playwright pageerror event.
+            page.on("console", lambda msg: errors.append(msg.text)
+                    if msg.type == "error" and "removeChild" in msg.text else None)
+            deadline = time.monotonic() + 35
+            while True:
+                try:
+                    page.goto(f"http://127.0.0.1:{port}/", wait_until="domcontentloaded", timeout=3000)
+                    break
+                except Exception:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.25)
+            raw = page.get_by_role("textbox", name="原始影像目录", exact=True)
+            raw.wait_for(timeout=30000)
+            page.get_by_text("获取卫星影像", exact=True).first.click()
+            folder = page.get_by_role("textbox", name="云端文件夹 / 任务子目录名")
+            folder.wait_for(timeout=15000)
+            caption = page.locator('[data-testid="stCaptionContainer"]').filter(
+                has_text="本地提取目录建议"
+            )
+            for _ in range(2):
+                raw.fill(str(image_root))
+                raw.press("Enter")
+                playwright.expect(page.get_by_role("combobox", name="目标任务")).to_be_visible()
+                playwright.expect(caption).to_contain_text(str(image_root))
+                folder.fill("")
+                folder.press("Enter")
+                playwright.expect(caption.locator("code")).to_have_text(str(image_root) + os.sep)
+                if simulate_translation:
+                    caption.evaluate("""el => {
+                        // Reproduce translator replacement of mixed-content
+                        // text siblings while respecting HTML translation opt-out.
+                        for (const text of [...el.querySelector('p').childNodes]) {
+                            if (text.nodeType !== Node.TEXT_NODE) continue;
+                            const parent = text.parentElement;
+                            if (!parent.translate || parent.closest('.notranslate')) continue;
+                            const translated = document.createElement('font');
+                            translated.textContent = text.textContent;
+                            parent.replaceChild(translated, text);
+                        }
+                    }""")
+                raw.fill("")
+                raw.press("Enter")
+                page.wait_for_function("""() =>
+                    document.body.innerText.includes('NotFoundError') ||
+                    [...document.querySelectorAll('[data-testid="stCaptionContainer"]')]
+                        .some(el => el.textContent.includes('本地提取目录建议') && !el.querySelector('code'))
+                """, timeout=15000)
+                assert not errors, errors
+                assert "NotFoundError" not in page.locator("body").inner_text()
+                playwright.expect(page.get_by_role("combobox", name="目标任务")).to_have_count(0)
+                playwright.expect(page.get_by_text("未发现可用任务", exact=True)).to_be_visible()
+                playwright.expect(page.get_by_role("textbox", name="chat_input")).to_be_visible()
+
+            page.get_by_text("潮滩智能提取", exact=True).first.click()
+            playwright.expect(folder).to_have_count(0)
+            page.get_by_text("获取卫星影像", exact=True).first.click()
+            playwright.expect(folder).to_be_visible()
+            assert not errors, errors
+            browser.close()
+    except Exception as exc:
+        if "executable doesn't exist" in str(exc).lower():
+            pytest.skip("Playwright Chromium executable is not installed")
+        raise
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+
+
+@pytest.mark.external
 def test_chat_attachment_state_stays_clear_and_uses_only_custom_tooltip():
     """发送完成后旧文件名不能回流，加号也不能叠加浏览器原生 title。"""
     if os.environ.get("RUN_EXTERNAL_ACCEPTANCE") != "1" or os.environ.get("RUN_BROWSER_ACCEPTANCE") != "1":

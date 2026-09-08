@@ -2117,6 +2117,31 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# Browser translation can replace React-owned Text nodes with <font> elements.
+# A later rerun (for example, clearing a path in a Markdown caption) then fails
+# with removeChild/NotFoundError. Opt the Chinese UI out before rendering it;
+# change only document attributes/metadata, never React's children or DOM APIs.
+components.html(
+    """
+    <script>
+    (() => {
+      const doc = (window.parent || window).document;
+      doc.documentElement.lang = "zh-CN";
+      doc.documentElement.setAttribute("translate", "no");
+      doc.documentElement.classList.add("notranslate");
+      let meta = doc.head.querySelector('meta[name="google"]');
+      if (!meta) {
+        meta = doc.createElement("meta");
+        meta.name = "google";
+        doc.head.appendChild(meta);
+      }
+      meta.content = "notranslate";
+    })();
+    </script>
+    """,
+    height=0,
+)
+
 # 🌟 初始化系统状态：控制运行/中断的红绿灯
 if "is_running" not in st.session_state:
     st.session_state.is_running = False
