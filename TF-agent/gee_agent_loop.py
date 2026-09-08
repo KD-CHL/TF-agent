@@ -899,7 +899,8 @@ def execute_gee_download(
 
         elapsed = round(time.time() - started, 2)
         pct(100)
-        push_log(f"[GEE] 下载完成（{export_state}），scene_count={scene_count}，耗时 {elapsed}s。")
+        operation = "云端导出已提交" if export_to == "drive" else "下载完成"
+        push_log(f"[GEE] {operation}（{export_state}），scene_count={scene_count}，耗时 {elapsed}s。")
 
         _ledger_upsert(task_id, plan_id=plan_id, status=export_state, export_to=export_to)
 
@@ -997,6 +998,61 @@ def _gee_failure(task_id: str, plan_id: str, error: str, *,
 # =======================================================
 #  5. 本地输出验证（B8）：GEE_EXPORT_COMPLETED ≠ LOCAL_ASSET_READY
 # =======================================================
+def monitor_drive_export(result, stop_event, on_status, *, poll_fn=None, interval=10):
+    """Observe existing cloud tasks only; never resubmit or certify local assets."""
+    poll = poll_fn or _poll_gee_task_status
+    ids = list(dict.fromkeys((result.get("outputs") or {}).get("gee_task_ids") or []))
+    last = None
+
+    def emit(status, message):
+        nonlocal last
+        outcome = {"status": status, "message": message}
+        if outcome != last:
+            on_status(outcome)
+            last = outcome
+        return outcome
+
+    if not ids:
+        return emit("UNKNOWN", "云端任务ID未获取，无法确认导出状态；请到GEE后台核查，勿重复提交。")
+    emit("SUBMITTED", f"已提交 {len(ids)} 个云端导出任务，正在查询状态。")
+    unknown_count = 0
+    while True:
+        states = []
+        for task_id in ids:
+            try:
+                state = poll(task_id) or {"state": "UNKNOWN"}
+            except Exception:
+                state = {"state": "UNKNOWN"}
+            states.append(state)
+        names = [str(s.get("state") or "UNKNOWN").upper() for s in states]
+        result["cloud_tasks"] = states
+        if "FAILED" in names:
+            result["export_state"] = "FAILED"
+            detail = next((s.get("error_message") for s in states
+                           if s.get("state") == "FAILED" and s.get("error_message")), "云端导出任务失败")
+            result["error"] = safe_error_summary(RuntimeError(str(detail)))
+            return emit("FAILED", f"云端导出失败：{result['error']}；其他任务可能仍在运行，请核查GEE后台。")
+        if "CANCELLED" in names or "CANCEL_REQUESTED" in names:
+            result["export_state"] = "CANCELLED"
+            return emit("CANCELLED", "云端导出任务已取消或正在取消；请核查其他任务状态。")
+        if all(s == "COMPLETED" for s in names):
+            result["export_state"] = "COMPLETED"
+            return emit("WAITING_SYNC", "云端导出完成，待从Google Drive同步到本地；本地影像尚未校验，未登记为可提取数据。")
+        if any(s not in {"READY", "RUNNING", "COMPLETED"} for s in names):
+            unknown_count += 1
+            emit("UNKNOWN", "暂时无法确认云端状态，正在重试；这不代表导出失败。")
+            if unknown_count >= 3:
+                return emit("UNKNOWN", "连续查询未能确认云端状态；请到GEE后台核查，勿重复提交。")
+        else:
+            unknown_count = 0
+            running = "RUNNING" in names or "COMPLETED" in names
+            result["export_state"] = "RUNNING" if running else "READY"
+            emit("RUNNING" if running else "SUBMITTED",
+                 f"云端{'运行中' if running else '已提交，排队中'}：{names.count('COMPLETED')}/{len(ids)} 个任务已完成。")
+        if stop_event.wait(interval):
+            return emit("UNKNOWN", "已停止本地状态跟踪；云端任务未由此取消，请到GEE后台核查。")
+
+
 def verify_gee_outputs(
     plan: Dict[str, Any],
     result: Dict[str, Any],

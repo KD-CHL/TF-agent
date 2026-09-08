@@ -2068,9 +2068,32 @@ def _gee_worker_entry(ctx, shared, stop_event):
                 shared["gee_result"] = result or {}
             return
 
+        if str(plan.get("export_to") or "").lower() == "drive":
+            def cloud_status(outcome):
+                kind = "error" if outcome["status"] == "FAILED" else "info"
+                push_status(kind, outcome["message"])
+                push_log(outcome["message"])
+                with shared["lock"]:
+                    shared["gee_cloud_outcome"] = outcome
+                    shared.setdefault("gee_cloud_events", []).append(dict(outcome))
+                    shared["progress"] = 100 if outcome["status"] == "WAITING_SYNC" else 0
+
+            outcome = gal.monitor_drive_export(result, stop_event, cloud_status)
+            with shared["lock"]:
+                shared["gee_result"] = result
+            if outcome["status"] != "WAITING_SYNC":
+                return
+            # A completed Drive export is not proof that local files exist.
+            # Keep strict local validation, but report missing synchronization
+            # separately from a cloud export failure.
+            if not (result.get("outputs") or {}).get("local_tifs"):
+                return
+
         push_status("info", "下载结束，正在校验成果…")
         verification = gal.verify_gee_outputs(plan, result, started_at=started)
         if not verification or verification.get("ok") is not True:
+            with shared["lock"]:
+                shared.pop("gee_cloud_outcome", None)
             failed = [c.get("name") for c in (verification or {}).get("checks") or []
                       if not c.get("passed")]
             push_status("error", f"❌ 成果校验未通过: {', '.join(failed) or '未知'}")
@@ -2081,6 +2104,8 @@ def _gee_worker_entry(ctx, shared, stop_event):
 
         asset_id = gal.register_gee_dataset_asset(plan, result, verification)
         if not asset_id:
+            with shared["lock"]:
+                shared.pop("gee_cloud_outcome", None)
             push_status("error", "❌ 校验通过但资产登记失败（未登记数据集）。")
             with shared["lock"]:
                 shared["gee_result"] = result
@@ -2099,6 +2124,8 @@ def _gee_worker_entry(ctx, shared, stop_event):
             shared["progress"] = 100
         ok = True
     except Exception as e:
+        with shared["lock"]:
+            shared.pop("gee_cloud_outcome", None)
         _record_worker_exception(shared, "GEE 下载线程异常", e)
         ok = False
     finally:
@@ -6581,6 +6608,7 @@ def finalize_background_pipeline():
     gee_result = shared.get("gee_result") if shared else None
     gee_verification = shared.get("gee_verification") if shared else None
     gee_dataset_id = shared.get("dataset_id") if shared else None
+    gee_cloud_outcome = shared.get("gee_cloud_outcome") if shared else None
     if gee_result is not None or gee_dataset_id:
         _gv_ok = bool(gee_verification and gee_verification.get("ok") is True)
         if success and _gv_ok:
@@ -6615,6 +6643,22 @@ def finalize_background_pipeline():
                 st.session_state._cap_snapshot_injected = False
             except Exception:
                 pass
+        elif gee_cloud_outcome and not _job_was_stopped:
+            _cloud_state = gee_cloud_outcome["status"]
+            _cloud_message = gee_cloud_outcome["message"]
+            _cloud_timeline_status = {
+                "FAILED": "FAILED", "CANCELLED": "CANCELLED",
+                "WAITING_SYNC": "WARNING", "UNKNOWN": "WARNING",
+            }.get(_cloud_state, "RUNNING")
+            if _cloud_state == "WAITING_SYNC":
+                _tl_add(_tl_task, "GEE_EXPORT", "云端导出已完成（全部任务COMPLETED）",
+                        status="SUCCEEDED", tool="run_gee_download")
+            _tl_add(_tl_task, "VERIFY" if _cloud_state == "WAITING_SYNC" else "GEE_EXPORT", _cloud_message,
+                    status=_cloud_timeline_status, tool="run_gee_download",
+                    error=_cloud_message if _cloud_state == "FAILED" else None)
+            st.session_state.messages = list(st.session_state.get("messages") or [])
+            st.session_state.messages.append({"role": "assistant", "content": _cloud_message})
+            st.session_state["_gee_last_summary"] = _cloud_message
         else:
             _err = (gee_result or {}).get("error") or "影像获取失败（详见终端日志）"
             _tl_add(
@@ -6870,6 +6914,10 @@ def finalize_background_pipeline():
         _job_error = "主流程已完成，但可选后置输出校验未完全通过；相关成果未登记或加载。"
     elif _job_status == "WARNING" and not success:
         _job_error = "输出校验未完全通过；成果未登记或加载。"
+    if gee_cloud_outcome and not _job_was_stopped and not success:
+        _cloud_state = gee_cloud_outcome["status"]
+        _job_status = {"FAILED": "FAILED", "CANCELLED": "CANCELLED"}.get(_cloud_state, "WARNING")
+        _job_error = gee_cloud_outcome["message"]
     _job_transition(
         _job_status,
         progress=100 if success else prog,
@@ -7310,6 +7358,16 @@ def maybe_start_pipeline_thread():
 
 def _pipeline_monitor_inner(render: bool = True):
     shared = st.session_state.get("pipeline_shared")
+    if shared:
+        with shared["lock"]:
+            _cloud_events = shared.pop("gee_cloud_events", [])
+        for _event in _cloud_events:
+            # Terminal outcomes are recorded by finalization, avoiding duplicates.
+            if _event["status"] in ("SUBMITTED", "RUNNING"):
+                _tl_add(st.session_state.get("_tl_current_task") or "unknown",
+                        "GEE_EXPORT", _event["message"],
+                        status="QUEUED" if _event["status"] == "SUBMITTED" else "RUNNING",
+                        tool="run_gee_download")
     if shared and shared.get("done") and st.session_state.is_running:
         if finalize_background_pipeline():
             st.rerun()

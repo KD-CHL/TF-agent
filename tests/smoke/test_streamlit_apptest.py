@@ -52,6 +52,31 @@ def _button(at, label: str):
     return next(button for button in at.button if button.label == label)
 
 
+def test_completed_drive_export_is_waiting_sync_in_task_timeline(tmp_path, monkeypatch):
+    import threading
+    at = _run_app(tmp_path, monkeypatch)
+    message = "云端导出完成，待从Google Drive同步到本地；本地影像尚未校验，未登记为可提取数据。"
+    at.session_state["is_running"] = True
+    at.session_state["pipeline_thread_started"] = True
+    at.session_state["_tl_current_task"] = "cloud-audit"
+    at.session_state["pipeline_shared"] = {
+        "lock": threading.Lock(), "done": True, "success": False,
+        "job_kind": "gee", "progress": 100,
+        "gee_result": {"success": True, "export_state": "COMPLETED",
+                       "outputs": {"gee_task_ids": ["fake"], "local_tifs": []}},
+        "gee_cloud_outcome": {"status": "WAITING_SYNC", "message": message},
+    }
+    at.run(timeout=60)
+    assert not at.exception
+    assert not at.session_state["is_running"]
+    assert at.session_state["_gee_last_summary"] == message
+    timeline = TimelineStore(str(tmp_path / "timeline_ledger.json"))
+    timeline.load()
+    events = timeline.events()
+    assert any(event.status == "WARNING" and "待从Google Drive同步" in event.message for event in events)
+    assert not any(event.status == "FAILED" for event in events)
+
+
 def test_manual_gee_click_creates_plan_after_widgets_render(tmp_path, monkeypatch):
     import json
     roi = tmp_path / "roi.geojson"
