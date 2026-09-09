@@ -14,7 +14,20 @@ _WEB_URL_RE = re.compile(r"(?i)\b(?:https?|ftp)://[^\s<>\"']+")
 _SECRET_RE = re.compile(
     r"(?i)(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*[^\s,;，；]+"
 )
-_BARE_PROVIDER_KEY_RE = re.compile(r"(?i)\bsk-[A-Za-z0-9][A-Za-z0-9_-]{8,}")
+_BARE_PROVIDER_KEY_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:"
+    r"sk-[A-Za-z0-9][A-Za-z0-9_-]{8,}|"
+    r"ghp_[A-Za-z0-9]{8,}|"
+    r"github_pat_[A-Za-z0-9_-]{8,}|"
+    r"rk[-_][A-Za-z0-9_-]{8,}|"
+    r"pk_[A-Za-z0-9_-]{8,}"
+    r")(?![A-Za-z0-9_-])"
+)
+_DATA_URL_RE = re.compile(
+    r"(?is)\bdata:(?:image|audio|video)/[a-z0-9.+-]+"
+    r"(?:;\s*[a-z0-9!#$&^_.+-]+(?:=\s*[a-z0-9!#$&^_.+-]+)?)*"
+    r";\s*base64,\s*[a-z0-9+/=_-](?:[a-z0-9+/=_-]|\r|\n)*"
+)
 _URL_CREDENTIAL_RE = re.compile(r"(?i)(https?://)([^/@\s]+):([^/@\s]+)@")
 _SPATIAL_FIELD_RE = re.compile(
     r"(?i)\b(?:aoi[_ ]?bbox|bbox|centroid)\s*[:=]\s*(?:\([^\)\n]*\)|\[[^\]\n]*\])"
@@ -24,6 +37,26 @@ _MAP_CENTER_RE = re.compile(
 )
 _SPATIAL_LINE_RE = re.compile(
     r"(?im)^(?P<prefix>\s*(?:[-*]\s*)?)(?P<label>bounds|crs|resolution|pixel_size|transform)\s*:\s*[^\n]*$"
+)
+_PERSISTED_COMMAND_BLOCK_RE = re.compile(
+    r"\[SYSTEM_COMMAND_JSON\].*?\[/SYSTEM_COMMAND_JSON\]", re.I | re.S
+)
+_PERSISTED_COMMAND_TAIL_RE = re.compile(r"\[SYSTEM_COMMAND_JSON\].*$", re.I | re.S)
+_JSON_SPATIAL_VALUE_RE = re.compile(
+    r"(?ix)(?P<prefix>(?:[\"']?)(?:center|map_center|bounds|coordinates)(?:[\"']?)\s*:\s*)"
+    r"(?P<value>\[[^\n]*\]|\{[^\n]*\})"
+)
+_JSON_SPATIAL_NUMBER_RE = re.compile(
+    r"(?ix)(?P<prefix>(?:[\"']?)(?:lat|latitude|lon|longitude|west|south|east|north)(?:[\"']?)\s*:\s*)"
+    r"[\"']?[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?[\"']?"
+)
+_EXPLICIT_COORDINATE_RE = re.compile(
+    r"(?ix)(?P<label>坐标|经纬度|中心点|地图中心|coordinates?|center\s+point|map[\s_-]*center)"
+    r"\s*(?:[:：=]\s*)?"
+    r"(?:[\(\[（［【]\s*[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:°|º)?\s*[NSWE]?\s*[,，]\s*"
+    r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:°|º)?\s*[NSWE]?\s*[\)\]）］】]"
+    r"|[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:°|º)?\s*[NSWE]?\s*[,，]\s*"
+    r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:°|º)?\s*[NSWE]?)"
 )
 
 
@@ -52,10 +85,11 @@ def safe_local_path_label(path: Any) -> str:
 
 
 def sanitize_external_text(text: Any) -> str:
-    """移除绝对路径、密钥/代理凭据和完整本地 geometry 文本。"""
+    """移除绝对路径、密钥、内联媒体和完整本地 geometry 文本。"""
     value = str(text or "")
     value = _SECRET_RE.sub("<redacted>", value)
     value = _BARE_PROVIDER_KEY_RE.sub("<redacted>", value)
+    value = _DATA_URL_RE.sub("<attachment-redacted>", value)
     value = _URL_CREDENTIAL_RE.sub(r"\1<redacted>@", value)
     # Web URLs must remain intact. Running the absolute-path expression over
     # the whole string makes the tail of ``https:/`` look like a Windows drive
@@ -68,6 +102,27 @@ def sanitize_external_text(text: Any) -> str:
         cursor = match.end()
     chunks.append(_ABS_PATH_RE.sub("<local-path>", value[cursor:]))
     return "".join(chunks)
+
+
+def sanitize_persisted_text(text: Any) -> str:
+    """Shared durable-storage boundary for messages and debug records.
+
+    Keep this wrapper explicit at persistence call sites so future model/UI
+    sanitization changes cannot accidentally bypass PAT or inline-media
+    removal before writing SQLite or debug files.
+    """
+    value = sanitize_external_text(text)
+    # Closed command blocks get a stable, non-replayable history marker.  An
+    # opening marker without a close is treated as a tail so malformed model
+    # output cannot leak the remainder of its JSON into durable storage.
+    value = _PERSISTED_COMMAND_BLOCK_RE.sub("[系统命令已执行，历史记录不可重放]", value)
+    value = _PERSISTED_COMMAND_TAIL_RE.sub("[系统命令内容已隐藏]", value)
+    value = _JSON_SPATIAL_VALUE_RE.sub(r"\g<prefix><spatial-redacted>", value)
+    value = _JSON_SPATIAL_NUMBER_RE.sub(r"\g<prefix><spatial-redacted>", value)
+    value = _EXPLICIT_COORDINATE_RE.sub(
+        lambda match: f"{match.group('label')}: <spatial-redacted>", value
+    )
+    return value
 
 
 def redact_spatial_metadata(text: Any) -> str:
@@ -122,6 +177,6 @@ def raw_system_command_consent(state: dict) -> bool:
 
 __all__ = [
     "describe_local_path", "safe_local_path_label", "media_consent", "raw_system_command_consent",
-    "raw_system_command_enabled", "safe_error_summary", "sanitize_external_text",
+    "raw_system_command_enabled", "safe_error_summary", "sanitize_external_text", "sanitize_persisted_text",
     "spatial_consent", "redact_spatial_metadata"
 ]

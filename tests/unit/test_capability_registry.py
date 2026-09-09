@@ -88,8 +88,12 @@ class TestStatusDetermination(unittest.TestCase):
         self.assertEqual(st.status, cr.BLOCKED)
 
     def test_unavailable_when_gee_project_not_configured(self):
-        reg = cr.CapabilityRegistry(context={})
-        st = reg.check("gee_download")
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(cr, "_module_importable", side_effect=lambda name: name == "ee"):
+                with mock.patch.object(cr.os.path, "expanduser", return_value=td):
+                    reg = cr.CapabilityRegistry(context={})
+                    st = reg.check("gee_download")
         self.assertEqual(st.status, cr.UNAVAILABLE)
 
     def test_gee_probe_uses_real_ee_module_name(self):

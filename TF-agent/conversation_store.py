@@ -13,7 +13,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from agent_context_policy import redact_spatial_metadata, sanitize_external_text
+from agent_context_policy import redact_spatial_metadata, sanitize_persisted_text
 
 
 SCHEMA_VERSION = 2
@@ -96,12 +96,10 @@ def _safe_content(content: Any) -> str:
     # field name (for example ``sk-...``).
     # Absolute paths are handled by the shared sanitizer, which preserves
     # ordinary http/https/ftp links while redacting local filesystem paths.
-    text = sanitize_external_text(text)
+    text = sanitize_persisted_text(text)
     # AOI/map coordinates are not needed for local history display and must not
     # re-enter a later external-model context through persisted messages.
     text = redact_spatial_metadata(text)
-    # 不保存 base64/data URL；附件只保留受控引用字段。
-    text = re.sub(r"data:[^;\s]+;base64,[A-Za-z0-9+/=]+", "<attachment-redacted>", text)
     return text[:100_000]
 
 

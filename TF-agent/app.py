@@ -44,7 +44,12 @@ import threading
 import traceback
 import uuid
 import numpy as np
-from agent_context_policy import safe_error_summary, sanitize_external_text
+from agent_context_policy import (
+    redact_spatial_metadata,
+    safe_error_summary,
+    sanitize_external_text,
+    sanitize_persisted_text,
+)
 from preview_cache import cleanup_preview_cache, preview_cache_dir
 
 
@@ -64,9 +69,34 @@ DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent
 
 
 def _append_debug_log(message: str):
+    # The debug file is durable.  Strip command blocks before the common
+    # sanitizer so a provider exception or future caller cannot persist raw
+    # system JSON, coordinates, credentials, or local geometry.
+    safe_message = re.sub(
+        r"\[SYSTEM_COMMAND_JSON\].*?(?:\[/SYSTEM_COMMAND_JSON\]|$)",
+        "[system-command-redacted]",
+        str(message or ""),
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    # Cover JSON-shaped spatial fields that are not labelled as
+    # ``map_center``/``bounds`` prose.  This is a durable-log boundary, so a
+    # false positive is preferable to persisting an exact coordinate.
+    safe_message = re.sub(
+        r"(?i)([\"'](?:lat|latitude|lon|longitude|west|south|east|north)[\"']\s*:\s*)"
+        r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?",
+        r"\1<spatial-redacted>",
+        safe_message,
+    )
+    safe_message = re.sub(
+        r"(?i)([\"'](?:center|map_center|bounds|bbox|coordinates)[\"']\s*:\s*)"
+        r"(?:\[[^\]]*\]|\{[^}]*\})",
+        r"\1<spatial-redacted>",
+        safe_message,
+    )
+    safe_message = redact_spatial_metadata(sanitize_persisted_text(safe_message))[:2000]
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(f"[{ts}] {message}\n")
+        f.write(f"[{ts}] {safe_message}\n")
 
 
 def _format_agent_exception(exc: Exception) -> str:
@@ -89,6 +119,70 @@ def _record_worker_exception(shared, label: str, error: BaseException) -> None:
         lines.append(f"[CRASH] {label}: {safe}")
         shared["log_lines"] = lines[-30:]
         shared["status"] = ("error", f"{label}：{safe}")
+
+
+def _remember_map_diagnostics(diagnostics):
+    """Keep the rounded map diagnostic in session state and log only its safe projection."""
+    if not isinstance(diagnostics, dict):
+        return
+    display = diagnostics.get("display")
+    persisted = diagnostics.get("persisted")
+    if isinstance(display, dict):
+        st.session_state["_map_diagnostics"] = dict(display)
+    if isinstance(persisted, dict):
+        _append_debug_log(
+            "map_diagnostic "
+            + json.dumps(persisted, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
+
+
+def _map_runtime_diagnostics():
+    """Return ephemeral platform/protocol fields for the collapsed map panel."""
+    diagnostics = dict(st.session_state.get("_map_diagnostics") or {})
+    try:
+        from llm_backend import backend_status
+
+        backend = backend_status()
+        diagnostics["backend"] = sanitize_external_text(backend.get("provider"))[:40] or "unknown"
+        diagnostics["model"] = sanitize_external_text(backend.get("model"))[:80] or "unknown"
+    except Exception:
+        diagnostics["backend"] = sanitize_external_text(
+            os.environ.get("CSTF_LLM_BACKEND") or "dashscope"
+        )[:40]
+        diagnostics["model"] = sanitize_external_text(
+            os.environ.get("CSTF_LLM_MODEL") or os.environ.get("QWEN_CHAT_MODEL") or "qwen-plus"
+        )[:80]
+    diagnostics["globe_port"] = st.session_state.get("_globe_server_port", "—")
+    globe_url = st.session_state.get("_globe_iframe_url") or ""
+    try:
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(str(globe_url))
+        diagnostics["iframe_origin"] = (
+            f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else "不可用"
+        )
+    except Exception:
+        diagnostics["iframe_origin"] = "不可用"
+    try:
+        import globe_server as _diag_globe_server
+
+        protocol = _diag_globe_server.map_protocol_state(
+            channel_id=st.session_state.get("_map_channel_id")
+        )
+        diagnostics["ready_ts"] = protocol.get("ready_ts")
+        diagnostics["ack_command_id"] = (protocol.get("ack") or {}).get("command_id") or "—"
+        diagnostics["ack_navigation_seq"] = (protocol.get("ack") or {}).get("navigation_seq") or "—"
+    except Exception:
+        diagnostics.update({"ready_ts": None, "ack_command_id": "—", "ack_navigation_seq": "—"})
+    diagnostics["channel"] = st.session_state.get("_map_channel_id") or "default"
+    diagnostics["target_origin"] = diagnostics.get("iframe_origin") or "不可用"
+    diagnostics["command_id"] = ((st.session_state.get("_last_globe_payload") or {}).get("command_id") or "—")
+    diagnostics["navigation_seq"] = ((st.session_state.get("_last_globe_payload") or {}).get("navigation_seq") or "—")
+    diagnostics.setdefault("confirmation", st.session_state.get("_map_confirmation") or "未提供")
+    diagnostics["aoi"] = "已启用"
+    diagnostics["auto_fit"] = bool((st.session_state.get("_last_globe_payload") or {}).get("flyRectangle"))
+    diagnostics["fallback_2d"] = bool(st.session_state.get("use_2d_map_fallback", False))
+    return diagnostics
 
 
 def _chat_preview_uint8(rgb: np.ndarray) -> np.ndarray:
@@ -1974,9 +2068,32 @@ def _gee_worker_entry(ctx, shared, stop_event):
                 shared["gee_result"] = result or {}
             return
 
+        if str(plan.get("export_to") or "").lower() == "drive":
+            def cloud_status(outcome):
+                kind = "error" if outcome["status"] == "FAILED" else "info"
+                push_status(kind, outcome["message"])
+                push_log(outcome["message"])
+                with shared["lock"]:
+                    shared["gee_cloud_outcome"] = outcome
+                    shared.setdefault("gee_cloud_events", []).append(dict(outcome))
+                    shared["progress"] = 100 if outcome["status"] == "WAITING_SYNC" else 0
+
+            outcome = gal.monitor_drive_export(result, stop_event, cloud_status)
+            with shared["lock"]:
+                shared["gee_result"] = result
+            if outcome["status"] != "WAITING_SYNC":
+                return
+            # A completed Drive export is not proof that local files exist.
+            # Keep strict local validation, but report missing synchronization
+            # separately from a cloud export failure.
+            if not (result.get("outputs") or {}).get("local_tifs"):
+                return
+
         push_status("info", "下载结束，正在校验成果…")
         verification = gal.verify_gee_outputs(plan, result, started_at=started)
         if not verification or verification.get("ok") is not True:
+            with shared["lock"]:
+                shared.pop("gee_cloud_outcome", None)
             failed = [c.get("name") for c in (verification or {}).get("checks") or []
                       if not c.get("passed")]
             push_status("error", f"❌ 成果校验未通过: {', '.join(failed) or '未知'}")
@@ -1987,6 +2104,8 @@ def _gee_worker_entry(ctx, shared, stop_event):
 
         asset_id = gal.register_gee_dataset_asset(plan, result, verification)
         if not asset_id:
+            with shared["lock"]:
+                shared.pop("gee_cloud_outcome", None)
             push_status("error", "❌ 校验通过但资产登记失败（未登记数据集）。")
             with shared["lock"]:
                 shared["gee_result"] = result
@@ -2005,6 +2124,8 @@ def _gee_worker_entry(ctx, shared, stop_event):
             shared["progress"] = 100
         ok = True
     except Exception as e:
+        with shared["lock"]:
+            shared.pop("gee_cloud_outcome", None)
         _record_worker_exception(shared, "GEE 下载线程异常", e)
         ok = False
     finally:
@@ -2021,6 +2142,31 @@ st.set_page_config(
     page_icon="🌍",
     layout="wide",
     initial_sidebar_state="expanded"
+)
+
+# Browser translation can replace React-owned Text nodes with <font> elements.
+# A later rerun (for example, clearing a path in a Markdown caption) then fails
+# with removeChild/NotFoundError. Opt the Chinese UI out before rendering it;
+# change only document attributes/metadata, never React's children or DOM APIs.
+components.html(
+    """
+    <script>
+    (() => {
+      const doc = (window.parent || window).document;
+      doc.documentElement.lang = "zh-CN";
+      doc.documentElement.setAttribute("translate", "no");
+      doc.documentElement.classList.add("notranslate");
+      let meta = doc.head.querySelector('meta[name="google"]');
+      if (!meta) {
+        meta = doc.createElement("meta");
+        meta.name = "google";
+        doc.head.appendChild(meta);
+      }
+      meta.content = "notranslate";
+    })();
+    </script>
+    """,
+    height=0,
 )
 
 # 🌟 初始化系统状态：控制运行/中断的红绿灯
@@ -2731,6 +2877,42 @@ st.markdown("""
         margin: 0 !important;
         padding: 0 !important;
         overflow: hidden !important;
+    }
+    /* Only the drawer scrolls: stretch containers grow with their contents
+       and get clipped by the fixed-height workbench. Keep the native scroll
+       viewport and its wrapper on the same drag-controlled height budget. */
+    :root {
+        --cstf-status-drawer-h: max(0px, min(
+            calc(var(--cstf-status-panel-reserve, 228px) - 8px),
+            calc(var(--workbench-h) - 288px)
+        ));
+    }
+    div[data-testid="stColumn"]:has(.cockpit-map-col) > div[data-testid="stVerticalBlock"] > [data-testid="stLayoutWrapper"]:has(> .st-key-map_status_drawer),
+    .st-key-map_status_drawer {
+        flex: 0 0 auto !important;
+        height: var(--cstf-status-drawer-h) !important;
+        max-height: var(--cstf-status-drawer-h) !important;
+        min-height: 0 !important;
+        min-width: 0 !important;
+    }
+    .st-key-map_status_drawer {
+        overflow-y: auto !important;
+        overflow-x: hidden !important;
+        overscroll-behavior-y: contain;
+        scrollbar-gutter: stable;
+        scroll-padding-block: 12px;
+        padding: 12px !important;
+    }
+    .st-key-map_status_drawer [data-testid="stMarkdownContainer"] {
+        overflow-wrap: anywhere;
+    }
+    .st-key-task_terminal_log {
+        overscroll-behavior-y: auto;
+    }
+    .st-key-task_terminal_log [data-testid="stCode"] pre,
+    .st-key-task_terminal_log [data-testid="stCode"] code {
+        white-space: pre-wrap !important;
+        overflow-wrap: anywhere !important;
     }
     .cstf-layout-defaults {
         display: none !important;
@@ -4598,8 +4780,12 @@ with st.sidebar:
             try:
                 from agent_command_bridge import propose_gee_plan as _propose_manual_gee
 
+                # The bridge normalizes UI defaults and the region name. Use
+                # a snapshot because those widgets are already instantiated
+                # in this run; only publish the resulting execution plan.
+                _manual_gee_state = dict(st.session_state)
                 _manual_gee_plan, _manual_gee_errors = _propose_manual_gee(
-                    st.session_state,
+                    _manual_gee_state,
                     {
                         "task": selected_task or m4_roi_name,
                         "roi_name": m4_roi_name,
@@ -4618,15 +4804,12 @@ with st.sidebar:
                         "gee_project_id": (m4_gee_project or "").strip(),
                     },
                 )
-                if _manual_gee_plan.get("ready"):
-                    st.info("已生成影像获取计划，请在下方确认后执行。")
-                else:
-                    st.warning("影像获取计划暂不可执行，请先修复以下条件：")
-                for _plan_error in _manual_gee_errors or _manual_gee_plan.get("blockers") or []:
-                    st.caption(f"· {_plan_error}")
+                st.session_state["_gee_pending_plan"] = _manual_gee_plan
+                st.session_state["_gee_plan_confirmed"] = set()
             except Exception as _manual_gee_exc:
                 st.error(f"影像获取计划生成失败：{type(_manual_gee_exc).__name__}")
-            st.rerun()
+            else:
+                st.rerun()
 
     if run_btn:
         if cache_hit and not force_rerun:
@@ -4741,7 +4924,7 @@ try:
     _status_panel_height = int(st.session_state.get("agent_status_panel_height", 220))
 except (TypeError, ValueError):
     _status_panel_height = 220
-_status_panel_height = max(140, min(340, _status_panel_height))
+_status_panel_height = max(140, min(384, _status_panel_height))
 st.session_state.agent_status_panel_height = _status_panel_height
 _status_panel_collapsed = bool(st.session_state.get("agent_status_panel_collapsed", False))
 # 地图下方预留状态工具栏 + 可调状态区；收起时只保留工具栏。
@@ -4957,6 +5140,8 @@ with col_map:
                     "url": _globe_open_url,
                     "port": _globe_port,
                     "serve_ok": _serve_ok,
+                    "channel": st.session_state.get("_map_channel_id") or "default",
+                    "target_origin": "",
                 }
 
                 if not _serve_ok and _serve_err:
@@ -4981,7 +5166,8 @@ with col_map:
                         _fly_lon = float(_fly["lon"])
                         _fly_zoom = int(_fly.get("zoom", 9))
                         _fly_height = _fly.get("height")
-                        if _fly_height is None:
+                        _fly_bounds = _fly.get("bounds") if isinstance(_fly.get("bounds"), dict) else None
+                        if _fly_height is None and _fly_bounds is None:
                             _fly_height = float(_globe.zoom_to_height_m(_fly_zoom, _fly_lat))
                         _fly_label = _fly.get("label") or f"({_fly_lat:.2f}°N, {_fly_lon:.2f}°E)"
                         _fly_payload, _fly_errs = _map_proto.make_fly_message(
@@ -4989,8 +5175,9 @@ with col_map:
                             _fly_lat,
                             zoom=_fly_zoom,
                             height=_fly_height,
-                            pitch=float(_globe.DEFAULT_CAMERA["pitch_deg"]),
-                            heading=float(_globe.DEFAULT_CAMERA["heading_deg"]),
+                            bounds=_fly_bounds,
+                            pitch=float(_fly.get("pitch", _globe.DEFAULT_CAMERA["pitch_deg"])),
+                            heading=float(_fly.get("heading", _globe.DEFAULT_CAMERA["heading_deg"])),
                             duration=float(_fly.get("duration", 1.0)),
                             preset=_fly.get("preset"),
                             label=_fly_label,
@@ -4999,9 +5186,34 @@ with col_map:
                         if _fly_payload is None:
                             st.warning("地图跳转参数无效：" + "; ".join(_fly_errs or []))
                         else:
-                            # READY 握手：等 Cesium 就绪后发；等待窗口超 3s 仍未就绪则带警告发送
-                            _map_ready_warning = False
+                            # 每个地图 channel 只保留最后一条待送达相机命令；旧命令即使
+                            # 还在浏览器延迟重试，也会因较小 sequence 被 Cesium 丢弃。
                             _map_channel_id = st.session_state.get("_map_channel_id")
+                            _fly_payload = _globe_srv.queue_map_fly(
+                                _fly_payload,
+                                channel_id=_map_channel_id,
+                            )
+                            _last_map_payload = dict(st.session_state.get("_last_globe_payload") or {})
+                            _last_map_payload.update(
+                                {
+                                    "command_id": _fly_payload.get("command_id"),
+                                    "navigation_seq": _fly_payload.get("navigation_seq"),
+                                    "channel": _map_channel_id or "default",
+                                }
+                            )
+                            try:
+                                from urllib.parse import urlsplit
+
+                                _origin = urlsplit(str(_globe_open_url or ""))
+                                _last_map_payload["target_origin"] = (
+                                    f"{_origin.scheme}://{_origin.netloc}"
+                                    if _origin.scheme and _origin.netloc else ""
+                                )
+                            except Exception:
+                                pass
+                            st.session_state["_last_globe_payload"] = _last_map_payload
+                            # READY 握手：等 Cesium 就绪后发送；超过窗口仍发送，UI 保持非终态等待提示。
+                            _map_ready_warning = False
                             _mp_state = _globe_srv.map_protocol_state(
                                 channel_id=_map_channel_id
                             )
@@ -5021,7 +5233,10 @@ with col_map:
 (() => {{
   const win = window.parent || window;
   const doc = win.document;
-  const msg = {_fly_js};
+  const msg = Object.assign({_fly_js}, {{ channel_id: {_json.dumps(_map_channel_id or "default")} }});
+  // The latest payload is shared by every short-lived Streamlit bridge.
+  // A bridge from an older rerun therefore cannot send its closed-over target.
+  win.__cstfPendingFly = msg;
   // targetOrigin 收紧：从 iframe src 提取精确 origin；取不到时回退当前页面 origin
   let origin = "*";
   try {{
@@ -5033,7 +5248,9 @@ with col_map:
       }}
     }});
   }} catch (e) {{}}
-  const send = () => {{
+  const sendLatestFly = () => {{
+    const latest = win.__cstfPendingFly;
+    if (!latest) return false;
     const iframes = doc.querySelectorAll("iframe");
     let sent = false;
     iframes.forEach((ifr) => {{
@@ -5041,7 +5258,7 @@ with col_map:
       if (!src) return;
       if (src.indexOf("/globe") >= 0 || src.indexOf(":8765") >= 0) {{
         try {{
-          ifr.contentWindow.postMessage(msg, origin);
+          ifr.contentWindow.postMessage(latest, origin);
           sent = true;
         }} catch (e) {{}}
       }}
@@ -5051,23 +5268,59 @@ with col_map:
   // 每次定位都会注入一个很短的隐藏组件。若上一轮定位的延迟重试
   // 仍在 parent window 中排队，它们可能在本轮定位之后再次把相机拉回旧位置。
   // 将定时器挂在 parent 上并在新命令开始时统一取消，保证“最后一次定位”胜出。
-  try {{
+  const clearFlyRetryTimers = () => {{
     const oldTimers = Array.isArray(win.__cstfFlyRetryTimers)
       ? win.__cstfFlyRetryTimers : [];
     oldTimers.forEach((timerId) => win.clearTimeout(timerId));
     win.__cstfFlyRetryTimers = [];
-  }} catch (e) {{}}
+  }};
+  try {{ clearFlyRetryTimers(); }} catch (e) {{}}
+  const replayLatestFly = () => {{
+    const latest = win.__cstfPendingFly;
+    if (!latest) return false;
+    clearFlyRetryTimers();
+    return sendLatestFly();
+  }};
+  const installMapDeliveryListener = () => {{
+    if (win.__cstfMapDeliveryListener) {{
+      win.removeEventListener("message", win.__cstfMapDeliveryListener);
+    }}
+    const listener = (event) => {{
+      const latest = win.__cstfPendingFly;
+      const msg = event && event.data;
+      if (!latest || !msg || typeof msg !== "object") return;
+      if (msg.type !== "CSTF_MAP_READY" && msg.type !== "CSTF_FLY_ACK") return;
+      if (msg.channel_id !== latest.channel_id) return;
+      if (origin !== "*" && event.origin !== origin) return;
+      if (msg.type === "CSTF_MAP_READY") {{
+        replayLatestFly();
+        return;
+      }}
+      if (msg.command_id === latest.command_id &&
+          Number(msg.navigation_seq) === Number(latest.navigation_seq)) {{
+        clearFlyRetryTimers();
+        win.__cstfPendingFly = null;
+      }}
+    }};
+    win.__cstfMapDeliveryListener = listener;
+    win.addEventListener("message", listener);
+  }};
+  installMapDeliveryListener();
   // The iframe element can exist before Cesium installs its message listener.
   // Retry at a few increasing delays; avoid restarting the camera flight
   // continuously while the viewer is animating.
   const retryDelays = [150, 400, 900, 1800, 3200, 5000];
-  send();
+  sendLatestFly();
   retryDelays.forEach((delay) => {{
     try {{
-      const timerId = win.setTimeout(send, delay);
+      const timerId = win.setTimeout(() => {{
+        if (win.__cstfPendingFly && win.__cstfPendingFly.command_id === msg.command_id) {{
+          sendLatestFly();
+        }}
+      }}, delay);
       win.__cstfFlyRetryTimers.push(timerId);
     }} catch (e) {{
-      setTimeout(send, delay);
+      setTimeout(sendLatestFly, delay);
     }}
   }});
 }})();
@@ -5080,6 +5333,7 @@ with col_map:
                                 _fly_payload.get("command_id", ""),
                                 timeout=1.2,
                                 channel_id=_map_channel_id,
+                                navigation_seq=_fly_payload.get("navigation_seq"),
                             )
                             if _ack:
                                 st.session_state["_map_ready_wait_started"] = None
@@ -5088,7 +5342,9 @@ with col_map:
                                 else:
                                     st.warning("地图跳转未完成，请检查地球页面状态。")
                             if _ack is None and _map_ready_warning:
-                                st.caption("⚠️ 地图尚未确认就绪（可能仍在加载），已尝试跳转。")
+                                st.caption("等待地图确认（确认窗口已超时，仍会继续尝试）。")
+                            elif _ack is None:
+                                st.caption("等待地图确认…")
                     except (TypeError, ValueError):
                         pass
             else:
@@ -5162,20 +5418,8 @@ with col_map:
             st.toast("⚡ 已有成果已加载到地图", icon="✅")
 
     if raster_load_error and not st.session_state.asset_just_loaded:
-        st.toast(f"成果图层加载异常: {raster_load_error}", icon="⚠️")
-        with st.expander("🛰️ 地图加载诊断", expanded=False):
-            _lp = st.session_state.get("_last_globe_payload") or {}
-            st.write(f"**错误**：{raster_load_error}")
-            if _lp.get("url"):
-                st.write(f"**地球 URL**：{_lp.get('url')}")
-            st.write(f"**本机地球端口**：{st.session_state.get('_globe_server_port', '—')}")
-            st.write(
-                "**建议**：① 用 http://localhost:8501 打开（不要用局域网 IP，除非已配 ngrok）；"
-                "② 重启 Streamlit；③ 远程演示见 REMOTE_DEMO.md"
-            )
-            if st.button("切换为 2D 地图并重试", key="btn_force_2d_map"):
-                st.session_state.use_2d_map_fallback = True
-                st.rerun()
+        _safe_raster_error = sanitize_external_text(raster_load_error)[:240]
+        st.toast(f"成果图层加载异常: {_safe_raster_error}", icon="⚠️")
 
     # 任务状态和终端日志位于地图下方，不再占用右侧 Agent Dock。
     st.markdown('<div class="cstf-map-status-zone"></div>', unsafe_allow_html=True)
@@ -5196,7 +5440,36 @@ with col_map:
             st.session_state.agent_status_panel_collapsed = not _status_panel_collapsed
             st.rerun()
     if not _status_panel_collapsed:
-        _log_panel_slot = st.container(height="stretch", border=True)
+        with st.container(height=_status_panel_height, border=True, key="map_status_drawer"):
+            _log_panel_slot = st.container()
+            # Diagnostics share the drawer's scroll budget instead of adding
+            # an unaccounted row between the map and the task monitor.
+            # Values remain ephemeral; durable logging uses the projection.
+            with st.expander("🛰️ 地图加载诊断", expanded=False):
+                _diag = _map_runtime_diagnostics()
+                if raster_load_error:
+                    st.warning(f"错误摘要：{sanitize_external_text(raster_load_error)[:240]}")
+                _diag_rows = (
+                    ("指令来源", _diag.get("command_source", "unknown")),
+                    ("中心/缩放（四舍五入）", f"{_diag.get('center', '不可用')} · zoom={_diag.get('zoom', '不可用')}"),
+                    ("bounds 有效性", _diag.get("bounds_valid", "未提供")),
+                    ("模型/后端", f"{_diag.get('model', 'unknown')} / {_diag.get('backend', 'unknown')}"),
+                    ("Globe 端口", _diag.get("globe_port", "—")),
+                    ("iframe origin", _diag.get("iframe_origin", "不可用")),
+                    ("READY 时间", _diag.get("ready_ts") or "未收到"),
+                    ("ACK command_id", _diag.get("ack_command_id", "—")),
+                    ("ACK navigation_seq", _diag.get("ack_navigation_seq", "—")),
+                    ("channel / targetOrigin", f"{_diag.get('channel', 'default')} / {_diag.get('target_origin', '不可用')}"),
+                    ("确认 / AOI / 自动适配 / 2D fallback", f"{_diag.get('confirmation', '未提供')} / {_diag.get('aoi', '已启用')} / {bool(_diag.get('auto_fit'))} / {bool(_diag.get('fallback_2d'))}"),
+                )
+                for _label, _value in _diag_rows:
+                    st.caption(f"{_label}：{sanitize_external_text(_value)}")
+                for _warning in (_diag.get("warnings") or []):
+                    st.caption(f"适配告警：{sanitize_external_text(_warning)}")
+                st.caption("诊断仅临时显示；持久化日志仅保留坐标存在性、范围结果与哈希。")
+                if raster_load_error and st.button("切换为 2D 地图并重试", key="btn_force_2d_map"):
+                    st.session_state.use_2d_map_fallback = True
+                    st.rerun()
 
 with col_side:
     st.markdown('<div class="command-deck-side">', unsafe_allow_html=True)
@@ -6037,6 +6310,7 @@ if _user_submitted:
                             st.session_state.messages.append({"role": "assistant", "content": _msg})
                             st.rerun()
                         cmd_result, clean_reply = process_agent_reply(st.session_state, prompt)
+                        _remember_map_diagnostics(cmd_result.diagnostics)
                         for _ce in cmd_result.errors:
                             st.warning(_ce)
                         _msg = clean_reply or (
@@ -6110,6 +6384,7 @@ if _user_submitted:
                     )
 
                     cmd_result, clean_reply = process_agent_reply(st.session_state, reply)
+                    _remember_map_diagnostics(cmd_result.diagnostics)
                     if cmd_result.applied:
                         for _ce in cmd_result.errors:
                             st.warning(_ce)
@@ -6120,7 +6395,31 @@ if _user_submitted:
                         st.session_state.messages.append({"role": "assistant", "content": display})
                         st.rerun()
 
-                    parsed_map = _parse_agent_map_command(reply)
+                    if cmd_result.errors:
+                        _warning = (
+                            "地图指令格式不兼容：系统命令未执行，请检查格式后重试。"
+                            if "[SYSTEM_COMMAND_JSON]" in (reply or "")
+                            else "系统指令未执行，请检查格式后重试。"
+                        )
+                        st.warning(_warning)
+                        _display = clean_reply.strip()
+                        if _display:
+                            st.markdown(_display)
+                        st.session_state.messages.append(
+                            {"role": "assistant", "content": _display or _warning}
+                        )
+                        st.rerun()
+
+                    # A malformed JSON command is never treated as a natural
+                    # language map command.  Only coordinates outside that
+                    # block remain eligible for the legacy UI fallback.
+                    _map_fallback_reply = re.sub(
+                        r"\[SYSTEM_COMMAND_JSON\].*?(?:\[/SYSTEM_COMMAND_JSON\]|$)",
+                        "",
+                        reply,
+                        flags=re.DOTALL | re.IGNORECASE,
+                    )
+                    parsed_map = _parse_agent_map_command(_map_fallback_reply)
                     if parsed_map is not None:
                         target_lat, target_lon, target_zoom, _cmd_span = parsed_map
                         _map_label = _parse_agent_map_label(reply)
@@ -6170,13 +6469,17 @@ if _user_submitted:
                     _has_map_kw = re.search(r"COMMAND_UPDATE_MAP", reply, re.I) is not None
                     _has_pipe_kw = re.search(r"COMMAND_RUN_PIPELINE", reply, re.I) is not None
                     if (_has_map_kw or _has_pipe_kw) and parsed_map is None and parsed_pipe is None:
-                        st.warning(
-                            "模型提到了地图/跑图暗号但无法解析。推荐：让模型调用工具 `change_map_view`；"
-                            "或正文含 `COMMAND_UPDATE_MAP|纬度|经度|缩放`（竖线）。"
-                            "括号格式 `(lat,lon)` 已做兼容，若仍失败请重试。"
+                        # Never render or persist the complete model reply on
+                        # this malformed-command path: it may contain raw
+                        # protocol JSON, tool traces, or provider payloads.
+                        _map_warning = (
+                            "地图指令格式不兼容：未执行地图动作。请重新描述地点，"
+                            "或让模型调用地图定位工具后重试。"
                         )
-                        st.markdown(reply)
-                        st.session_state.messages.append({"role": "assistant", "content": reply})
+                        st.warning(_map_warning)
+                        st.session_state.messages.append(
+                            {"role": "assistant", "content": _map_warning}
+                        )
                     elif not _has_map_kw and not _has_pipe_kw:
                         st.markdown(reply)
                         st.session_state.messages.append({"role": "assistant", "content": reply})
@@ -6305,6 +6608,7 @@ def finalize_background_pipeline():
     gee_result = shared.get("gee_result") if shared else None
     gee_verification = shared.get("gee_verification") if shared else None
     gee_dataset_id = shared.get("dataset_id") if shared else None
+    gee_cloud_outcome = shared.get("gee_cloud_outcome") if shared else None
     if gee_result is not None or gee_dataset_id:
         _gv_ok = bool(gee_verification and gee_verification.get("ok") is True)
         if success and _gv_ok:
@@ -6339,6 +6643,22 @@ def finalize_background_pipeline():
                 st.session_state._cap_snapshot_injected = False
             except Exception:
                 pass
+        elif gee_cloud_outcome and not _job_was_stopped:
+            _cloud_state = gee_cloud_outcome["status"]
+            _cloud_message = gee_cloud_outcome["message"]
+            _cloud_timeline_status = {
+                "FAILED": "FAILED", "CANCELLED": "CANCELLED",
+                "WAITING_SYNC": "WARNING", "UNKNOWN": "WARNING",
+            }.get(_cloud_state, "RUNNING")
+            if _cloud_state == "WAITING_SYNC":
+                _tl_add(_tl_task, "GEE_EXPORT", "云端导出已完成（全部任务COMPLETED）",
+                        status="SUCCEEDED", tool="run_gee_download")
+            _tl_add(_tl_task, "VERIFY" if _cloud_state == "WAITING_SYNC" else "GEE_EXPORT", _cloud_message,
+                    status=_cloud_timeline_status, tool="run_gee_download",
+                    error=_cloud_message if _cloud_state == "FAILED" else None)
+            st.session_state.messages = list(st.session_state.get("messages") or [])
+            st.session_state.messages.append({"role": "assistant", "content": _cloud_message})
+            st.session_state["_gee_last_summary"] = _cloud_message
         else:
             _err = (gee_result or {}).get("error") or "影像获取失败（详见终端日志）"
             _tl_add(
@@ -6594,6 +6914,10 @@ def finalize_background_pipeline():
         _job_error = "主流程已完成，但可选后置输出校验未完全通过；相关成果未登记或加载。"
     elif _job_status == "WARNING" and not success:
         _job_error = "输出校验未完全通过；成果未登记或加载。"
+    if gee_cloud_outcome and not _job_was_stopped and not success:
+        _cloud_state = gee_cloud_outcome["status"]
+        _job_status = {"FAILED": "FAILED", "CANCELLED": "CANCELLED"}.get(_cloud_state, "WARNING")
+        _job_error = gee_cloud_outcome["message"]
     _job_transition(
         _job_status,
         progress=100 if success else prog,
@@ -7034,6 +7358,16 @@ def maybe_start_pipeline_thread():
 
 def _pipeline_monitor_inner(render: bool = True):
     shared = st.session_state.get("pipeline_shared")
+    if shared:
+        with shared["lock"]:
+            _cloud_events = shared.pop("gee_cloud_events", [])
+        for _event in _cloud_events:
+            # Terminal outcomes are recorded by finalization, avoiding duplicates.
+            if _event["status"] in ("SUBMITTED", "RUNNING"):
+                _tl_add(st.session_state.get("_tl_current_task") or "unknown",
+                        "GEE_EXPORT", _event["message"],
+                        status="QUEUED" if _event["status"] == "SUBMITTED" else "RUNNING",
+                        tool="run_gee_download")
     if shared and shared.get("done") and st.session_state.is_running:
         if finalize_background_pipeline():
             st.rerun()
@@ -7119,7 +7453,7 @@ def _pipeline_monitor_inner(render: bool = True):
                     st.rerun()
 
     st.markdown('<div class="deck-section-title">🖥️ 系统终端日志</div>', unsafe_allow_html=True)
-    with st.container(height=LOG_PANEL_HEIGHT, border=False):
+    with st.container(height=LOG_PANEL_HEIGHT, border=False, key="task_terminal_log"):
         if lines:
             st.code("\n".join(lines), language="bash")
         elif st.session_state.is_running:
@@ -7626,7 +7960,9 @@ components.html(
       const syncWorkbenchHeight = () => {
         const header = doc.querySelector('[data-testid="stHeader"]');
         const headerH = header ? header.offsetHeight : 56;
-        const h = Math.max(480, win.innerHeight - headerH - 6);
+        const row = doc.querySelector('div[data-testid="stHorizontalBlock"]:has(.cockpit-map-col)');
+        const top = Math.max(headerH, row?.getBoundingClientRect().top || headerH);
+        const h = Math.max(280, win.innerHeight - top - 12);
         const px = h + "px";
         const reserve = parseFloat(
           win.getComputedStyle(doc.documentElement).getPropertyValue("--cstf-status-panel-reserve")
@@ -7671,8 +8007,9 @@ components.html(
               if (canScroll(el)) {
                 const top = el.scrollTop <= 0;
                 const bottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 1;
-                if ((e.deltaY < 0 && top) || (e.deltaY > 0 && bottom)) e.preventDefault();
-                return;
+                // At a nested log's boundary, let the enclosing drawer take
+                // the wheel before preventing scroll on the fixed page.
+                if ((e.deltaY < 0 && !top) || (e.deltaY > 0 && !bottom)) return;
               }
               el = el.parentElement;
             }
@@ -7751,7 +8088,8 @@ components.html(
           if (!nodes.mapCol) return;
           const header = doc.querySelector('[data-testid="stHeader"]');
           const headerH = header ? header.offsetHeight : 56;
-          const workbenchH = Math.max(480, win.innerHeight - headerH - 6);
+          const top = Math.max(headerH, nodes.row?.getBoundingClientRect().top || headerH);
+          const workbenchH = Math.max(280, win.innerHeight - top - 12);
           const reserve = getReserve();
           const mapH = Math.max(280, workbenchH - reserve);
           doc.documentElement.style.setProperty("--workbench-h", workbenchH + "px");
@@ -7910,7 +8248,10 @@ components.html(
           }
           moveEvent.preventDefault();
         };
-        stop = () => {
+        stop = (stopEvent) => {
+          // Focusing the separator blurs the previously focused control.
+          // Only leaving the browser window should cancel the active drag.
+          if (stopEvent?.type === "blur" && stopEvent.target !== win) return;
           if (drag) {
             if (drag.kind === "dock") {
               setLayoutParam("cstf_agent_w", drag.currentPct);
@@ -8087,7 +8428,8 @@ components.html(
               if (!nodes.mapCol) return;
               const header = doc.querySelector('[data-testid="stHeader"]');
               const headerH = header ? header.offsetHeight : 56;
-              const workbenchH = Math.max(480, win.innerHeight - headerH - 6);
+              const top = Math.max(headerH, nodes.row?.getBoundingClientRect().top || headerH);
+              const workbenchH = Math.max(280, win.innerHeight - top - 12);
               const reserve = getReserve();
               const mapH = Math.max(280, workbenchH - reserve);
               doc.documentElement.style.setProperty("--workbench-h", workbenchH + "px");

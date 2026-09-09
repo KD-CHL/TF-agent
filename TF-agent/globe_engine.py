@@ -865,16 +865,27 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
 
   function navigateToRectangle(box, opts) {{
     if (!box) return false;
-    const rect = rectFromCfg(box);
+    const west = Number(box.west), south = Number(box.south);
+    const east = Number(box.east), north = Number(box.north);
+    if (!isFinite(west) || !isFinite(south) || !isFinite(east) || !isFinite(north) ||
+        west < -180 || east > 180 || south < -90 || north > 90 ||
+        west >= east || south >= north) {{
+      console.warn("[MapCamera] invalid rectangle", box);
+      return false;
+    }}
+    const rect = rectFromCfg({{ west, south, east, north }});
     const center = Cesium.Rectangle.center(rect);
     const lon = Cesium.Math.toDegrees(center.longitude);
     const lat = Cesium.Math.toDegrees(center.latitude);
-    const range = heightForRectangle(box);
+    let range = Number(opts && opts.height);
+    if (!isFinite(range) || range <= 0) range = heightForRectangle({{ west, south, east, north }});
     return navigateToLocation({{
       longitude: lon,
       latitude: lat,
       height: range,
       duration: (opts && opts.duration != null) ? opts.duration : (CFG.duration || 1.0),
+      pitch: (opts && opts.pitch != null) ? opts.pitch : defaultPitchDeg(),
+      heading: (opts && opts.heading != null) ? opts.heading : defaultHeadingDeg(),
       source: (opts && opts.source) || "rectangle",
       force: !!(opts && opts.force),
     }});
@@ -1005,6 +1016,8 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
   let _parentOrigin = "";
   const _cstfLayers = {{}};
   let _aoiPreviewEntity = null;
+  let _lastFlyNavigationSeq = 0;
+  let _lastFlyCommandId = "";
 
   function clearLocalAoiPreview() {{
     if (!_aoiPreviewEntity) return;
@@ -1055,10 +1068,10 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
     }} catch (e) {{}}
   }}
 
-  function notifyAckToServer(commandId, ok) {{
+  function notifyAckToServer(commandId, ok, navigationSeq) {{
     try {{
       fetch(
-        "./api/map/ack?channel_id=" + encodeURIComponent(CFG.channelId || "default") + "&command_id=" + encodeURIComponent(commandId || "") + "&ok=" + (ok ? "1" : "0"),
+        "./api/map/ack?channel_id=" + encodeURIComponent(CFG.channelId || "default") + "&command_id=" + encodeURIComponent(commandId || "") + "&navigation_seq=" + encodeURIComponent(navigationSeq != null ? navigationSeq : "") + "&ok=" + (ok ? "1" : "0"),
         {{ method: "GET", cache: "no-store" }}
       ).catch(function() {{}});
     }} catch (e) {{}}
@@ -1069,6 +1082,7 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
       type: "CSTF_MAP_READY",
       version: 1,
       command_id: "ready-" + Date.now(),
+      channel_id: CFG.channelId || "default",
       status: "ready",
       viewer_init_count: window.__cstfViewerInitCount || 1,
       ts: Date.now(),
@@ -1081,12 +1095,13 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
       type: "CSTF_FLY_ACK",
       version: 1,
       command_id: commandId || "",
+      channel_id: CFG.channelId || "default",
       ok: !!ok,
       ts: Date.now(),
     }};
     if (extra) Object.assign(msg, extra);
     postToParent(msg);
-    notifyAckToServer(commandId, ok);
+    notifyAckToServer(commandId, ok, msg.navigation_seq);
   }}
 
   function sendLayerAck(commandId, layerId, ok, error) {{
@@ -1146,13 +1161,42 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
   // Streamlit 侧仅改 center/zoom 时通过 postMessage 飞行，避免 iframe 重建
   window.addEventListener("message", function(ev) {{
     if (!ev.origin) return;
-    _parentOrigin = ev.origin;  // 记录父窗口精确 origin，回发收紧 targetOrigin
     const data = ev.data;
     if (!data || typeof data !== "object") return;
     const type = data.type;
+    if (type !== "CSTF_FLY" && type !== "CSTF_LAYER_ADD" && type !== "CSTF_LAYER_REMOVE") return;
+    if (data.version !== 1) return;
+    if (data.channel_id !== (CFG.channelId || "default")) return;
+    _parentOrigin = ev.origin;  // 记录已通过协议/通道校验的父窗口 origin
 
     if (type === "CSTF_FLY") {{
-      const ok = navigateToLocation({{
+      const navigationSeq = Number(data.navigation_seq);
+      const hasNavigationSeq = Number.isFinite(navigationSeq) && navigationSeq > 0;
+      if (!hasNavigationSeq && _lastFlyNavigationSeq > 0) {{
+        // Legacy delivery remains supported only before this viewer has seen
+        // a sequenced command; afterwards it could only be a stale retry.
+        sendFlyAck(data.command_id, false, {{ error: "stale_navigation" }});
+        return;
+      }}
+      if (hasNavigationSeq && navigationSeq < _lastFlyNavigationSeq) {{
+        // A delayed retry must not drag the camera back to an older target.
+        sendFlyAck(data.command_id, false, {{
+          navigation_seq: navigationSeq,
+          error: "stale_navigation",
+        }});
+        return;
+      }}
+      if (hasNavigationSeq && navigationSeq === _lastFlyNavigationSeq &&
+          data.command_id === _lastFlyCommandId) {{
+        // Delivery retries get a correlated ACK without restarting the flight.
+        sendFlyAck(data.command_id, true, {{ navigation_seq: navigationSeq, retry: true }});
+        return;
+      }}
+      if (hasNavigationSeq) {{
+        _lastFlyNavigationSeq = navigationSeq;
+        _lastFlyCommandId = data.command_id || "";
+      }}
+      const navigationOptions = {{
         longitude: data.lon,
         latitude: data.lat,
         height: data.height,
@@ -1161,12 +1205,22 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
         duration: data.duration != null ? data.duration : 1.0,
         source: data.source || "postMessage",
         force: true,
-      }});
-      const label = data.label || (
-        Number(data.lat).toFixed(2) + "°N, " + Number(data.lon).toFixed(2) + "°E"
+      }};
+      let ok = data.bounds
+        ? navigateToRectangle(data.bounds, navigationOptions)
+        : navigateToLocation(navigationOptions);
+      // 不受信任的 postMessage 可能带有非法矩形；保留其点位定位退路。
+      if (!ok && data.bounds) ok = navigateToLocation(navigationOptions);
+      const label = data.label || (data.bounds
+        ? "区域范围"
+        : Number(data.lat).toFixed(2) + "°N, " + Number(data.lon).toFixed(2) + "°E"
       );
       if (ok) setStatus("底图就绪 · 已定位 " + label);
-      sendFlyAck(data.command_id, ok, {{ label: label, source: data.source || "postMessage" }});
+      sendFlyAck(data.command_id, ok, {{
+        label: label,
+        source: data.source || "postMessage",
+        navigation_seq: hasNavigationSeq ? navigationSeq : undefined,
+      }});
       return;
     }}
 

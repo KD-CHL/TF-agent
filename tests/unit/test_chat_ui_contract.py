@@ -357,6 +357,13 @@ class TestChatUiContract(unittest.TestCase):
         self.assertIn("oldTimers.forEach((timerId) => win.clearTimeout(timerId));", self.source)
         self.assertIn("win.__cstfFlyRetryTimers.push(timerId);", self.source)
 
+    def test_slow_map_ready_replays_the_latest_pending_fly(self):
+        """READY after all initial retries must replay the current channel payload."""
+        self.assertIn("const replayLatestFly = () =>", self.source)
+        self.assertIn('msg.type !== "CSTF_MAP_READY"', self.source)
+        self.assertIn("replayLatestFly();", self.source)
+        self.assertIn("clearFlyRetryTimers();", self.source)
+
     def test_alerts_are_dismissible_and_do_not_reflow_workbench(self):
         """错误/警告通知浮动显示并支持关闭，避免挤压地图与 Agent。"""
         self.assertIn("cstf-dismissible-alert", self.source)
@@ -376,12 +383,12 @@ class TestChatUiContract(unittest.TestCase):
 
     def test_chat_messages_have_distinct_left_right_alignment(self):
         """用户消息右对齐、助手消息左对齐，且卡片宽度受控。"""
-        self.assertIn('[data-testid="stChatMessage"]:has(.msg-role-user)', self.source)
+        self.assertIn('[data-testid="stChatMessage"]:has(.chat-role-label-user)', self.source)
         self.assertIn('flex-direction: row-reverse', self.source)
         self.assertIn('margin-left: auto', self.source)
-        self.assertIn('[data-testid="stChatMessage"]:has(.msg-role-assistant)', self.source)
+        self.assertIn('[data-testid="stChatMessage"]:has(.chat-role-label-agent)', self.source)
         self.assertIn('margin-right: auto', self.source)
-        self.assertIn('max-width: 86%', self.source)
+        self.assertIn('max-width: 85%', self.source)
 
     def test_chat_stream_and_composer_have_explicit_size_contract(self):
         """消息滚动区占剩余高度，输入区固定收缩，避免再次出现空白或溢出。"""
@@ -393,7 +400,7 @@ class TestChatUiContract(unittest.TestCase):
         """短消息不应继承整列宽度，长消息仍受最大宽度约束。"""
         self.assertIn('width: fit-content !important', self.source)
         self.assertIn('min-width: 7rem !important', self.source)
-        self.assertIn('max-width: 86% !important', self.source)
+        self.assertIn('max-width: 85% !important', self.source)
 
     def test_history_view_is_navigation_only_and_session_switch_opens_chat(self):
         """历史页仅展示记录，选中会话后自动返回对话视图。"""
