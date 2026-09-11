@@ -111,13 +111,31 @@ def _format_agent_exception(exc: Exception) -> str:
     return " | ".join(parts)
 
 
+_WORKER_LOG_HISTORY_LIMIT = 2000
+_WORKER_LOG_DISPLAY_LIMIT = 40
+
+
+def _append_worker_log(shared, line: str, display_limit: int = _WORKER_LOG_DISPLAY_LIMIT) -> None:
+    """Keep a bounded full worker log while retaining a short live-panel view.
+
+    ``log_lines`` intentionally stays small because it is rendered on every
+    Streamlit rerun.  Reports need the preceding AutoTune/post-processing
+    metrics as well, so keep a separate bounded history in the worker state.
+    """
+    safe_line = str(line or "")
+    with shared["lock"]:
+        history = list(shared.get("log_history") or [])
+        history.append(safe_line)
+        history = history[-_WORKER_LOG_HISTORY_LIMIT:]
+        shared["log_history"] = history
+        shared["log_lines"] = history[-max(1, int(display_limit)):]
+
+
 def _record_worker_exception(shared, label: str, error: BaseException) -> None:
     """Store only a bounded safe summary in UI worker state, never a traceback."""
     safe = safe_error_summary(error)
+    _append_worker_log(shared, f"[CRASH] {label}: {safe}")
     with shared["lock"]:
-        lines = list(shared.get("log_lines") or [])
-        lines.append(f"[CRASH] {label}: {safe}")
-        shared["log_lines"] = lines[-30:]
         shared["status"] = ("error", f"{label}：{safe}")
 
 
@@ -1127,8 +1145,7 @@ def run_m5_sync(ctx, shared, stop_event):
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] root@m5: {msg}"
         logs_local.append(line)
-        with shared["lock"]:
-            shared["log_lines"] = logs_local[-40:]
+        _append_worker_log(shared, line, display_limit=40)
         print(msg)
 
     def push_progress(pct):
@@ -1252,8 +1269,7 @@ def run_e1_sync(ctx, shared, stop_event):
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] root@e1: {msg}"
         logs_local.append(line)
-        with shared["lock"]:
-            shared["log_lines"] = logs_local[-40:]
+        _append_worker_log(shared, line, display_limit=40)
         print(msg)
 
     def push_progress(pct):
@@ -1450,8 +1466,7 @@ def run_pipeline_sync(ctx, shared, stop_event):
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] root@cstf: {msg}"
         logs_local.append(line)
-        with shared["lock"]:
-            shared["log_lines"] = logs_local[-30:]
+        _append_worker_log(shared, line, display_limit=30)
         print(msg)
 
     def push_progress(pct):
@@ -1586,7 +1601,9 @@ def run_pipeline_sync(ctx, shared, stop_event):
         success = post_engine.generate_double_constraint_complete(
             source_folder=input_dir, mask_folder=mask_out_dir, output_path=current_final_shp,
             shp_path=shp_path, prob_threshold=prob, min_absolute_count=cnt,
-            logger=bridge_logger, stop_callback=check_stop
+            logger=bridge_logger, stop_callback=check_stop,
+            # 监测报告基于栅格统计；保留与 Final SHP 同 stem 的 Final TIF。
+            keep_final_tif=True,
         )
         if success and (
             not os.path.isfile(current_final_shp)
@@ -1625,9 +1642,9 @@ def run_index_pipeline_sync(ctx, shared, stop_event):
 
     def push_log(msg):
         ts = datetime.datetime.now().strftime("%H:%M:%S")
-        logs_local.append(f"[{ts}] root@cstf: {msg}")
-        with shared["lock"]:
-            shared["log_lines"] = logs_local[-30:]
+        line = f"[{ts}] root@cstf: {msg}"
+        logs_local.append(line)
+        _append_worker_log(shared, line, display_limit=30)
         print(msg)
 
     def push_progress(pct):
@@ -1697,9 +1714,9 @@ def run_m4_download_sync(ctx, shared, stop_event):
 
     def push_log(msg):
         ts = datetime.datetime.now().strftime("%H:%M:%S")
-        logs_local.append(f"[{ts}] root@cstf: {msg}")
-        with shared["lock"]:
-            shared["log_lines"] = logs_local[-30:]
+        line = f"[{ts}] root@cstf: {msg}"
+        logs_local.append(line)
+        _append_worker_log(shared, line, display_limit=30)
         print(msg)
 
     def push_progress(pct):
@@ -1827,10 +1844,7 @@ def _workflow_worker_entry(ctx, shared, stop_event):
 
         def push_log(msg):
             ts = datetime.datetime.now().strftime("%H:%M:%S")
-            with shared["lock"]:
-                lines = list(shared.get("log_lines") or [])
-                lines.append(f"[{ts}] root@workflow: {msg}")
-                shared["log_lines"] = lines[-40:]
+            _append_worker_log(shared, f"[{ts}] root@workflow: {msg}", display_limit=40)
             print(msg)
 
         def push_progress(pct):
@@ -1860,6 +1874,7 @@ def _workflow_worker_entry(ctx, shared, stop_event):
             "report_output_dir": ctx.get("report_output_dir"),
             "baseline_task": ctx.get("baseline_task"),
             "push_progress": push_progress,
+            "terminal_logs": lambda: list(shared.get("log_history") or shared.get("log_lines") or []),
         }
         result = _wo.run_analysis_workflow(
             wf, exec_ctx=exec_ctx, push_log=push_log, stop_event=stop_event,
@@ -1913,10 +1928,17 @@ def _inference_worker_entry(ctx, shared, stop_event):
 
         def push_log(msg):
             ts = datetime.datetime.now().strftime("%H:%M:%S")
-            with shared["lock"]:
-                lines = list(shared.get("log_lines") or [])
-                lines.append(f"[{ts}] root@cstf: {msg}")
-                shared["log_lines"] = lines[-30:]
+            line = f"[{ts}] root@cstf: {msg}"
+            # Keep this worker extractable by lightweight contract tests and
+            # by legacy callers that provide only ``lock``/``log_lines``.
+            _append = globals().get("_append_worker_log")
+            if callable(_append):
+                _append(shared, line, display_limit=30)
+            else:
+                with shared["lock"]:
+                    lines = list(shared.get("log_lines") or [])
+                    lines.append(line)
+                    shared["log_lines"] = lines[-30:]
             print(msg)
 
         def push_progress(pct):
@@ -2035,10 +2057,17 @@ def _gee_worker_entry(ctx, shared, stop_event):
 
         def push_log(msg):
             ts = datetime.datetime.now().strftime("%H:%M:%S")
-            with shared["lock"]:
-                lines = list(shared.get("log_lines") or [])
-                lines.append(f"[{ts}] root@cstf: {msg}")
-                shared["log_lines"] = lines[-30:]
+            line = f"[{ts}] root@cstf: {msg}"
+            # Keep this worker extractable by lightweight contract tests and
+            # by legacy callers that provide only ``lock``/``log_lines``.
+            _append = globals().get("_append_worker_log")
+            if callable(_append):
+                _append(shared, line, display_limit=30)
+            else:
+                with shared["lock"]:
+                    lines = list(shared.get("log_lines") or [])
+                    lines.append(line)
+                    shared["log_lines"] = lines[-30:]
             print(msg)
 
         def push_progress(pct):
@@ -2188,6 +2217,10 @@ if "executing_pipeline" not in st.session_state:
     st.session_state.executing_pipeline = False
 if "pipeline_log_snapshot" not in st.session_state:
     st.session_state.pipeline_log_snapshot = []
+if "pipeline_log_history" not in st.session_state:
+    st.session_state.pipeline_log_history = []
+if "pipeline_execution_results" not in st.session_state:
+    st.session_state.pipeline_execution_results = {}
 if "pipeline_progress_value" not in st.session_state:
     st.session_state.pipeline_progress_value = 0
 if "pipeline_thread_started" not in st.session_state:
@@ -6516,6 +6549,7 @@ def finalize_background_pipeline():
         )
         asset_path = shared.get("asset_path")
         lines = list(shared.get("log_lines") or [])
+        terminal_logs = list(shared.get("log_history") or lines)
         prog = int(shared.get("progress", 0))
         at_result = shared.get("autotune_result")
         m5_report = shared.get("m5_report")
@@ -6528,9 +6562,27 @@ def finalize_background_pipeline():
         inference_result = shared.get("inference_result")
         inference_verification = shared.get("inference_verification")
         inference_asset_id = shared.get("asset_id")
+        gee_result = shared.get("gee_result")
+        gee_verification = shared.get("gee_verification")
+        gee_dataset_id = shared.get("dataset_id")
+        gee_cloud_outcome = shared.get("gee_cloud_outcome")
+        workflow_result = shared.get("workflow_result")
     _failure_timeline_status = "CANCELLED" if _job_was_stopped else "FAILED"
     _tl_task = st.session_state.get("_tl_current_task") or "unknown"
     st.session_state.pipeline_log_snapshot = lines
+    st.session_state.pipeline_log_history = terminal_logs
+    _execution_results = {}
+    for _result_key, _result_value in (
+        ("autotune", at_result),
+        ("inference", inference_result),
+        ("gee", gee_result),
+        ("m5", m5_report),
+        ("e1", e1_report),
+        ("workflow", workflow_result),
+    ):
+        if isinstance(_result_value, dict):
+            _execution_results[_result_key] = _result_value
+    st.session_state.pipeline_execution_results = _execution_results
     st.session_state.pipeline_progress_value = prog
     st.session_state.is_running = False
     st.session_state.pipeline_thread_started = False
@@ -6540,6 +6592,10 @@ def finalize_background_pipeline():
     st.session_state.executing_pipeline = False
     if at_result:
         st.session_state.autotune_result = at_result
+    if inference_result is not None:
+        st.session_state.inference_result = inference_result
+    if gee_result is not None:
+        st.session_state.gee_result = gee_result
     # ---- 本地潮滩推理可信执行闭环收尾 ----
     if inference_result is not None or inference_asset_id:
         _iv_ok = bool(inference_verification and inference_verification.get("ok") is True)
@@ -6605,10 +6661,6 @@ def finalize_background_pipeline():
                 tool="run_inference",
             )
     # ---- GEE 影像下载可信执行闭环收尾 ----
-    gee_result = shared.get("gee_result") if shared else None
-    gee_verification = shared.get("gee_verification") if shared else None
-    gee_dataset_id = shared.get("dataset_id") if shared else None
-    gee_cloud_outcome = shared.get("gee_cloud_outcome") if shared else None
     if gee_result is not None or gee_dataset_id:
         _gv_ok = bool(gee_verification and gee_verification.get("ok") is True)
         if success and _gv_ok:
@@ -6942,8 +6994,7 @@ def run_autotune_sync(ctx, shared, stop_event):
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] root@autotune: {msg}"
         logs_local.append(line)
-        with shared["lock"]:
-            shared["log_lines"] = logs_local[-40:]
+        _append_worker_log(shared, line, display_limit=40)
         print(msg)
 
     def push_progress(pct):
@@ -7046,6 +7097,8 @@ def maybe_start_pipeline_thread():
         st.session_state.pop("pending_autotune", None)
         st.session_state.pipeline_thread_started = True
         st.session_state.pipeline_log_snapshot = []
+        st.session_state.pipeline_log_history = []
+        st.session_state.pipeline_execution_results = {}
         st.session_state.pipeline_progress_value = 0
         st.session_state.executing_pipeline = True
         st.session_state._tl_current_task = at_info["task"]
@@ -7080,6 +7133,7 @@ def maybe_start_pipeline_thread():
             "lock": threading.Lock(),
             "job_id": _at_job.job_id,
             "log_lines": [],
+            "log_history": [],
             "progress": 0,
             "status": ("info", "🔬 正在启动参数优化线程…"),
             "done": False,
@@ -7180,6 +7234,8 @@ def maybe_start_pipeline_thread():
     st.session_state.pending_task = None
     st.session_state.pipeline_thread_started = True
     st.session_state.pipeline_log_snapshot = []
+    st.session_state.pipeline_log_history = []
+    st.session_state.pipeline_execution_results = {}
     st.session_state.pipeline_progress_value = 0
     st.session_state.executing_pipeline = True
     st.session_state._tl_current_task = task_info.get("task") or "unknown"
@@ -7196,6 +7252,7 @@ def maybe_start_pipeline_thread():
         "lock": threading.Lock(),
         "job_id": _job_record.job_id,
         "log_lines": [],
+        "log_history": [],
         "progress": 0,
         "status": ("info", "正在启动后台线程…"),
         "done": False,
@@ -7630,6 +7687,33 @@ def _record_report_outcome(
     st.session_state.pop("_active_report_plan_id", None)
 
 
+def _report_runtime_inputs():
+    """Return the current task's bounded terminal history and result payloads.
+
+    The live panel intentionally renders only a short tail.  Report builders
+    consume the separate history captured by worker callbacks so AutoTune and
+    post-processing metrics are not lost when the terminal viewport scrolls.
+    """
+    terminal_logs = list(
+        st.session_state.get("pipeline_log_history")
+        or st.session_state.get("pipeline_log_snapshot")
+        or []
+    )
+    execution_results = dict(st.session_state.get("pipeline_execution_results") or {})
+    if not execution_results:
+        for state_key, result_key in (
+            ("autotune_result", "autotune"),
+            ("inference_result", "inference"),
+            ("gee_result", "gee"),
+            ("m5_report", "m5"),
+            ("e1_report", "e1"),
+        ):
+            value = st.session_state.get(state_key)
+            if isinstance(value, dict):
+                execution_results[result_key] = value
+    return terminal_logs, execution_results
+
+
 def _build_asset_report():
     try:
         import asset_report_engine as _are
@@ -7654,8 +7738,11 @@ def _build_asset_report():
                 "text": "未识别到目标任务，请在左侧选择目标任务",
             }
             return
+        _terminal_logs, _execution_results = _report_runtime_inputs()
         _res = _are.generate_asset_report(
             _task, progress_callback=lambda p, m: None,
+            terminal_logs=_terminal_logs,
+            execution_results=_execution_results,
         )
         if _res.success and _res.report_path:
             _record_report_outcome(_task, "asset_report_engine", _res.report_path)
@@ -7720,8 +7807,20 @@ def _build_pdf_report():
         for _e in _events:
             for _a in (_e.artifacts or []):
                 _assets.append({"path": str(_a), "kind": "artifact"})
+        # 将当前任务资产库中的完整成果（Final TIF/SHP、参数、状态）一并写入任务报告。
+        try:
+            for _key, _row in get_task_assets(_task_id).items():
+                _asset_row = dict(_row)
+                _asset_row.setdefault("path", _asset_row.get("file_path") or "")
+                _asset_row.setdefault("kind", _asset_row.get("asset_type") or "result")
+                _asset_row["key"] = _key
+                _assets.append(_asset_row)
+        except Exception:
+            pass
+        _terminal_logs, _execution_results = _report_runtime_inputs()
         _res = _rg.generate_task_report(
             _task_ctx, capabilities=_caps, timeline=_events, assets=_assets,
+            terminal_logs=_terminal_logs, execution_results=_execution_results,
         )
         if _res.success and _res.report_path:
             _record_report_outcome(_task_id, "report_generator", _res.report_path)
