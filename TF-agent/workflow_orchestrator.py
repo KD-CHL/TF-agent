@@ -1039,6 +1039,7 @@ def _run_e1_step(step, workflow, *, exec_ctx, push_log, stop_event) -> Dict[str,
             export_multi_product_heatmap=p.get(
                 "export_multi_product_heatmap", True),
             logger=lg,
+            stop_callback=se,
         )
         if not report:
             return {"success": False, "report": None,

@@ -15,7 +15,7 @@ import sys
 import warnings
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import geopandas as gpd
 import numpy as np
@@ -50,6 +50,51 @@ DEFAULT_TILE_SIZE = 4096
 CHINA_BOUNDS_4326 = (107.996, 18.159, 124.229, 41.019)
 
 DEFAULT_DATA_ROOT = r"E:\潮滩数据集"
+
+
+class E1Cancelled(RuntimeError):
+    """Raised when a cooperative stop is requested during a tiled E1 run."""
+
+
+def _stop_requested(stop_callback: Optional[Callable[[], bool]]) -> bool:
+    if not stop_callback:
+        return False
+
+
+def _vector_bounds_4326(path: Union[str, Path]) -> Optional[Tuple[float, float, float, float]]:
+    """Read a vector extent and normalize it to WGS84.
+
+    E1 historically used ``CHINA_BOUNDS_4326`` whenever no explicit ROI was
+    supplied.  That turns a local prediction into a nationwide 30 m grid and
+    can make an otherwise valid evaluation appear hung or fail from resource
+    pressure.  The target result is a safe fallback extent because it bounds
+    the comparison without treating the prediction geometry as the ROI mask.
+    """
+    try:
+        gdf = gpd.read_file(path)
+        crs = getattr(gdf, "crs", None)
+        if crs is not None:
+            crs_text = str(crs).upper()
+            if "4326" not in crs_text and "CRS84" not in crs_text:
+                gdf = gdf.to_crs(TARGET_VECTOR_CRS)
+        bounds = getattr(gdf, "total_bounds", None)
+        if bounds is None or len(bounds) != 4:
+            return None
+        values = tuple(float(v) for v in bounds)
+        west, south, east, north = values
+        if not all(np.isfinite(values)) or east <= west or north <= south:
+            return None
+        if west < -180 or east > 180 or south < -90 or north > 90:
+            return None
+        return values
+    except Exception:
+        return None
+    try:
+        return bool(stop_callback())
+    except Exception:
+        # A diagnostic callback must never make E1 fail spuriously.  The
+        # worker still has its own event and will perform a final gate.
+        return False
 
 
 def _find_child(root: Path, *keywords: str) -> Optional[Path]:
@@ -546,10 +591,13 @@ class E1_DataCleanerAndDiagnostic:
         gdf_cache: Dict[str, gpd.GeoDataFrame],
         tile_size: int = DEFAULT_TILE_SIZE,
         writers: Optional[Dict[str, Any]] = None,
+        stop_callback: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, float]:
         stats = {"inter": 0, "only_a": 0, "only_b": 0, "union": 0, "cnt_a": 0, "cnt_b": 0}
         total = 0
         for row, col, h, w, done, total in self._iter_tiles(width, height, tile_size):
+            if _stop_requested(stop_callback):
+                raise E1Cancelled("E1 精度评价被用户中断")
             win = Window(col, row, w, h)
             sub_transform = window_transform(win, transform)
             shape = (h, w)
@@ -565,6 +613,8 @@ class E1_DataCleanerAndDiagnostic:
                 self._write_tile(writers["class"], cls, col, row)
             if done == 1 or done == total or done % max(1, total // 10) == 0:
                 print(f"    分块进度 {done}/{total}", flush=True)
+        if _stop_requested(stop_callback):
+            raise E1Cancelled("E1 精度评价被用户中断")
         metrics = self._stats_to_metrics(stats, pair_name=f"{name_a}_vs_{name_b}")
         metrics["tiles_processed"] = total
         return metrics
@@ -580,12 +630,15 @@ class E1_DataCleanerAndDiagnostic:
         gdf_cache: Dict[str, gpd.GeoDataFrame],
         tile_size: int = DEFAULT_TILE_SIZE,
         writers: Optional[Dict[str, Any]] = None,
+        stop_callback: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, float]:
         stats = {"inter": 0, "only_a": 0, "only_b": 0, "union": 0, "cnt_a": 0, "cnt_b": 0}
         if roi_gdf is not None:
             gdf_a = gpd.clip(gdf_a, roi_gdf.to_crs(TARGET_VECTOR_CRS))
         total = 0
         for row, col, h, w, done, total in self._iter_tiles(width, height, tile_size):
+            if _stop_requested(stop_callback):
+                raise E1Cancelled("E1 精度评价被用户中断")
             win = Window(col, row, w, h)
             sub_transform = window_transform(win, transform)
             shape = (h, w)
@@ -604,6 +657,8 @@ class E1_DataCleanerAndDiagnostic:
                 self._write_tile(writers["class"], cls, col, row)
             if done == 1 or done == total or done % max(1, total // 10) == 0:
                 print(f"    分块进度 {done}/{total}", flush=True)
+        if _stop_requested(stop_callback):
+            raise E1Cancelled("E1 精度评价被用户中断")
         return self._stats_to_metrics(stats, pair_name=f"product_vs_{name_b}")
 
     def _save_geotiff(
@@ -908,6 +963,7 @@ class E1_DataCleanerAndDiagnostic:
         gdf_cache: Dict[str, gpd.GeoDataFrame],
         roi_name: str,
         tile_size: int = DEFAULT_TILE_SIZE,
+        stop_callback: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         """多产品一致计数热力图：像元值 = 判定为潮滩的产品数量 (0..N)。"""
         all_names = [reference] + [n for n in product_names if n != reference]
@@ -926,6 +982,10 @@ class E1_DataCleanerAndDiagnostic:
         total_valid = 0
 
         for row, col, h, w, done, total in self._iter_tiles(width, height, tile_size):
+            if _stop_requested(stop_callback):
+                count_dst.close()
+                disagree_dst.close()
+                raise E1Cancelled("E1 精度评价被用户中断")
             win = Window(col, row, w, h)
             sub_transform = window_transform(win, transform)
             shape = (h, w)
@@ -952,6 +1012,11 @@ class E1_DataCleanerAndDiagnostic:
 
             if done == 1 or done == total or done % max(1, total // 5) == 0:
                 print(f"  多产品热力图 {done}/{total}", flush=True)
+
+        if _stop_requested(stop_callback):
+            count_dst.close()
+            disagree_dst.close()
+            raise E1Cancelled("E1 精度评价被用户中断")
 
         count_dst.close()
         disagree_dst.close()
@@ -1038,6 +1103,7 @@ class E1_DataCleanerAndDiagnostic:
         export_disagreement_maps: Optional[bool] = None,
         export_multi_product_heatmap: bool = True,
         tile_size: int = DEFAULT_TILE_SIZE,
+        stop_callback: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         """
         像元级多源对比（默认以师姐产品为 reference）。
@@ -1049,14 +1115,34 @@ class E1_DataCleanerAndDiagnostic:
         :param export_disagreement_maps: 是否导出分歧图（分块 COG 写入，全国可用）
         :param export_multi_product_heatmap: 是否导出多产品一致计数热力图
         """
+        if _stop_requested(stop_callback):
+            raise E1Cancelled("E1 精度评价被用户中断")
         if reference not in self.dataset_specs:
             raise KeyError(f"reference [{reference}] 不在已注册列表: {self.list_datasets()}")
 
         if compare_sources is None:
             compare_sources = [n for n in self.list_datasets() if n != reference]
 
-        roi_gdf, _ = self._load_roi(roi_path, CHINA_BOUNDS_4326)
-        transform, width, height, crs = self.build_reference_grid(roi_path)
+        # A missing explicit ROI used to silently expand every local target to
+        # the China-wide 30 m grid.  Keep an explicit ROI authoritative; when
+        # it is absent, bound the grid by the target vector extent instead.
+        grid_bounds = CHINA_BOUNDS_4326
+        target_extent_used = False
+        if not roi_path and target_path:
+            target_bounds = _vector_bounds_4326(target_path)
+            if target_bounds is not None:
+                grid_bounds = target_bounds
+                target_extent_used = True
+                print(
+                    "  未指定 ROI，已按目标成果范围建立评价网格: "
+                    f"({grid_bounds[0]:.6f}, {grid_bounds[1]:.6f}, "
+                    f"{grid_bounds[2]:.6f}, {grid_bounds[3]:.6f})"
+                )
+
+        roi_gdf, resolved_bounds = self._load_roi(roi_path, grid_bounds)
+        transform, width, height, crs = self.build_reference_grid(
+            roi_path, bounds_4326=grid_bounds
+        )
         total_pixels = width * height
         use_tiled = total_pixels > MAX_FULL_RASTER_PIXELS
         if export_rasters is None:
@@ -1086,6 +1172,8 @@ class E1_DataCleanerAndDiagnostic:
             "raster_crs": RASTER_CRS,
             "pixel_size_m": self.pixel_size_m,
             "grid_size": {"width": width, "height": height},
+            "bounds_4326": [float(v) for v in resolved_bounds],
+            "target_extent_used": target_extent_used,
             "tiled_mode": use_tiled,
             "export_rasters": export_rasters,
             "export_disagreement_maps": export_disagreement_maps,
@@ -1093,6 +1181,8 @@ class E1_DataCleanerAndDiagnostic:
         }
 
         if export_rasters and not use_tiled:
+            if _stop_requested(stop_callback):
+                raise E1Cancelled("E1 精度评价被用户中断")
             ref_raster = self._dataset_to_raster(
                 reference, transform, (height, width), roi_gdf, gdf_cache
             )
@@ -1115,6 +1205,8 @@ class E1_DataCleanerAndDiagnostic:
                 )
 
         if target_path:
+            if _stop_requested(stop_callback):
+                raise E1Cancelled("E1 精度评价被用户中断")
             target_path = ux.normalize_path(target_path, must_exist=True)
             target_gdf = self.normalize_vector(target_path, target_name, save=True)
             pair_name = f"{target_name}_vs_{reference}"
@@ -1140,6 +1232,7 @@ class E1_DataCleanerAndDiagnostic:
             else:
                 out_dir = self.output_dir / roi_name / pair_name
                 writers = None
+                metrics: Dict[str, Any] = {}
                 if use_tiled and export_disagreement_maps:
                     writers = self._open_pair_disagreement_writers(
                         out_dir, transform, crs, width, height
@@ -1156,14 +1249,19 @@ class E1_DataCleanerAndDiagnostic:
                             gdf_cache,
                             tile_size,
                             writers=writers,
+                            stop_callback=stop_callback,
                         )
                     else:
+                        if _stop_requested(stop_callback):
+                            raise E1Cancelled("E1 精度评价被用户中断")
                         target_raster = self.vector_to_raster(
                             target_gdf, transform, (height, width), roi_gdf
                         )
                         ref_raster = self._dataset_to_raster(
                             reference, transform, (height, width), roi_gdf, gdf_cache
                         )
+                        if _stop_requested(stop_callback):
+                            raise E1Cancelled("E1 精度评价被用户中断")
                         if export_rasters:
                             self._save_geotiff(
                                 target_raster,
@@ -1190,6 +1288,8 @@ class E1_DataCleanerAndDiagnostic:
 
         successful_compare = []
         for src in compare_sources:
+            if _stop_requested(stop_callback):
+                raise E1Cancelled("E1 精度评价被用户中断")
             if src == reference:
                 continue
             if src not in self.dataset_specs:
@@ -1200,6 +1300,7 @@ class E1_DataCleanerAndDiagnostic:
             print(f"  对比 [{pair_name}] ...")
             out_dir = self.output_dir / roi_name / pair_name
             writers = None
+            metrics: Dict[str, Any] = {}
             if use_tiled and export_disagreement_maps:
                 writers = self._open_pair_disagreement_writers(
                     out_dir, transform, crs, width, height
@@ -1216,14 +1317,19 @@ class E1_DataCleanerAndDiagnostic:
                         gdf_cache,
                         tile_size,
                         writers=writers,
+                        stop_callback=stop_callback,
                     )
                 else:
+                    if _stop_requested(stop_callback):
+                        raise E1Cancelled("E1 精度评价被用户中断")
                     src_raster = self._dataset_to_raster(
                         src, transform, (height, width), roi_gdf, gdf_cache
                     )
                     ref_raster = self._dataset_to_raster(
                         reference, transform, (height, width), roi_gdf, gdf_cache
                     )
+                    if _stop_requested(stop_callback):
+                        raise E1Cancelled("E1 精度评价被用户中断")
                     if export_rasters:
                         self._save_geotiff(
                             src_raster,
@@ -1238,6 +1344,10 @@ class E1_DataCleanerAndDiagnostic:
                             src_raster, ref_raster, transform, crs, roi_name, pair_name
                         )
                         metrics["disagreement_maps"] = self._disagreement_map_paths(out_dir)
+            except E1Cancelled:
+                if writers:
+                    self._close_writers(writers)
+                raise
             except Exception as exc:
                 print(f"    失败: {exc}")
                 results["comparisons"][pair_name] = {"error": str(exc)}
@@ -1261,6 +1371,8 @@ class E1_DataCleanerAndDiagnostic:
             )
 
         if export_multi_product_heatmap and len(successful_compare) >= 2:
+            if _stop_requested(stop_callback):
+                raise E1Cancelled("E1 精度评价被用户中断")
             print("\n  导出多产品一致热力图 ...")
             try:
                 results["multi_product_heatmap"] = self._export_multi_product_heatmap_tiled(
@@ -1273,16 +1385,28 @@ class E1_DataCleanerAndDiagnostic:
                     gdf_cache,
                     roi_name,
                     tile_size,
+                    stop_callback=stop_callback,
                 )
+            except E1Cancelled:
+                raise
             except Exception as exc:
                 print(f"  多产品热力图失败: {exc}")
                 results["multi_product_heatmap"] = {"error": str(exc)}
 
+        if _stop_requested(stop_callback):
+            raise E1Cancelled("E1 精度评价被用户中断")
+
         report_path = self.output_dir / f"E1_PIXEL_REPORT_{roi_name}.json"
+        # Keep deterministic provenance in the JSON itself.  This also makes
+        # reports generated by the low-level engine verifiable after reload,
+        # without relying on the wrapper having been the original caller.
+        results["report_path"] = str(report_path)
+        results["report_md_path"] = str(self.output_dir / f"E1_PIXEL_REPORT_{roi_name}.md")
+        results["workspace_dir"] = str(self.workspace)
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
 
-        md_path = self.output_dir / f"E1_PIXEL_REPORT_{roi_name}.md"
+        md_path = Path(results["report_md_path"])
         self._write_markdown_report(results, md_path)
 
         print(f"\n报告已保存: {report_path}")

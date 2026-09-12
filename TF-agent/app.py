@@ -1098,12 +1098,15 @@ def _run_m5_phase(ctx, shared, current_shp, actual_task, prob, cnt, push_log, ch
             workspace_dir=ctx["final_root"],
             logger=push_log,
         )
+        if check_stop():
+            push_log("[M5] 已收到中断请求，跳过后续校验与资产登记。")
+            return None
         if report:
             verification = m5_agent_loop.verify_m5_outputs(
                 report, workspace_dir=ctx["final_root"]
             )
             asset_id = None
-            if verification.get("ok") is True:
+            if verification.get("ok") is True and not check_stop():
                 try:
                     asset_id = register_m5_asset(actual_task, report)
                     if not asset_id:
@@ -1117,6 +1120,8 @@ def _run_m5_phase(ctx, shared, current_shp, actual_task, prob, cnt, push_log, ch
                         "name": "asset_registration", "passed": False, "detail": reg_error,
                     }]
                     push_log(f"[M5] 后置资产登记失败（不阻断主流程）: {reg_error}")
+            elif check_stop():
+                push_log("[M5] 已收到中断请求，未登记变化分析成果。")
             with shared["lock"]:
                 shared["m5_report"] = report
                 shared["m5_verification"] = verification
@@ -1194,6 +1199,10 @@ def run_m5_sync(ctx, shared, stop_event):
             workspace_dir=ctx["final_root"],
             logger=push_log,
         )
+        if stop_event.is_set():
+            push_status("warning", "变化分析已中断，未登记成果")
+            push_log("[M5] 已收到中断请求，跳过后续校验与资产登记。")
+            return False
         push_progress(80)
         if not report:
             push_status("warning", "变化分析未生成结果")
@@ -1202,7 +1211,7 @@ def run_m5_sync(ctx, shared, stop_event):
         verification = m5_agent_loop.verify_m5_outputs(report, workspace_dir=ctx["final_root"])
         map_path = verification.get("map_candidate") or m5_agent_loop.pick_m5_map_path(report)
         verified = verification.get("ok") is True
-        if verified:
+        if verified and not stop_event.is_set():
             try:
                 asset_id = register_m5_asset(task, report)
                 if not asset_id:
@@ -1217,6 +1226,10 @@ def run_m5_sync(ctx, shared, stop_event):
                     "name": "asset_registration", "passed": False, "detail": reg_error,
                 }]
                 push_log(f"[M5] 资产登记失败，任务不提交成功: {reg_error}")
+        elif stop_event.is_set():
+            push_status("warning", "变化分析已中断，未登记成果")
+            push_log("[M5] 已收到中断请求，未登记变化分析成果。")
+            return False
         else:
             push_log("[M5] 输出校验未通过，未登记或加载未验证成果。")
 
@@ -1322,7 +1335,12 @@ def run_e1_sync(ctx, shared, stop_event):
             export_disagreement_maps=bool(e1_cfg.get("export_disagreement_maps", True)),
             export_multi_product_heatmap=bool(e1_cfg.get("export_multi_product_heatmap", True)),
             logger=push_log,
+            stop_callback=check_stop,
         )
+        if stop_event.is_set():
+            push_status("warning", "精度评价已中断，未登记成果")
+            push_log("[E1] 已收到中断请求，跳过后续校验与资产登记。")
+            return False
         push_progress(80)
         if not report:
             push_status("warning", "精度评价未生成结果")
@@ -1330,7 +1348,7 @@ def run_e1_sync(ctx, shared, stop_event):
         verification = e1_agent_loop.verify_e1_outputs(report)
         map_path = verification.get("map_candidate") or e1_agent_loop.pick_e1_map_path(report)
         verified = verification.get("ok") is True
-        if verified:
+        if verified and not stop_event.is_set():
             try:
                 asset_id = register_e1_asset(task, report)
                 if not asset_id:
@@ -1345,6 +1363,10 @@ def run_e1_sync(ctx, shared, stop_event):
                     "name": "asset_registration", "passed": False, "detail": reg_error,
                 }]
                 push_log(f"[E1] 资产登记失败，任务不提交成功: {reg_error}")
+        elif stop_event.is_set():
+            push_status("warning", "精度评价已中断，未登记成果")
+            push_log("[E1] 已收到中断请求，未登记精度评价成果。")
+            return False
         else:
             push_log("[E1] 输出校验未通过，未登记或加载未验证成果。")
 
@@ -1417,11 +1439,15 @@ def _run_e1_phase(ctx, shared, current_shp, actual_task, push_log, check_stop):
             export_disagreement_maps=bool(ctx.get("e1_export_maps", True)),
             export_multi_product_heatmap=bool(ctx.get("e1_export_heatmap", True)),
             logger=push_log,
+            stop_callback=check_stop,
         )
+        if check_stop():
+            push_log("[E1] 已收到中断请求，跳过后续校验与资产登记。")
+            return None
         if report:
             verification = e1_agent_loop.verify_e1_outputs(report)
             asset_id = None
-            if verification.get("ok") is True:
+            if verification.get("ok") is True and not check_stop():
                 try:
                     asset_id = register_e1_asset(actual_task, report)
                     if not asset_id:
@@ -1435,6 +1461,8 @@ def _run_e1_phase(ctx, shared, current_shp, actual_task, push_log, check_stop):
                         "name": "asset_registration", "passed": False, "detail": reg_error,
                     }]
                     push_log(f"[E1] 后置资产登记失败（不阻断主流程）: {reg_error}")
+            elif check_stop():
+                push_log("[E1] 已收到中断请求，未登记精度评价成果。")
             with shared["lock"]:
                 shared["e1_report"] = report
                 shared["e1_verification"] = verification
@@ -1517,6 +1545,9 @@ def run_pipeline_sync(ctx, shared, stop_event):
                 cached_shp = _alt
         _run_m5_phase(ctx, shared, cached_shp, actual_task, prob, cnt, push_log, check_stop)
         _run_e1_phase(ctx, shared, cached_shp, actual_task, push_log, check_stop)
+        if check_stop():
+            push_status("warning", "任务已被手动中止，未加载缓存成果。")
+            return False
         push_status("success", "⚡ 发现已有资产！直接加载，无需重新计算")
         push_progress(100)
         with shared["lock"]:
@@ -1612,10 +1643,18 @@ def run_pipeline_sync(ctx, shared, stop_event):
             push_log("[SYSTEM] 合成引擎返回成功，但最终成果文件缺失或为空；不登记为成功。")
             push_status("error", "合成结果校验失败：成果文件缺失或为空。")
             return False
+        if check_stop():
+            push_log("[SYSTEM] 合成完成后收到中断信号，未登记成果。")
+            push_status("warning", "任务已被手动中止，未登记成果。")
+            return False
         if success:
             register_asset(actual_task, prob, cnt, current_final_shp)
             _run_m5_phase(ctx, shared, current_final_shp, actual_task, prob, cnt, push_log, check_stop)
             _run_e1_phase(ctx, shared, current_final_shp, actual_task, push_log, check_stop)
+            if check_stop():
+                push_log("[SYSTEM] 后置分析期间收到中断信号，未报告为成功。")
+                push_status("warning", "任务已被手动中止，未报告为成功。")
+                return False
             push_progress(100)
             push_status("success", "🎉 全流程完毕！结果已生成并注册到资产库。")
             with shared["lock"]:
@@ -1672,6 +1711,9 @@ def run_index_pipeline_sync(ctx, shared, stop_event):
         if os.path.isfile(index_shp):
             _run_m5_phase(ctx, shared, index_shp, actual_task, None, None, push_log, check_stop)
             _run_e1_phase(ctx, shared, index_shp, actual_task, push_log, check_stop)
+        if check_stop():
+            push_status("warning", "任务已被手动中止，未加载缓存成果。")
+            return False
         push_status("success", "⚡ 发现已有指数法成果，直接加载")
         push_progress(100)
         with shared["lock"]:
@@ -1697,6 +1739,9 @@ def run_index_pipeline_sync(ctx, shared, stop_event):
     if os.path.isfile(index_shp):
         _run_m5_phase(ctx, shared, index_shp, actual_task, None, None, push_log, check_stop)
         _run_e1_phase(ctx, shared, index_shp, actual_task, push_log, check_stop)
+    if check_stop():
+        push_status("warning", "指数法提取已中断，未报告为成功。")
+        return False
     push_status("success", index_agent_loop.summarize_index_result(result))
     with shared["lock"]:
         shared["asset_path"] = result.get("result_path")
@@ -1884,7 +1929,9 @@ def _workflow_worker_entry(ctx, shared, stop_event):
         final_status = result.get("status")
         ok = final_status in ("SUCCEEDED", "COMPLETED_WITH_WARNINGS")
         summary = result.get("summary") or ""
-        if ok:
+        if stop_event.is_set() or final_status == "CANCELLED":
+            push_status("warning", "一键潮滩分析已中断，未登记后续成果。")
+        elif ok:
             push_status(
                 "success" if final_status == "SUCCEEDED" else "warning",
                 f"一键潮滩分析完成 · {uil.get_status_label(final_status)}",
@@ -1983,6 +2030,21 @@ def _inference_worker_entry(ctx, shared, stop_event):
                 push_log=push_log,
                 push_progress=push_progress,
             )
+        # A cooperative stop may arrive while the last inference/post-process
+        # operation is returning.  Check before any UI success/verification
+        # side effect so a late worker result cannot reopen the cancelled job.
+        if stop_event.is_set():
+            result = dict(result or {})
+            result.update({
+                "success": False,
+                "status": "cancelled",
+                "outputs": {},
+                "error": "推理被用户中断。",
+            })
+            push_status("warning", "潮滩智能提取已中断，未登记成果。")
+            with shared["lock"]:
+                shared["inference_result"] = result
+            return
         if not result or result.get("success") is not True:
             err = sanitize_external_text((result or {}).get("error") or "提取失败")[:240]
             push_status("error", f"❌ {err}")
@@ -1992,6 +2054,19 @@ def _inference_worker_entry(ctx, shared, stop_event):
 
         push_status("info", "提取完成，正在校验磁盘成果…")
         verification = verification or ial.verify_inference_outputs(plan, result, started_at=started)
+        if stop_event.is_set():
+            result = dict(result or {})
+            result.update({
+                "success": False,
+                "status": "cancelled",
+                "outputs": {},
+                "error": "推理被用户中断。",
+            })
+            push_status("warning", "潮滩智能提取已中断，未登记成果。")
+            with shared["lock"]:
+                shared["inference_result"] = result
+                shared["inference_verification"] = verification or {}
+            return
         if not verification or verification.get("ok") is not True:
             failed = [c.get("name") for c in (verification or {}).get("checks") or []
                       if not c.get("passed")]
@@ -2001,6 +2076,19 @@ def _inference_worker_entry(ctx, shared, stop_event):
                 shared["inference_verification"] = verification or {}
             return
 
+        if stop_event.is_set():
+            result = dict(result or {})
+            result.update({
+                "success": False,
+                "status": "cancelled",
+                "outputs": {},
+                "error": "推理被用户中断。",
+            })
+            push_status("warning", "潮滩智能提取已中断，未登记成果。")
+            with shared["lock"]:
+                shared["inference_result"] = result
+                shared["inference_verification"] = verification
+            return
         asset_id = ial.register_inference_asset(plan, result, verification)
         if not asset_id:
             push_status("error", "❌ 校验通过但资产登记失败（未登记成果）。")
@@ -2090,6 +2178,19 @@ def _gee_worker_entry(ctx, shared, stop_event):
             push_log=push_log,
             push_progress=push_progress,
         )
+        # 远程提交/本地下载返回后仍要确认停止信号，避免停止按钮与
+        # worker 成功返回竞态，继续进入校验和登记。
+        if stop_event.is_set():
+            result = dict(result or {})
+            result.update({
+                "success": False,
+                "status": "cancelled",
+                "error": "影像获取被用户中断。",
+            })
+            push_status("warning", "影像获取已中断，未登记数据集。")
+            with shared["lock"]:
+                shared["gee_result"] = result
+            return
         if not result or result.get("success") is not True:
             err = sanitize_external_text((result or {}).get("error") or "影像获取失败")[:240]
             push_status("error", f"❌ {err}")
@@ -2110,6 +2211,17 @@ def _gee_worker_entry(ctx, shared, stop_event):
             outcome = gal.monitor_drive_export(result, stop_event, cloud_status)
             with shared["lock"]:
                 shared["gee_result"] = result
+            if stop_event.is_set():
+                result = dict(result or {})
+                result.update({
+                    "success": False,
+                    "status": "cancelled",
+                    "error": "已停止本地状态跟踪；云端任务未由此取消。",
+                })
+                push_status("warning", "已停止本地跟踪；云端任务仍需在 GEE 后台核查。")
+                with shared["lock"]:
+                    shared["gee_result"] = result
+                return
             if outcome["status"] != "WAITING_SYNC":
                 return
             # A completed Drive export is not proof that local files exist.
@@ -2120,6 +2232,18 @@ def _gee_worker_entry(ctx, shared, stop_event):
 
         push_status("info", "下载结束，正在校验成果…")
         verification = gal.verify_gee_outputs(plan, result, started_at=started)
+        if stop_event.is_set():
+            result = dict(result or {})
+            result.update({
+                "success": False,
+                "status": "cancelled",
+                "error": "影像获取被用户中断。",
+            })
+            push_status("warning", "影像获取已中断，未登记数据集。")
+            with shared["lock"]:
+                shared["gee_result"] = result
+                shared["gee_verification"] = verification or {}
+            return
         if not verification or verification.get("ok") is not True:
             with shared["lock"]:
                 shared.pop("gee_cloud_outcome", None)
@@ -2131,6 +2255,18 @@ def _gee_worker_entry(ctx, shared, stop_event):
                 shared["gee_verification"] = verification or {}
             return
 
+        if stop_event.is_set():
+            result = dict(result or {})
+            result.update({
+                "success": False,
+                "status": "cancelled",
+                "error": "影像获取被用户中断。",
+            })
+            push_status("warning", "影像获取已中断，未登记数据集。")
+            with shared["lock"]:
+                shared["gee_result"] = result
+                shared["gee_verification"] = verification
+            return
         asset_id = gal.register_gee_dataset_asset(plan, result, verification)
         if not asset_id:
             with shared["lock"]:
@@ -4154,19 +4290,13 @@ with st.sidebar:
                         for key, asset in task_assets.items():
                             a_cols = st.columns([5, 2])
                             with a_cols[0]:
-                                if asset.get("method") == "index":
-                                    _lbl = f"指数 · {asset['created_at']} · {asset['file_size_mb']}MB"
-                                else:
-                                    _lbl = (
-                                        f"P={asset['prob_threshold']} C={asset['min_count']} "
-                                        f"· {asset['created_at']} · {asset['file_size_mb']}MB"
-                                    )
-                                st.caption(_lbl)
+                                st.caption(uil.format_asset_caption(asset))
                             with a_cols[1]:
                                 if st.button("加载", key=f"load_{key}", use_container_width=True):
                                     st.session_state.asset_override = asset["file_path"]
                                     st.session_state._asset_pinned = True
                                     st.session_state._map_view_synced_for = None
+                                    st.session_state._map_prefer_center = False
                                     st.session_state.asset_just_loaded = True
                                     st.session_state._globe_rev = int(st.session_state.get("_globe_rev", 0)) + 1
                                     st.rerun()
@@ -4762,22 +4892,38 @@ with st.sidebar:
             on_click=_on_run_inference_click,
         )
 
+    _stop_pending = bool(st.session_state.get("stop_requested"))
     stop_btn = st.button(
-        "中断任务",
+        "正在中断…" if _stop_pending else "中断任务",
         type="secondary",
         use_container_width=True,
-        disabled=not st.session_state.is_running,
+        disabled=not st.session_state.is_running or _stop_pending,
     )
 
     if stop_btn:
         st.session_state.stop_requested = True
         st.session_state.pending_task = None
         st.session_state.pop("pending_autotune", None)
-        if st.session_state.get("pipeline_stop_event") is not None:
-            st.session_state.pipeline_stop_event.set()
+        _stop_event = st.session_state.get("pipeline_stop_event")
+        if _stop_event is not None:
+            _stop_event.set()
+        _stop_shared = st.session_state.get("pipeline_shared")
+        _stop_progress = int(st.session_state.get("pipeline_progress_value", 0))
+        if _stop_shared:
+            with _stop_shared["lock"]:
+                _stop_progress = int(_stop_shared.get("progress", _stop_progress))
+                _stop_shared["status"] = ("warning", "已发送中断请求，正在等待当前阶段安全退出…")
+        # 账本先落 CANCELLED，保证用户意图立即可见；后台线程仍需
+        # 协作式收尾，避免强制杀线程导致文件句柄和中间成果损坏。
+        _job_transition(
+            "CANCELLED",
+            progress=_stop_progress,
+            error="用户已请求中断；等待后台安全退出。",
+            metadata={"cancel_requested": True},
+        )
         _tl_add(selected_task or st.session_state.get("_tl_current_task") or "system",
                 "EXECUTE", "任务已被用户中断", status="CANCELLED", tool="stop_button")
-        st.toast("正在请求安全终止…", icon="🛑")
+        st.toast("已发送中断请求，正在等待安全退出…", icon="🛑")
         st.rerun()
 
     if tune_btn and _autotune_ready and _ref_id:
@@ -5440,7 +5586,9 @@ with col_map:
         _lp = st.session_state.get("_last_globe_payload") or {}
         if raster_load_error:
             st.toast(f"成果图层加载失败: {raster_load_error}", icon="⚠️")
-        elif _lp.get("flyRectangle") and _lp.get("assetName"):
+        elif _lp.get("assetName") and (
+            _lp.get("flyRectangle") or _lp.get("geojson") or _lp.get("imagery")
+        ):
             st.toast(
                 f"✅ 已加载 {_lp.get('assetName')} · 矢量:{_lp.get('geojson', 0)} 栅格:{_lp.get('imagery', 0)}",
                 icon="✅",
@@ -6945,14 +7093,18 @@ def finalize_background_pipeline():
                     tool=job_kind or "run_pipeline")
         time.sleep(2)
     _job_status = "CANCELLED" if _job_was_stopped else ("SUCCEEDED" if success else "FAILED")
-    if not success and (_m5_independent_handled or _e1_independent_handled):
+    if not _job_was_stopped and not success and (_m5_independent_handled or _e1_independent_handled):
         _postflight_verification = m5_verification if _m5_independent_handled else e1_verification
         if isinstance(_postflight_verification, dict) and _postflight_verification.get("ok") is False:
             _job_status = "WARNING"
-    if _optional_postflight_warning:
+    if not _job_was_stopped and _optional_postflight_warning:
         _job_status = "WARNING"
-    if workflow_result and workflow_result.get("status") == "COMPLETED_WITH_WARNINGS" and success:
+    if not _job_was_stopped and workflow_result and workflow_result.get("status") == "COMPLETED_WITH_WARNINGS" and success:
         _job_status = "WARNING"
+    # A stop request is authoritative even if an optional postflight report
+    # happened to finish at the same time as the cancellation signal.
+    if _job_was_stopped:
+        _job_status = "CANCELLED"
     _job_error = (
         None
         if success
@@ -7049,6 +7201,10 @@ def run_autotune_sync(ctx, shared, stop_event):
         )
 
         _best_shp = str((result or {}).get("best_shp_path") or "")
+        if stop_event.is_set():
+            push_status("warning", "参数优化已中断，未登记最优成果。")
+            push_log("[AutoTune] 已收到中断请求，跳过后续校验与资产登记。")
+            return False
         if result and _best_shp and os.path.isfile(_best_shp) and os.path.getsize(_best_shp) > 0:
             register_asset(actual_task, result["best_prob"], result["best_cnt"], _best_shp)
             _run_m5_phase(
@@ -7056,6 +7212,10 @@ def run_autotune_sync(ctx, shared, stop_event):
                 result["best_prob"], result["best_cnt"], push_log, check_stop,
             )
             _run_e1_phase(ctx, shared, result["best_shp_path"], actual_task, push_log, check_stop)
+            if stop_event.is_set():
+                push_status("warning", "参数优化已中断，未报告为成功。")
+                push_log("[AutoTune] 后置分析期间收到中断信号，未报告为成功。")
+                return False
             push_status(
                 "success",
                 f"🏆 最优参数: P={result['best_prob']:.2f} C={result['best_cnt']} | "
@@ -7447,7 +7607,12 @@ def _pipeline_monitor_inner(render: bool = True):
         _job_progress_update(
             prog,
             job_id=active_job_id,
-            metadata={"phase": "RUNNING", "job_kind": (shared or {}).get("job_kind")},
+            metadata={
+                "phase": "CANCEL_REQUESTED"
+                if st.session_state.get("stop_requested")
+                else "RUNNING",
+                "job_kind": (shared or {}).get("job_kind"),
+            },
         )
 
     # Keep the monitor alive while the drawer is collapsed so completion,
@@ -7462,6 +7627,8 @@ def _pipeline_monitor_inner(render: bool = True):
         kind, text = status[0], status[1]
     else:
         kind, text = "info", ""
+    if st.session_state.get("stop_requested") and not (shared and shared.get("done")):
+        kind, text = "warning", "已发送中断请求，正在等待当前阶段安全退出…"
     if text:
         if kind == "error":
             st.error(text)
