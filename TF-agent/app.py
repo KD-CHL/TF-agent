@@ -762,7 +762,9 @@ def register_e1_asset(task, report: dict):
     registry[asset_key] = {
         "task": task,
         "method": "e1",
+        "asset_type": "e1_evaluation",
         "file_path": os.path.normpath(map_path) if map_path else "",
+        "map_path": os.path.normpath(map_path) if map_path else "",
         "report_path": report_path,
         "report_md_path": (report or {}).get("report_md_path"),
         "reference": (report or {}).get("reference"),
@@ -781,10 +783,62 @@ def find_index_asset(task):
     return None
 
 
+def _asset_map_path_for_loading(asset):
+    """Resolve the map layer represented by an asset registry row."""
+    if not isinstance(asset, dict):
+        return None
+    method = str(asset.get("method") or asset.get("asset_type") or "").lower()
+    if method in {"e1", "e1_evaluation", "精度评价"}:
+        try:
+            import e1_agent_loop
+
+            return e1_agent_loop.resolve_e1_map_asset(asset)
+        except Exception:
+            return None
+    raw = asset.get("file_path")
+    return os.path.normpath(os.path.abspath(str(raw))) if _nonempty_file(raw) else None
+
+
+def _prepare_map_display_path(path):
+    """Use a bounded raster preview for slow-to-tile national GeoTIFFs."""
+    if not path:
+        return None
+    raw = os.path.normpath(os.path.abspath(str(path)))
+    if not os.path.isfile(raw):
+        return None
+    if os.path.splitext(raw)[1].lower() not in {".tif", ".tiff"}:
+        return raw
+    try:
+        import globe_engine
+
+        return globe_engine.prepare_map_asset(raw) or raw
+    except Exception:
+        return raw
+
+
 def get_task_assets(task):
     registry = load_asset_registry()
-    return {k: v for k, v in registry.items()
-            if v.get("task") == task and os.path.exists(v.get("file_path", ""))}
+    assets = {}
+    for key, value in registry.items():
+        if not isinstance(value, dict) or value.get("task") != task:
+            continue
+        row = dict(value)
+        map_path = _asset_map_path_for_loading(row)
+        if map_path:
+            # Keep report_path intact, but expose a canonical map path to the
+            # existing history UI.  This also repairs legacy E1 rows whose
+            # file_path pointed at the JSON/Markdown report.
+            row["map_path"] = map_path
+            if not _nonempty_file(row.get("file_path")) or os.path.splitext(
+                str(row.get("file_path") or "")
+            )[1].lower() not in {".tif", ".tiff", ".shp", ".geojson", ".gpkg"}:
+                row["file_path"] = map_path
+        row_method = str(row.get("method") or row.get("asset_type") or "").lower()
+        if _nonempty_file(row.get("file_path")) or (
+            row_method in {"e1", "e1_evaluation"} and _nonempty_file(row.get("report_path"))
+        ):
+            assets[key] = row
+    return assets
 
 
 def scan_and_register_existing(final_root):
@@ -2089,6 +2143,56 @@ def _inference_worker_entry(ctx, shared, stop_event):
                 shared["inference_result"] = result
                 shared["inference_verification"] = verification
             return
+        final_tif = (result.get("outputs") or {}).get("final_tif") or ""
+        final_shp = (result.get("outputs") or {}).get("final_shp") or ""
+        # The inference adapter may return paths relative to the worker's
+        # process.  Post-flight engines and the map loader need an actual
+        # filesystem path, so resolve them once after verification.
+        final_shp_for_postflight = str(
+            (verification or {}).get("final_shp") or final_shp or ""
+        )
+        if final_shp_for_postflight and not os.path.isabs(final_shp_for_postflight):
+            final_shp_for_postflight = os.path.abspath(final_shp_for_postflight)
+
+        # Run the optional M5/E1 phases here as well as in the legacy pipeline
+        # path.  The modern inference worker previously discarded these UI
+        # settings, which made a checked "潮滩精度评价" option appear to do
+        # nothing.  Both phases keep their own verification/registration gate
+        # and are intentionally non-blocking for the main inference result.
+        postflight_ctx = dict(ctx)
+        actual_task = task_id
+        for option in ctx.get("task_options") or []:
+            if task_id and task_id in str(option):
+                actual_task = str(option)
+                break
+        postflight_prob = float(plan.get("prob_threshold") or 0.05)
+        postflight_cnt = int(plan.get("count_threshold") or 2)
+        if final_shp_for_postflight and os.path.isfile(final_shp_for_postflight):
+            _run_m5_phase(
+                postflight_ctx, shared, final_shp_for_postflight, actual_task,
+                postflight_prob, postflight_cnt, push_log, check_stop,
+            )
+            _run_e1_phase(
+                postflight_ctx, shared, final_shp_for_postflight, actual_task,
+                push_log, check_stop,
+            )
+        if stop_event.is_set():
+            result = dict(result or {})
+            result.update({
+                "success": False,
+                "status": "cancelled",
+                "outputs": {},
+                "error": "推理被用户中断。",
+            })
+            push_status("warning", "潮滩智能提取已中断，未登记成果。")
+            with shared["lock"]:
+                shared["inference_result"] = result
+                shared["inference_verification"] = verification
+            return
+
+        # Register the primary inference asset only after optional post-flight
+        # work and its cancellation gate.  This closes the last window in
+        # which a stop request could leave a successful main asset behind.
         asset_id = ial.register_inference_asset(plan, result, verification)
         if not asset_id:
             push_status("error", "❌ 校验通过但资产登记失败（未登记成果）。")
@@ -2097,8 +2201,6 @@ def _inference_worker_entry(ctx, shared, stop_event):
                 shared["inference_verification"] = verification
             return
 
-        final_tif = (result.get("outputs") or {}).get("final_tif") or ""
-        final_shp = (result.get("outputs") or {}).get("final_shp") or ""
         push_log(f"✅ 提取闭环完成 | asset_id={asset_id} | Final TIF={os.path.basename(str(final_tif))} | "
                  f"Final SHP={os.path.basename(str(final_shp))}")
         push_status("success", "🎉 潮滩智能提取完成：成果已验证并登记。")
@@ -2678,7 +2780,20 @@ def _job_transition(status, *, progress=None, artifacts=None, error=None, metada
         job_id = st.session_state.get("_active_job_id")
         if not job_id:
             return None
-        return _get_job_store().transition(
+        store = _get_job_store()
+        # A process restart may have reconciled this job to INTERRUPTED while
+        # an older worker/finalizer is still unwinding.  Terminal records are
+        # authoritative; do not overwrite them with a late FAILED/WARNING
+        # transition (which used to produce ``INTERRUPTED->FAILED`` errors and
+        # made the UI look as if cancellation had failed).
+        current = store.get(job_id)
+        from job_store import TERMINAL_STATUSES
+
+        if current is None or (
+            current.status in TERMINAL_STATUSES and current.status != status
+        ):
+            return current
+        return store.transition(
             job_id, status, progress=progress, artifacts=artifacts,
             error=error, metadata=metadata,
         )
@@ -4262,11 +4377,11 @@ with st.sidebar:
             cache_hit = None
 
         if st.session_state.asset_override and os.path.exists(st.session_state.asset_override):
-            map_display_path = st.session_state.asset_override
+            map_display_path = _prepare_map_display_path(st.session_state.asset_override)
         elif cache_hit:
-            map_display_path = cache_hit["file_path"]
+            map_display_path = _prepare_map_display_path(cache_hit["file_path"])
         elif final_tif_path and os.path.exists(final_tif_path):
-            map_display_path = final_tif_path
+            map_display_path = _prepare_map_display_path(final_tif_path)
 
         sbui.section("成果管理")
         with st.container(border=True):
@@ -4293,18 +4408,22 @@ with st.sidebar:
                                 st.caption(uil.format_asset_caption(asset))
                             with a_cols[1]:
                                 if st.button("加载", key=f"load_{key}", use_container_width=True):
-                                    st.session_state.asset_override = asset["file_path"]
-                                    st.session_state._asset_pinned = True
-                                    st.session_state._map_view_synced_for = None
-                                    st.session_state._map_prefer_center = False
-                                    st.session_state.asset_just_loaded = True
-                                    st.session_state._globe_rev = int(st.session_state.get("_globe_rev", 0)) + 1
-                                    st.rerun()
+                                    _asset_path = _asset_map_path_for_loading(asset)
+                                    _asset_display_path = _prepare_map_display_path(_asset_path)
+                                    if _asset_display_path and os.path.isfile(_asset_display_path):
+                                        st.session_state.asset_override = _asset_display_path
+                                        st.session_state._asset_pinned = True
+                                        st.session_state._map_view_synced_for = None
+                                        st.session_state._map_prefer_center = False
+                                        st.session_state.asset_just_loaded = True
+                                        st.session_state._globe_rev = int(st.session_state.get("_globe_rev", 0)) + 1
+                                        st.rerun()
+                                    st.warning("该精度评价没有可加载的地图图层，请先重新生成分歧图或热力图。")
 
             if cache_hit and not adaptive_mode:
                 force_rerun = st.checkbox("强制重新生成", key="ui_force_rerun", help="忽略缓存，重新运行提取。")
     elif st.session_state.asset_override and os.path.exists(st.session_state.asset_override):
-        map_display_path = st.session_state.asset_override
+        map_display_path = _prepare_map_display_path(st.session_state.asset_override)
 
     # --- 自适应优化历史结果 ---
     _at_res = st.session_state.get("autotune_result")
@@ -6952,14 +7071,20 @@ def finalize_background_pipeline():
                     error=None if _e1_verified else "输出校验未完全通过；未登记成果。",
                     tool="verify_e1",
                 )
-            map_path = asset_path
-            if not map_path:
-                try:
-                    import e1_agent_loop
+            # E1's report heatmap is authoritative for the map layer.  The
+            # shared asset_path may still contain a main-inference output or a
+            # legacy report path, so do not let it shadow the verified E1 map.
+            try:
+                import e1_agent_loop
 
-                    map_path = e1_agent_loop.pick_e1_map_path(e1_report)
-                except Exception:
-                    map_path = None
+                map_path = e1_agent_loop.pick_e1_map_path(e1_report)
+            except Exception:
+                map_path = None
+            if not map_path and asset_path:
+                map_path = _asset_map_path_for_loading(
+                    {"method": "e1", "file_path": asset_path, "report_path": e1_report.get("report_path")}
+                )
+            map_path = _prepare_map_display_path(map_path)
             if _e1_verified and map_path and os.path.isfile(str(map_path)):
                 st.session_state.asset_override = map_path
                 st.session_state._asset_pinned = True
@@ -7441,6 +7566,19 @@ def maybe_start_pipeline_thread():
             "shp_path": shp_path,
             "task_options": list(task_options),
             "task": task_info.get("task"),
+            # Optional post-flight analysis belongs to the same execution
+            # request.  The modern inference worker used to receive only the
+            # DL plan, so the sidebar E1/M5 switches were silently dropped and
+            # no accuracy/temporal evaluation was ever started.
+            "task_aoi_shp": task_aoi_shp,
+            "m5_enabled": m5_enabled,
+            "m5_baseline_shp": m5_baseline_shp,
+            "e1_enabled": e1_enabled,
+            "e1_data_root": e1_data_root,
+            "e1_reference": e1_reference,
+            "e1_compare_sources": list(e1_compare_sources),
+            "e1_export_maps": e1_export_maps,
+            "e1_export_heatmap": e1_export_heatmap,
             "inference_plan": task_info.get("inference_plan"),
         }
         threading.Thread(

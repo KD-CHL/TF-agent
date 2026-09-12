@@ -12,6 +12,7 @@ import glob
 import json
 import os
 import sys
+import time
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -59,6 +60,12 @@ class E1Cancelled(RuntimeError):
 def _stop_requested(stop_callback: Optional[Callable[[], bool]]) -> bool:
     if not stop_callback:
         return False
+    try:
+        return bool(stop_callback())
+    except Exception:
+        # A diagnostic callback must never make E1 fail spuriously.  The
+        # worker still has its own event and will perform a final gate.
+        return False
 
 
 def _vector_bounds_4326(path: Union[str, Path]) -> Optional[Tuple[float, float, float, float]]:
@@ -89,12 +96,6 @@ def _vector_bounds_4326(path: Union[str, Path]) -> Optional[Tuple[float, float, 
         return values
     except Exception:
         return None
-    try:
-        return bool(stop_callback())
-    except Exception:
-        # A diagnostic callback must never make E1 fail spuriously.  The
-        # worker still has its own event and will perform a final gate.
-        return False
 
 
 def _find_child(root: Path, *keywords: str) -> Optional[Path]:
@@ -220,6 +221,11 @@ class E1_DataCleanerAndDiagnostic:
         self.unified_dir = Path(ux.ensure_dir(self.workspace / "E1_unified"))
         self.raster_dir = Path(ux.ensure_dir(self.workspace / "E1_rasters"))
         self.output_dir = Path(ux.ensure_dir(self.workspace / "outputs_e1"))
+        # Projected geometries are reused by every tile/pair in one run.  The
+        # previous implementation transformed and clipped the same national
+        # vectors once per tile, which dominated E1 runtime.
+        self._raster_projected_cache: Dict[str, gpd.GeoDataFrame] = {}
+        self._raster_roi_cache: Dict[int, Optional[gpd.GeoDataFrame]] = {}
 
         self.dataset_specs = _builtin_dataset_specs(self.data_root)
         ux.banner("E1 多源一致性诊断", print)
@@ -247,16 +253,34 @@ class E1_DataCleanerAndDiagnostic:
             mask = series.astype(str).str.lower().isin({str(v).lower() for v in values})
         return gdf.loc[mask].copy()
 
-    def _load_tfmc_merge(self, folder: Path) -> gpd.GeoDataFrame:
+    def _load_tfmc_merge(
+        self,
+        folder: Path,
+        bbox_4326: Optional[Tuple[float, float, float, float]] = None,
+    ) -> gpd.GeoDataFrame:
         parts = []
+        bbox = None
+        if bbox_4326 is not None:
+            bbox = gpd.GeoSeries([box(*bbox_4326)], crs=TARGET_VECTOR_CRS)
         for fp in sorted(folder.glob("*.geojson")):
-            parts.append(gpd.read_file(fp))
+            try:
+                parts.append(gpd.read_file(fp, bbox=bbox) if bbox is not None else gpd.read_file(fp))
+            except Exception:
+                # Older GDAL/pyogrio combinations may not accept a GeoSeries
+                # bbox for GeoJSON (or may reject a CRS conversion); fall back
+                # to the normal read path so correctness is preserved.
+                parts.append(gpd.read_file(fp))
         if not parts:
             raise FileNotFoundError(f"TFMC 目录下无 geojson: {folder}")
         gdf = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=parts[0].crs)
         return gdf
 
-    def load_dataset(self, name: str, spec: Optional[dict] = None) -> gpd.GeoDataFrame:
+    def load_dataset(
+        self,
+        name: str,
+        spec: Optional[dict] = None,
+        bbox_4326: Optional[Tuple[float, float, float, float]] = None,
+    ) -> gpd.GeoDataFrame:
         spec = spec or self.dataset_specs.get(name)
         if not spec:
             raise KeyError(f"未知数据集 [{name}]，可用: {self.list_datasets()}")
@@ -267,10 +291,20 @@ class E1_DataCleanerAndDiagnostic:
         if kind == "vector":
             if not path.exists():
                 raise FileNotFoundError(path)
-            gdf = gpd.read_file(path)
+            if bbox_4326 is not None:
+                bbox = gpd.GeoSeries([box(*bbox_4326)], crs=TARGET_VECTOR_CRS)
+                try:
+                    gdf = gpd.read_file(path, bbox=bbox)
+                except Exception:
+                    # Keep compatibility with drivers that do not support a
+                    # GeoSeries bbox; the later spatial index still clips the
+                    # loaded result to the local comparison domain.
+                    gdf = gpd.read_file(path)
+            else:
+                gdf = gpd.read_file(path)
             gdf = self._apply_filter(gdf, spec.get("filter"))
         elif kind == "tfmc_merge":
-            gdf = self._load_tfmc_merge(path)
+            gdf = self._load_tfmc_merge(path, bbox_4326=bbox_4326)
         elif kind == "tif_folder":
             gdf = self._tif_folder_to_vectors(path, spec.get("flat_values", [1]))
         else:
@@ -280,6 +314,7 @@ class E1_DataCleanerAndDiagnostic:
         if gdf.crs is None:
             gdf = gdf.set_crs(TARGET_VECTOR_CRS)
         gdf = gdf.to_crs(TARGET_VECTOR_CRS)
+        gdf = self._clip_gdf_to_bounds(gdf, bbox_4326)
         gdf = ux.repair_geometries(gdf, logger=print)
         gdf["source"] = name
         return gdf
@@ -316,18 +351,27 @@ class E1_DataCleanerAndDiagnostic:
         asset_name: str,
         filter_spec: Optional[dict] = None,
         save: bool = True,
+        bbox_4326: Optional[Tuple[float, float, float, float]] = None,
     ) -> gpd.GeoDataFrame:
         """读取任意 shp/geojson/gpkg，统一为 EPSG:4326 标准字段。"""
         path = Path(ux.normalize_path(input_path, must_exist=True) or input_path)
         if not path.exists():
             raise FileNotFoundError(path)
 
-        gdf = gpd.read_file(path)
+        if bbox_4326 is not None:
+            bbox = gpd.GeoSeries([box(*bbox_4326)], crs=TARGET_VECTOR_CRS)
+            try:
+                gdf = gpd.read_file(path, bbox=bbox)
+            except Exception:
+                gdf = gpd.read_file(path)
+        else:
+            gdf = gpd.read_file(path)
         gdf = self._apply_filter(gdf, filter_spec)
         gdf = gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty].copy()
         if gdf.crs is None:
             gdf = gdf.set_crs(TARGET_VECTOR_CRS)
         gdf = gdf.to_crs(TARGET_VECTOR_CRS)
+        gdf = self._clip_gdf_to_bounds(gdf, bbox_4326)
         gdf = ux.repair_geometries(gdf, logger=print)
 
         out = gpd.GeoDataFrame(
@@ -384,6 +428,39 @@ class E1_DataCleanerAndDiagnostic:
         )
         return roi, clipped
 
+    @staticmethod
+    def _clip_gdf_to_bounds(
+        gdf: gpd.GeoDataFrame,
+        bounds_4326: Optional[Tuple[float, float, float, float]],
+    ) -> gpd.GeoDataFrame:
+        """Clip geometry envelopes before topology repair.
+
+        Coastal products often contain one invalid polygon spanning a large
+        part of China.  Repairing that full geometry is much more expensive
+        than repairing the small piece that can actually enter this E1 grid.
+        ``shapely.clip_by_rect`` is deliberately used as a fast preclip; the
+        normal validity repair still runs immediately afterwards.
+        """
+        if not bounds_4326 or gdf is None or gdf.empty:
+            return gdf
+        try:
+            from shapely import clip_by_rect
+
+            clipped = gdf.copy()
+            xmin, ymin, xmax, ymax = (float(v) for v in bounds_4326)
+            clipped["geometry"] = clip_by_rect(
+                clipped.geometry.array, xmin, ymin, xmax, ymax
+            )
+            return clipped[clipped.geometry.notna() & ~clipped.geometry.is_empty].copy()
+        except Exception:
+            # A conservative envelope filter is still useful with older
+            # Shapely/GDAL combinations that do not expose clip_by_rect.
+            try:
+                frame = gdf[gdf.geometry.intersects(box(*bounds_4326))].copy()
+                return frame
+            except Exception:
+                return gdf
+
     def build_reference_grid(
         self,
         roi_path: Optional[str] = None,
@@ -401,6 +478,135 @@ class E1_DataCleanerAndDiagnostic:
         transform = from_origin(minx, maxy, self.pixel_size_m, self.pixel_size_m)
         return transform, width, height, RASTER_CRS
 
+    def _projected_roi(self, roi_gdf: Optional[gpd.GeoDataFrame]) -> Optional[gpd.GeoDataFrame]:
+        if roi_gdf is None:
+            return None
+        key = id(roi_gdf)
+        cache = getattr(self, "_raster_roi_cache", None)
+        if cache is None:
+            cache = {}
+            self._raster_roi_cache = cache
+        if key not in cache:
+            cache[key] = roi_gdf.to_crs(RASTER_CRS)
+        return cache[key]
+
+    def _projected_gdf(
+        self,
+        cache_key: str,
+        gdf: gpd.GeoDataFrame,
+        roi_gdf: Optional[gpd.GeoDataFrame] = None,
+    ) -> Tuple[gpd.GeoDataFrame, Optional[gpd.GeoDataFrame]]:
+        """Prepare one vector once in the equal-area raster CRS."""
+        cache = getattr(self, "_raster_projected_cache", None)
+        if cache is None:
+            cache = {}
+            self._raster_projected_cache = cache
+        if cache_key not in cache:
+            gdf_p = gdf if str(getattr(gdf, "crs", "")) == RASTER_CRS else gdf.to_crs(RASTER_CRS)
+            roi_p = self._projected_roi(roi_gdf)
+            if roi_p is not None and not gdf_p.empty:
+                try:
+                    # Clip once per dataset, never once per tile.
+                    gdf_p = gpd.clip(gdf_p, roi_p)
+                except Exception:
+                    # The tile-level spatial index and ROI mask below remain
+                    # a correct fallback when a GDAL spatial index is absent.
+                    pass
+            cache[cache_key] = gdf_p
+        return cache[cache_key], self._projected_roi(roi_gdf)
+
+    def _projected_dataset(
+        self,
+        name: str,
+        gdf_cache: Dict[str, gpd.GeoDataFrame],
+        roi_gdf: Optional[gpd.GeoDataFrame],
+    ) -> Tuple[gpd.GeoDataFrame, Optional[gpd.GeoDataFrame]]:
+        gdf = gdf_cache.get(name)
+        if gdf is None:
+            # An explicit AOI is just as useful as the target extent for
+            # driver-level filtering.  Most vector drivers can reject
+            # features outside this bbox before GeoPandas constructs the
+            # full national frame; the projected clip below still applies
+            # the exact ROI geometry.
+            bbox_4326 = None
+            if roi_gdf is not None and not roi_gdf.empty:
+                try:
+                    roi_wgs84 = (
+                        roi_gdf
+                        if str(getattr(roi_gdf, "crs", "")) == TARGET_VECTOR_CRS
+                        else roi_gdf.to_crs(TARGET_VECTOR_CRS)
+                    )
+                    bounds = tuple(float(v) for v in roi_wgs84.total_bounds)
+                    if len(bounds) == 4 and bounds[2] > bounds[0] and bounds[3] > bounds[1]:
+                        bbox_4326 = bounds
+                except Exception:
+                    bbox_4326 = None
+            gdf = self.load_dataset(name, bbox_4326=bbox_4326)
+            gdf_cache[name] = gdf
+        return self._projected_gdf(name, gdf, roi_gdf)
+
+    def _rasterize_projected(
+        self,
+        gdf_p: gpd.GeoDataFrame,
+        transform,
+        out_shape: Tuple[int, int],
+        roi_p: Optional[gpd.GeoDataFrame] = None,
+        tile_bounds: Optional[Tuple[float, float, float, float]] = None,
+    ) -> np.ndarray:
+        """Rasterize already projected geometries with tile-local filtering."""
+        tile_gdf = gdf_p
+        if tile_bounds is not None and not tile_gdf.empty:
+            minx, miny, maxx, maxy = tile_bounds
+            try:
+                idx = list(tile_gdf.sindex.intersection(tile_bounds))
+                tile_gdf = tile_gdf.iloc[idx]
+            except Exception:
+                tile_box = box(minx, miny, maxx, maxy)
+                tile_gdf = tile_gdf[tile_gdf.intersects(tile_box)]
+
+        geoms = [
+            (geom, 1)
+            for geom in tile_gdf.geometry
+            if geom is not None and not geom.is_empty
+        ]
+        arr = rasterize(
+            geoms,
+            out_shape=out_shape,
+            transform=transform,
+            fill=0,
+            dtype=np.uint8,
+            all_touched=False,
+        ) if geoms else np.zeros(out_shape, dtype=np.uint8)
+
+        if roi_p is not None and not roi_p.empty:
+            roi_tile = roi_p
+            if tile_bounds is not None:
+                minx, miny, maxx, maxy = tile_bounds
+                try:
+                    idx = list(roi_p.sindex.intersection(tile_bounds))
+                    roi_tile = roi_p.iloc[idx]
+                except Exception:
+                    tile_box = box(minx, miny, maxx, maxy)
+                    roi_tile = roi_p[roi_p.intersects(tile_box)]
+            roi_geoms = [
+                (geom, 1)
+                for geom in roi_tile.geometry
+                if geom is not None and not geom.is_empty
+            ]
+            if roi_geoms:
+                roi_mask = rasterize(
+                    roi_geoms,
+                    out_shape=out_shape,
+                    transform=transform,
+                    fill=0,
+                    dtype=np.uint8,
+                    all_touched=True,
+                )
+                arr = np.where(roi_mask == 1, arr, 0).astype(np.uint8)
+            else:
+                arr.fill(0)
+        return arr
+
     def vector_to_raster(
         self,
         gdf: gpd.GeoDataFrame,
@@ -410,50 +616,16 @@ class E1_DataCleanerAndDiagnostic:
         tile_bounds: Optional[Tuple[float, float, float, float]] = None,
     ) -> np.ndarray:
         """矢量 -> 30 m 二值栅格 (1=潮滩, 0=非潮滩)。"""
-        gdf_p = gdf.to_crs(RASTER_CRS)
-        if roi_gdf is not None:
-            roi_p = roi_gdf.to_crs(RASTER_CRS)
-            gdf_p = gpd.clip(gdf_p, roi_p)
-
-        if tile_bounds is not None and not gdf_p.empty:
-            minx, miny, maxx, maxy = tile_bounds
-            if gdf_p.sindex is not None:
-                idx = list(gdf_p.sindex.intersection(tile_bounds))
-                gdf_p = gdf_p.iloc[idx]
-            else:
-                tile_box = box(minx, miny, maxx, maxy)
-                gdf_p = gdf_p[gdf_p.intersects(tile_box)]
-
-        geoms = [
-            (geom, 1)
-            for geom in gdf_p.geometry
-            if geom is not None and not geom.is_empty
-        ]
-        if not geoms:
-            return np.zeros(out_shape, dtype=np.uint8)
-
-        arr = rasterize(
-            geoms,
-            out_shape=out_shape,
-            transform=transform,
-            fill=0,
-            dtype=np.uint8,
-            all_touched=False,
+        gdf_p, roi_p = self._projected_gdf(
+            f"__vector_to_raster__{id(gdf)}", gdf, roi_gdf
         )
-
-        if roi_gdf is not None:
-            roi_p = roi_gdf.to_crs(RASTER_CRS)
-            roi_mask = rasterize(
-                [(g, 1) for g in roi_p.geometry if g is not None and not g.is_empty],
-                out_shape=out_shape,
-                transform=transform,
-                fill=0,
-                dtype=np.uint8,
-                all_touched=True,
-            )
-            arr = np.where(roi_mask == 1, arr, 0).astype(np.uint8)
-
-        return arr
+        return self._rasterize_projected(
+            gdf_p,
+            transform,
+            out_shape,
+            roi_p=roi_p,
+            tile_bounds=tile_bounds,
+        )
 
     def tif_to_raster(
         self,
@@ -509,14 +681,14 @@ class E1_DataCleanerAndDiagnostic:
                 acc = np.where(roi_mask == 1, acc, 0).astype(np.uint8)
             return acc
 
-        if name not in gdf_cache:
-            gdf = self.load_dataset(name)
-            if roi_gdf is not None:
-                gdf = gpd.clip(gdf, roi_gdf.to_crs(TARGET_VECTOR_CRS))
-            gdf_cache[name] = gdf
+        gdf_p, roi_p = self._projected_dataset(name, gdf_cache, roi_gdf)
         tile_bounds = array_bounds(out_shape[0], out_shape[1], transform)
-        return self.vector_to_raster(
-            gdf_cache[name], transform, out_shape, roi_gdf, tile_bounds=tile_bounds
+        return self._rasterize_projected(
+            gdf_p,
+            transform,
+            out_shape,
+            roi_p=roi_p,
+            tile_bounds=tile_bounds,
         )
 
     @staticmethod
@@ -542,11 +714,35 @@ class E1_DataCleanerAndDiagnostic:
 
     @staticmethod
     def _gdf_spatial_overlap(gdf_a: gpd.GeoDataFrame, gdf_b: gpd.GeoDataFrame) -> bool:
+        """Cheap overlap gate using bounds + spatial index.
+
+        Dissolving both sources into ``unary_union`` before every E1 run can
+        take several seconds for coastal multipart polygons.  The raster
+        comparison itself is authoritative, so the gate only needs to reject
+        clearly disjoint inputs; an envelope/index false positive simply
+        yields IoU=0 in the normal comparison path.
+        """
         if gdf_a.empty or gdf_b.empty:
             return False
-        a = gdf_a.unary_union
-        b = gdf_b.to_crs(gdf_a.crs).unary_union if gdf_b.crs != gdf_a.crs else gdf_b.unary_union
-        return ux.geometries_have_overlap(a, b)
+        try:
+            b = gdf_b.to_crs(gdf_a.crs) if gdf_b.crs != gdf_a.crs else gdf_b
+            a_minx, a_miny, a_maxx, a_maxy = gdf_a.total_bounds
+            b_minx, b_miny, b_maxx, b_maxy = b.total_bounds
+            if (
+                a_maxx < b_minx
+                or b_maxx < a_minx
+                or a_maxy < b_miny
+                or b_maxy < a_miny
+            ):
+                return False
+            try:
+                return bool(len(gdf_a.sindex.query(b.geometry, predicate="intersects")))
+            except Exception:
+                return True
+        except Exception:
+            # Do not block a valid evaluation on an optional spatial-index
+            # optimization; the pixel pass will determine the real overlap.
+            return True
 
     @staticmethod
     def _accumulate_tile_stats(
@@ -633,8 +829,9 @@ class E1_DataCleanerAndDiagnostic:
         stop_callback: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, float]:
         stats = {"inter": 0, "only_a": 0, "only_b": 0, "union": 0, "cnt_a": 0, "cnt_b": 0}
-        if roi_gdf is not None:
-            gdf_a = gpd.clip(gdf_a, roi_gdf.to_crs(TARGET_VECTOR_CRS))
+        target_p, roi_p = self._projected_gdf(
+            f"__target__{id(gdf_a)}", gdf_a, roi_gdf
+        )
         total = 0
         for row, col, h, w, done, total in self._iter_tiles(width, height, tile_size):
             if _stop_requested(stop_callback):
@@ -643,8 +840,12 @@ class E1_DataCleanerAndDiagnostic:
             sub_transform = window_transform(win, transform)
             shape = (h, w)
             tile_bounds = array_bounds(h, w, sub_transform)
-            ra = self.vector_to_raster(
-                gdf_a, sub_transform, shape, roi_gdf, tile_bounds=tile_bounds
+            ra = self._rasterize_projected(
+                target_p,
+                sub_transform,
+                shape,
+                roi_p=roi_p,
+                tile_bounds=tile_bounds,
             )
             rb = self._dataset_to_raster(name_b, sub_transform, shape, roi_gdf, gdf_cache)
             self._accumulate_tile_stats(stats, ra, rb)
@@ -1041,6 +1242,7 @@ class E1_DataCleanerAndDiagnostic:
             f"- 参考层: {results.get('reference')}",
             f"- 网格: {results.get('raster_crs')} @ {results.get('pixel_size_m')}m",
             f"- 分块模式: {results.get('tiled_mode')}",
+            f"- 评价耗时: {results.get('elapsed_seconds', '-')} 秒",
             "",
             "## 两两对比",
             "",
@@ -1117,6 +1319,7 @@ class E1_DataCleanerAndDiagnostic:
         """
         if _stop_requested(stop_callback):
             raise E1Cancelled("E1 精度评价被用户中断")
+        started_at = time.perf_counter()
         if reference not in self.dataset_specs:
             raise KeyError(f"reference [{reference}] 不在已注册列表: {self.list_datasets()}")
 
@@ -1140,6 +1343,13 @@ class E1_DataCleanerAndDiagnostic:
                 )
 
         roi_gdf, resolved_bounds = self._load_roi(roi_path, grid_bounds)
+        if target_extent_used and roi_gdf is None:
+            # Use the target *extent* as a comparison mask.  It is deliberately
+            # a bbox rather than the prediction geometry, so false positives
+            # and false negatives remain measurable inside the local domain.
+            roi_gdf = gpd.GeoDataFrame(
+                {"geometry": [box(*grid_bounds)]}, crs=TARGET_VECTOR_CRS
+            )
         transform, width, height, crs = self.build_reference_grid(
             roi_path, bounds_4326=grid_bounds
         )
@@ -1164,6 +1374,27 @@ class E1_DataCleanerAndDiagnostic:
             print(f"  你的产品: {target_path}")
 
         gdf_cache: Dict[str, gpd.GeoDataFrame] = {}
+        # A diagnostic object can be reused for another ROI in tests or an
+        # interactive session; never carry projected geometries across runs.
+        self._raster_projected_cache = {}
+        self._raster_roi_cache = {}
+        local_scope = bool(target_extent_used or roi_path)
+        if local_scope:
+            # Warm the vector cache with spatially filtered data.  Without
+            # this, every local E1 comparison would first load all national
+            # products and only clip them after the expensive read.  An
+            # explicit ROI follows the same fast path as an inferred target
+            # extent; the exact polygon remains the raster mask.
+            for _name in dict.fromkeys([reference, *compare_sources]):
+                _spec = self.dataset_specs.get(_name) or {}
+                if _spec.get("kind") not in {"vector", "tfmc_merge"}:
+                    continue
+                try:
+                    gdf_cache[_name] = self.load_dataset(
+                        _name, bbox_4326=resolved_bounds
+                    )
+                except Exception as _cache_exc:
+                    print(f"  {_name} 局部预读取失败，将在对比时重试: {_cache_exc}")
         results: Dict[str, Any] = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "roi_name": roi_name,
@@ -1208,9 +1439,20 @@ class E1_DataCleanerAndDiagnostic:
             if _stop_requested(stop_callback):
                 raise E1Cancelled("E1 精度评价被用户中断")
             target_path = ux.normalize_path(target_path, must_exist=True)
-            target_gdf = self.normalize_vector(target_path, target_name, save=True)
+            target_gdf = self.normalize_vector(
+                target_path,
+                target_name,
+                save=True,
+                bbox_4326=resolved_bounds,
+            )
             pair_name = f"{target_name}_vs_{reference}"
-            ref_gdf = self.load_dataset(reference)
+            ref_gdf = gdf_cache.get(reference)
+            if ref_gdf is None:
+                ref_gdf = self.load_dataset(
+                    reference,
+                    bbox_4326=resolved_bounds if local_scope else None,
+                )
+                gdf_cache[reference] = ref_gdf
             if not self._gdf_spatial_overlap(target_gdf, ref_gdf):
                 ux.warn(ux.zero_overlap_message_e1(pair_name), print)
                 metrics = {
@@ -1396,6 +1638,7 @@ class E1_DataCleanerAndDiagnostic:
         if _stop_requested(stop_callback):
             raise E1Cancelled("E1 精度评价被用户中断")
 
+        results["elapsed_seconds"] = round(time.perf_counter() - started_at, 3)
         report_path = self.output_dir / f"E1_PIXEL_REPORT_{roi_name}.json"
         # Keep deterministic provenance in the JSON itself.  This also makes
         # reports generated by the low-level engine verifiable after reload,
